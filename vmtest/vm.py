@@ -59,6 +59,8 @@ cd /
 "$BUSYBOX" mount -t devtmpfs -o nosuid,noexec dev /dev
 "$BUSYBOX" mount -t proc -o nosuid,nodev,noexec proc /proc
 "$BUSYBOX" mount -t sysfs -o nosuid,nodev,noexec sys /sys
+# cgroup2 was added in Linux v4.5.
+"$BUSYBOX" mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup || "$BUSYBOX" true
 # Ideally we'd just be able to create an opaque directory for /tmp on the upper
 # layer. However, before Linux kernel commit 51f7e52dc943 ("ovl: share inode
 # for hard link") (in v4.8), overlayfs doesn't handle hard links correctly,
@@ -68,7 +70,9 @@ cd /
 # Load kernel modules.
 "$BUSYBOX" mkdir -p "/lib/modules/$RELEASE"
 "$BUSYBOX" mount -t 9p -o trans=virtio,cache=loose,ro,msize={_9PFS_MSIZE} modules "/lib/modules/$RELEASE"
-"$BUSYBOX" modprobe configs
+for module in configs rng_core virtio_rng; do
+	"$BUSYBOX" modprobe "$module"
+done
 
 # Create static device nodes.
 "$BUSYBOX" grep -v '^#' "/lib/modules/$RELEASE/modules.devname" |
@@ -230,6 +234,8 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
 
                 "-virtfs",
                 f"local,path={kernel_dir},mount_tag=modules,security_model=none,readonly=on",
+
+                "-device", "virtio-rng-pci",
 
                 "-device", "virtio-serial",
                 "-chardev", f"socket,id=vmtest,path={socket_path}",
