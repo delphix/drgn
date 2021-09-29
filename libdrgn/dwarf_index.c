@@ -838,6 +838,8 @@ static struct drgn_error *read_abbrev_table(struct drgn_dwarf_index_cu *cu,
 			return err;
 		}
 	}
+	uint8_vector_shrink_to_fit(&insns);
+	uint32_vector_shrink_to_fit(&decls);
 	cu->abbrev_decls = decls.data;
 	cu->num_abbrev_decls = decls.size;
 	cu->abbrev_insns = insns.data;
@@ -2666,6 +2668,7 @@ static struct drgn_error *index_namespace(struct drgn_dwarf_index_namespace *ns)
 		return drgn_error_copy(ns->saved_err);
 	}
 	ns->pending_dies.size = 0;
+	drgn_dwarf_index_pending_die_vector_shrink_to_fit(&ns->pending_dies);
 	return err;
 }
 
