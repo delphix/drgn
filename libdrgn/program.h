@@ -122,7 +122,7 @@ struct drgn_program {
 	 * Debugging information.
 	 */
 	struct drgn_object_index oindex;
-	struct drgn_debug_info *_dbinfo;
+	struct drgn_debug_info *dbinfo;
 
 	/*
 	 * Program information.
@@ -256,9 +256,6 @@ drgn_program_address_mask(const struct drgn_program *prog, uint64_t *ret)
 	*ret = drgn_platform_address_mask(&prog->platform);
 	return NULL;
 }
-
-struct drgn_error *drgn_program_get_dbinfo(struct drgn_program *prog,
-					   struct drgn_debug_info **ret);
 
 /**
  * Find the @c NT_PRSTATUS note for the given CPU.

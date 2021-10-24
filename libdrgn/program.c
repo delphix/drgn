@@ -32,7 +32,7 @@
 #include "util.h"
 
 DEFINE_VECTOR_FUNCTIONS(drgn_prstatus_vector)
-DEFINE_HASH_TABLE_FUNCTIONS(drgn_prstatus_map, int_key_hash_pair, scalar_key_eq)
+DEFINE_HASH_MAP_FUNCTIONS(drgn_prstatus_map, int_key_hash_pair, scalar_key_eq)
 
 static Elf_Type note_header_type(GElf_Phdr *phdr)
 {
@@ -113,7 +113,7 @@ void drgn_program_deinit(struct drgn_program *prog)
 	if (prog->core_fd != -1)
 		close(prog->core_fd);
 
-	drgn_debug_info_destroy(prog->_dbinfo);
+	drgn_debug_info_destroy(prog->dbinfo);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -550,37 +550,6 @@ out_fd:
 	return err;
 }
 
-struct drgn_error *drgn_program_get_dbinfo(struct drgn_program *prog,
-					   struct drgn_debug_info **ret)
-{
-	struct drgn_error *err;
-
-	if (!prog->_dbinfo) {
-		struct drgn_debug_info *dbinfo;
-		err = drgn_debug_info_create(prog, &dbinfo);
-		if (err)
-			return err;
-		err = drgn_program_add_object_finder(prog,
-						     drgn_debug_info_find_object,
-						     dbinfo);
-		if (err) {
-			drgn_debug_info_destroy(dbinfo);
-			return err;
-		}
-		err = drgn_program_add_type_finder(prog,
-						   drgn_debug_info_find_type,
-						   dbinfo);
-		if (err) {
-			drgn_object_index_remove_finder(&prog->oindex);
-			drgn_debug_info_destroy(dbinfo);
-			return err;
-		}
-		prog->_dbinfo = dbinfo;
-	}
-	*ret = prog->_dbinfo;
-	return NULL;
-}
-
 /* Set the default language from the language of "main". */
 static void drgn_program_set_language_from_main(struct drgn_debug_info *dbinfo)
 {
@@ -645,10 +614,28 @@ drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
 	if (!n && !load_default && !load_main)
 		return NULL;
 
-	struct drgn_debug_info *dbinfo;
-	err = drgn_program_get_dbinfo(prog, &dbinfo);
-	if (err)
-		return err;
+	struct drgn_debug_info *dbinfo = prog->dbinfo;
+	if (!dbinfo) {
+		err = drgn_debug_info_create(prog, &dbinfo);
+		if (err)
+			return err;
+		err = drgn_program_add_object_finder(prog,
+						     drgn_debug_info_find_object,
+						     dbinfo);
+		if (err) {
+			drgn_debug_info_destroy(dbinfo);
+			return err;
+		}
+		err = drgn_program_add_type_finder(prog,
+						   drgn_debug_info_find_type,
+						   dbinfo);
+		if (err) {
+			drgn_object_index_remove_finder(&prog->oindex);
+			drgn_debug_info_destroy(dbinfo);
+			return err;
+		}
+		prog->dbinfo = dbinfo;
+	}
 
 	err = drgn_debug_info_load(dbinfo, paths, n, load_default, load_main);
 	if ((!err || err->code == DRGN_ERROR_MISSING_DEBUG_INFO)) {
@@ -1096,8 +1083,8 @@ bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 						  struct drgn_symbol *ret)
 {
 	if (!module) {
-		if (prog->_dbinfo) {
-			module = dwfl_addrmodule(prog->_dbinfo->dwfl, address);
+		if (prog->dbinfo) {
+			module = dwfl_addrmodule(prog->dbinfo->dwfl, address);
 			if (!module)
 				return false;
 		} else {
@@ -1193,9 +1180,9 @@ drgn_program_find_symbol_by_name(struct drgn_program *prog,
 		.ret = ret,
 	};
 
-	if (prog->_dbinfo &&
-	    dwfl_getmodules(prog->_dbinfo->dwfl, find_symbol_by_name_cb,
-			    &arg, 0))
+	if (prog->dbinfo &&
+	    dwfl_getmodules(prog->dbinfo->dwfl, find_symbol_by_name_cb, &arg,
+			    0))
 		return arg.err;
 	return drgn_error_format(DRGN_ERROR_LOOKUP,
 				 "could not find symbol with name '%s'%s", name,
