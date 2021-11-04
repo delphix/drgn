@@ -43,7 +43,7 @@ library that can be used to build debugging and introspection tools; see the
 official `tools <https://github.com/osandov/drgn/tree/main/tools>`_.
 
 drgn was developed for debugging the Linux kernel (as an alternative to the
-`crash <http://people.redhat.com/anderson/>`_ utility), but it can also debug
+`crash <https://crash-utility.github.io/>`_ utility), but it can also debug
 userspace programs written in C. C++ support is in progress.
 
 .. end-introduction
@@ -51,47 +51,99 @@ userspace programs written in C. C++ support is in progress.
 Documentation can be found at `drgn.readthedocs.io
 <https://drgn.readthedocs.io>`_.
 
+.. start-installation
+
 Installation
 ------------
 
-.. start-install-dependencies
+Package Manager
+^^^^^^^^^^^^^^^
 
-Install dependencies:
+drgn can be installed using the package manager on some Linux distributions.
 
-Arch Linux:
+* Fedora >= 32
 
-.. code-block:: console
+  .. code-block:: console
 
-    $ sudo pacman -S --needed gcc libelf make pkgconf python python-pip python-setuptools
+      $ sudo dnf install drgn
 
-Debian/Ubuntu:
+* RHEL/CentOS >= 8
 
-.. code-block:: console
+  `Enable EPEL <https://docs.fedoraproject.org/en-US/epel/#_quickstart>`_. Then:
 
-    $ sudo apt-get install gcc liblzma-dev libelf-dev libdw-dev make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
+  .. code-block:: console
 
-Note that Debian Stretch, Ubuntu Trusty, and Ubuntu Xenial (and older) ship
-Python versions which are too old. Python 3.6 or newer must be installed
-manually.
+      $ sudo dnf install drgn
 
-Fedora:
+* Arch Linux
 
-.. code-block:: console
+  Install the `drgn <https://aur.archlinux.org/packages/drgn/>`_ package from
+  the `AUR <https://wiki.archlinux.org/title/Arch_User_Repository>`_.
 
-    $ sudo dnf install elfutils-devel gcc make pkgconf python3 python3-devel python3-pip python3-setuptools
+pip
+^^^
 
-Optionally, install:
+If your Linux distribution doesn't package the latest release of drgn, you can
+install it with `pip <https://pip.pypa.io/>`_.
 
-* `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_ if you want
-  support for kdump-compressed kernel core dumps
-
-.. end-install-dependencies
-
+First, `install pip
+<https://packaging.python.org/guides/installing-using-linux-tools/#installing-pip-setuptools-wheel-with-linux-package-managers>`_.
 Then, run:
 
 .. code-block:: console
 
     $ sudo pip3 install drgn
+
+This will install a binary wheel by default. If you get a build error, then pip
+wasn't able to use the binary wheel. Install the dependencies listed `below
+<#from-source>`_ and try again.
+
+Note that RHEL/CentOS 6, Debian Stretch, Ubuntu Trusty, and Ubuntu Xenial (and
+older) ship Python versions which are too old. Python 3.6 or newer must be
+installed.
+
+From Source
+^^^^^^^^^^^
+
+To get the development version of drgn, you will need to build it from source.
+First, install dependencies:
+
+* Fedora/RHEL/CentOS
+
+  .. code-block:: console
+
+      $ sudo dnf install autoconf automake elfutils-devel gawk gcc git libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+
+  Replace ``dnf`` with ``yum`` for RHEL/CentOS < 8.
+
+* Debian/Ubuntu
+
+  .. code-block:: console
+
+      $ sudo apt-get install autoconf automake gawk gcc git liblzma-dev libelf-dev libdw-dev make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
+
+* Arch Linux
+
+  .. code-block:: console
+
+      $ sudo pacman -S --needed autoconf automake gawk gcc git libelf make pkgconf python python-pip python-setuptools
+
+Optionally, install `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_
+if you want support for the `makedumpfile
+<https://github.com/makedumpfile/makedumpfile>`_ compressed kernel core dump
+format. ``libkdumpfile`` is currently only packaged on Fedora and EPEL. For
+other distributions, you must install it manually.
+
+Then, run:
+
+.. code-block:: console
+
+    $ git clone https://github.com/osandov/drgn.git
+    $ cd drgn
+    $ python3 setup.py build
+    $ sudo python3 setup.py install
+
+.. end-installation
 
 See the `installation documentation
 <https://drgn.readthedocs.io/en/latest/installation.html>`_ for more options.
@@ -103,8 +155,10 @@ Quick Start
 
 drgn debugs the running kernel by default; run ``sudo drgn``. To debug a
 running program, run ``sudo drgn -p $PID``. To debug a core dump (either a
-kernel vmcore or a userspace core dump), run ``drgn -c $PATH``. The program
-must have debugging symbols available.
+kernel vmcore or a userspace core dump), run ``drgn -c $PATH``. Make sure to
+`install debugging symbols
+<https://drgn.readthedocs.io/en/latest/getting_debugging_symbols.html>`_ for
+whatever you are debugging.
 
 Then, you can access variables in the program with ``prog['name']`` and access
 structure members with ``.``:
