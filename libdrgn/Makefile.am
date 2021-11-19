@@ -35,8 +35,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 cityhash.h \
 			 debug_info.c \
 			 debug_info.h \
-			 dwarf_index.c \
-			 dwarf_index.h \
+			 dwarf_info.c \
+			 dwarf_info.h \
 			 error.c \
 			 error.h \
 			 hash_table.c \
@@ -61,6 +61,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 object_index.c \
 			 object_index.h \
 			 orc.h \
+			 orc_info.c \
+			 orc_info.h \
 			 path.c \
 			 path.h \
 			 platform.c \
