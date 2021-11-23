@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # setuptools must be imported before distutils (see pypa/setuptools#2230).
@@ -126,6 +126,7 @@ class test(Command):
     description = "run unit tests after in-place build"
 
     KERNELS = [
+        "5.16",
         "5.15",
         "5.14",
         "5.13",

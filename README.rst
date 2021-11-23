@@ -42,9 +42,10 @@ complex, inter-connected state in large programs. It is also designed as a
 library that can be used to build debugging and introspection tools; see the
 official `tools <https://github.com/osandov/drgn/tree/main/tools>`_.
 
-drgn was developed for debugging the Linux kernel (as an alternative to the
-`crash <https://crash-utility.github.io/>`_ utility), but it can also debug
-userspace programs written in C. C++ support is in progress.
+drgn was developed at `Meta <https://opensource.fb.com/>`_ for debugging the
+Linux kernel (as an alternative to the `crash
+<https://crash-utility.github.io/>`_ utility), but it can also debug userspace
+programs written in C. C++ support is in progress.
 
 .. end-introduction
 
@@ -202,7 +203,7 @@ License
 
 .. start-license
 
-Copyright (c) Facebook, Inc. and its affiliates.
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
 drgn is licensed under the `GPLv3
 <https://www.gnu.org/licenses/gpl-3.0.en.html>`_ or later.
