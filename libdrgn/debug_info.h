@@ -13,6 +13,7 @@
 #define DRGN_DEBUG_INFO_H
 
 #include <elfutils/libdwfl.h>
+#include <elfutils/version.h>
 #include <libelf.h>
 
 #include "binary_buffer.h"
@@ -100,7 +101,11 @@ struct drgn_debug_info_module {
 	Dwfl_Module *dwfl_module;
 	struct drgn_platform platform;
 	Elf_Scn *scns[DRGN_NUM_DEBUG_SCNS];
+	Elf_Scn *alt_debug_info;
+	Elf_Scn *alt_debug_str;
 	Elf_Data *scn_data[DRGN_NUM_DEBUG_SCN_DATA];
+	Elf_Data *alt_debug_info_data;
+	Elf_Data *alt_debug_str_data;
 
 	/** DWARF debugging information. */
 	struct drgn_dwarf_module_info dwarf;
@@ -331,6 +336,15 @@ struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret);
 
 struct drgn_error *elf_address_range(Elf *elf, uint64_t bias,
 				     uint64_t *start_ret, uint64_t *end_ret);
+
+static inline Elf_Type note_header_type(uint64_t p_align)
+{
+#if _ELFUTILS_PREREQ(0, 175)
+	if (p_align == 8)
+		return ELF_T_NHDR8;
+#endif
+	return ELF_T_NHDR;
+}
 
 /** @} */
 
