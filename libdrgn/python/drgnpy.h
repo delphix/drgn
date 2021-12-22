@@ -291,6 +291,10 @@ int enum_converter(PyObject *o, void *p);
 
 PyObject *drgnpy_linux_helper_read_vm(PyObject *self, PyObject *args,
 				      PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_per_cpu_ptr(PyObject *self, PyObject *args,
+					    PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_idle_task(PyObject *self, PyObject *args,
+					  PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_radix_tree_lookup(PyObject *self,
 						  PyObject *args,
 						  PyObject *kwds);

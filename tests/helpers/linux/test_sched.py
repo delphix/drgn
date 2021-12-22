@@ -4,12 +4,14 @@
 import os
 import signal
 
+from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.pid import find_task
-from drgn.helpers.linux.sched import task_state_to_char
+from drgn.helpers.linux.sched import idle_task, task_state_to_char
 from tests.helpers.linux import (
     LinuxHelperTestCase,
     fork_and_pause,
     proc_state,
+    smp_enabled,
     wait_until,
 )
 
@@ -34,3 +36,12 @@ class TestSched(LinuxHelperTestCase):
         self.assertEqual(task_state_to_char(task), "Z")
 
         os.waitpid(pid, 0)
+
+    def test_idle_task(self):
+        if smp_enabled():
+            for cpu in for_each_possible_cpu(self.prog):
+                self.assertEqual(
+                    idle_task(self.prog, cpu).comm.string_(), f"swapper/{cpu}".encode()
+                )
+        else:
+            self.assertEqual(idle_task(self.prog, 0).comm.string_(), b"swapper")

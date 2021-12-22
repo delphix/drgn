@@ -102,6 +102,67 @@ struct drgn_error *linux_helper_read_vm(struct drgn_program *prog,
 	return err;
 }
 
+struct drgn_error *linux_helper_per_cpu_ptr(struct drgn_object *res,
+					    const struct drgn_object *ptr,
+					    uint64_t cpu)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = drgn_object_program(ptr);
+
+	struct drgn_object tmp;
+	drgn_object_init(&tmp, prog);
+	err = drgn_program_find_object(prog, "__per_cpu_offset", NULL,
+				       DRGN_FIND_OBJECT_ANY, &tmp);
+	if (!err) {
+		err = drgn_object_subscript(&tmp, &tmp, cpu);
+		if (err)
+			goto out;
+		union drgn_value per_cpu_offset;
+		err = drgn_object_read_integer(&tmp, &per_cpu_offset);
+		if (err)
+			goto out;
+
+		uint64_t ptr_value;
+		err = drgn_object_read_unsigned(ptr, &ptr_value);
+		if (err)
+			goto out;
+
+		err = drgn_object_set_unsigned(res,
+					       drgn_object_qualified_type(ptr),
+					       ptr_value + per_cpu_offset.uvalue,
+					       0);
+	} else if (err->code == DRGN_ERROR_LOOKUP) {
+		drgn_error_destroy(err);
+		err = drgn_object_copy(res, ptr);
+	}
+out:
+	drgn_object_deinit(&tmp);
+	return err;
+}
+
+struct drgn_error *linux_helper_idle_task(struct drgn_object *res, uint64_t cpu)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = drgn_object_program(res);
+
+	struct drgn_object tmp;
+	drgn_object_init(&tmp, prog);
+	err = drgn_program_find_object(prog, "runqueues", NULL,
+				       DRGN_FIND_OBJECT_ANY, &tmp);
+	if (err)
+		goto out;
+	err = drgn_object_address_of(&tmp, &tmp);
+	if (err)
+		goto out;
+	err = linux_helper_per_cpu_ptr(&tmp, &tmp, cpu);
+	if (err)
+		goto out;
+	err = drgn_object_member_dereference(res, &tmp, "idle");
+out:
+	drgn_object_deinit(&tmp);
+	return err;
+}
+
 static struct drgn_error *
 radix_tree_init(struct drgn_program *prog, const struct drgn_object *root,
 		uint64_t *RADIX_TREE_INTERNAL_NODE_ret,

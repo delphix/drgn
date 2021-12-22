@@ -3,11 +3,16 @@
 
 import os
 import socket
+import sys
 import tempfile
 
 from drgn import cast
 from drgn.helpers.linux.fs import fget
 from drgn.helpers.linux.net import (
+    _S_IFMT,
+    _S_IFSOCK,
+    SOCK_INODE,
+    SOCKET_I,
     for_each_net,
     get_net_ns_by_fd,
     netdev_for_each_tx_queue,
@@ -29,8 +34,8 @@ class TestNet(LinuxHelperTestCase):
             cls.net = get_net_ns_by_fd(cls.task, file.fileno())
 
     def test_sk_fullsock(self):
-        with create_socket() as sock:
-            file = fget(self.task, sock.fileno())
+        with create_socket() as skt:
+            file = fget(self.task, skt.fileno())
             sk = cast("struct socket *", file.private_data).sk.read_()
             self.assertTrue(sk_fullsock(sk))
 
@@ -75,3 +80,20 @@ class TestNet(LinuxHelperTestCase):
             netdev = netdev_get_by_index(self.net, index)
             for queue in netdev_for_each_tx_queue(netdev):
                 self.assertEqual(queue.dev, netdev)
+
+    def test_SOCKET_I(self):
+        with create_socket(type=socket.SOCK_DGRAM) as skt:
+            sock = SOCKET_I(fget(self.task, skt.fileno()).f_inode)
+            self.assertEqual(sock.type, socket.SOCK_DGRAM)
+
+        with open("/dev/null") as null:
+            file = fget(self.task, null.fileno())
+            self.assertRaisesRegex(
+                ValueError, "not a socket inode", SOCKET_I, file.f_inode
+            )
+
+    def test_SOCK_INODE(self):
+        with create_socket() as skt:
+            sock = SOCKET_I(fget(self.task, skt.fileno()).f_inode)
+            inode = SOCK_INODE(sock)
+            self.assertEqual(inode.i_mode & _S_IFMT, _S_IFSOCK)
