@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
@@ -9,9 +9,13 @@ The ``drgn.helpers.linux.sched`` module provides helpers for working with the
 Linux CPU scheduler.
 """
 
+from _drgn import _linux_helper_idle_task as idle_task
 from drgn import Object
 
-__all__ = ("task_state_to_char",)
+__all__ = (
+    "idle_task",
+    "task_state_to_char",
+)
 
 _TASK_NOLOAD = 0x400
 
@@ -29,7 +33,9 @@ def task_state_to_char(task: Object) -> str:
     task_state_chars: str
     TASK_REPORT: int
     try:
-        task_state_chars, TASK_REPORT = prog.cache["task_state_to_char"]
+        task_state_chars, TASK_REPORT, task_state_name = prog.cache[
+            "task_state_to_char"
+        ]
     except KeyError:
         task_state_array = prog["task_state_array"]
         # Walk through task_state_array backwards looking for the largest state
@@ -45,13 +51,30 @@ def task_state_to_char(task: Object) -> str:
         if chars is None:
             raise Exception("could not parse task_state_array")
         task_state_chars = chars.decode("ascii")
-        prog.cache["task_state_to_char"] = task_state_chars, TASK_REPORT
-    task_state = task.state.value_()
+
+        # Since Linux kernel commit 2f064a59a11f ("sched: Change
+        # task_struct::state") (in v5.14), the task state is named "__state".
+        # Before that, it is named "state".
+        try:
+            task_state = task.__state
+            task_state_name = "__state"
+        except AttributeError:
+            task_state = task.state
+            task_state_name = "state"
+
+        prog.cache["task_state_to_char"] = (
+            task_state_chars,
+            TASK_REPORT,
+            task_state_name,
+        )
+    else:
+        task_state = getattr(task, task_state_name)
+    task_state = task_state.value_()
     exit_state = task.exit_state.value_()
     state = (task_state | exit_state) & TASK_REPORT
     char = task_state_chars[state.bit_length()]
-    # States beyond TASK_REPORT are special. As of Linux v5.8, TASK_IDLE is the
-    # only one; it is defined as TASK_UNINTERRUPTIBLE | TASK_NOLOAD.
+    # States beyond TASK_REPORT are special. As of Linux v5.14, TASK_IDLE is
+    # the only one; it is defined as TASK_UNINTERRUPTIBLE | TASK_NOLOAD.
     if char == "D" and (task_state & ~state) == _TASK_NOLOAD:
         return "I"
     else:

@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
@@ -85,9 +85,6 @@
 
 #define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
 
-#define __must_be_array(a)	BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
-
 #define container_of(ptr, type, member) ({				\
 	void *__mptr = (void *)(ptr);					\
 	BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) &&	\
@@ -147,27 +144,5 @@ static inline uint64_t uint_max(int n)
  */
 #define add_to_possibly_null_pointer(ptr, i)	\
 	((typeof(ptr))((uintptr_t)(ptr) + (i) * sizeof(*(ptr))))
-
-/** A string with a stored length. */
-struct string {
-	/**
-	 * The string, which is not necessarily null-terminated and may have
-	 * embedded null bytes.
-	 */
-	const char *str;
-	/** The length in bytes of the string. */
-	size_t len;
-};
-
-/** Compare two @ref string keys for equality. */
-static inline bool string_eq(const struct string *a, const struct string *b)
-{
-	/*
-	 * len == 0 is a special case because memcmp(NULL, NULL, 0) is
-	 * technically undefined.
-	 */
-	return (a->len == b->len &&
-		(a->len == 0 || memcmp(a->str, b->str, a->len) == 0));
-}
 
 #endif /* DRGN_UTIL_H */

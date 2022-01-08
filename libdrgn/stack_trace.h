@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 /**
@@ -12,6 +12,7 @@
 #ifndef DRGN_STACK_TRACE_H
 #define DRGN_STACK_TRACE_H
 
+#include <elfutils/libdw.h>
 #include <stddef.h>
 
 /**

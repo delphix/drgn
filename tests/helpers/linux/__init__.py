@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import contextlib
@@ -18,10 +18,11 @@ class LinuxHelperTestCase(unittest.TestCase):
     prog = None
     skip_reason = None
 
-    def setUp(self):
-        # We only want to create the Program once, so it's cached as a class
-        # variable. If we can't run these tests for whatever reason, we also
-        # cache that.
+    @classmethod
+    def setUpClass(cls):
+        # We only want to create the Program once for all tests, so it's cached
+        # as a class variable (in the base class). If we can't run these tests
+        # for whatever reason, we also cache that.
         if LinuxHelperTestCase.prog is not None:
             return
         if LinuxHelperTestCase.skip_reason is None:
@@ -37,7 +38,7 @@ class LinuxHelperTestCase(unittest.TestCase):
             elif not force_run and os.geteuid() != 0:
                 LinuxHelperTestCase.skip_reason = (
                     "Linux helper tests must be run as root "
-                    "(run with env DRGN_RUN_LINUX_HELPER_TESTS=1 to force"
+                    "(run with env DRGN_RUN_LINUX_HELPER_TESTS=1 to force)"
                 )
             else:
                 # Some of the tests use the loop module. Open loop-control so
@@ -58,7 +59,7 @@ class LinuxHelperTestCase(unittest.TestCase):
                     if force_run:
                         raise
                     LinuxHelperTestCase.skip_reason = str(e)
-        self.skipTest(LinuxHelperTestCase.skip_reason)
+        raise unittest.SkipTest(LinuxHelperTestCase.skip_reason)
 
 
 def wait_until(fn, *args, **kwds):
@@ -93,6 +94,32 @@ def proc_state(pid):
         return re.search(r"State:\s*(\S)", f.read(), re.M).group(1)
 
 
+# Return whether a process is blocked and fully scheduled out. The process
+# state is updated while the process is still running, so use this instead of
+# proc_state(pid) != "R" to avoid races. This is not accurate if pid is the
+# calling thread.
+def proc_blocked(pid):
+    with open(f"/proc/{pid}/syscall", "r") as f:
+        return f.read() != "running\n"
+
+
+def smp_enabled():
+    return bool(re.search(r"\bSMP\b", os.uname().version))
+
+
+def parse_range_list(s):
+    values = set()
+    s = s.strip()
+    if s:
+        for range_str in s.split(","):
+            first, sep, last = range_str.partition("-")
+            if sep:
+                values.update(range(int(first), int(last) + 1))
+            else:
+                values.add(int(first))
+    return values
+
+
 _c = ctypes.CDLL(None, use_errno=True)
 
 _mount = _c.mount
@@ -104,17 +131,41 @@ _mount.argtypes = [
     ctypes.c_ulong,
     ctypes.c_void_p,
 ]
+MS_RDONLY = 1
+MS_NOSUID = 2
+MS_NODEV = 4
+MS_NOEXEC = 8
+MS_SYNCHRONOUS = 16
+MS_REMOUNT = 32
+MS_MANDLOCK = 64
+MS_DIRSYNC = 128
+MS_NOSYMFOLLOW = 256
+MS_NOATIME = 1024
+MS_NODIRATIME = 2048
 MS_BIND = 4096
+MS_MOVE = 8192
+MS_REC = 16384
+MS_SILENT = 32768
+MS_POSIXACL = 1 << 16
+MS_UNBINDABLE = 1 << 17
+MS_PRIVATE = 1 << 18
+MS_SLAVE = 1 << 19
+MS_SHARED = 1 << 20
+MS_RELATIME = 1 << 21
+MS_KERNMOUNT = 1 << 22
+MS_I_VERSION = 1 << 23
+MS_STRICTATIME = 1 << 24
+MS_LAZYTIME = 1 << 25
 
 
-def mount(source, target, fstype, flags, data):
+def mount(source, target, fstype, flags=0, data=None):
     if (
         _mount(
             os.fsencode(source),
             os.fsencode(target),
             fstype.encode(),
             flags,
-            data.encode(),
+            None if data is None else data.encode(),
         )
         == -1
     ):

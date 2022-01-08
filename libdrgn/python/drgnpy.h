@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef DRGNPY_H
@@ -97,6 +97,14 @@ typedef struct {
 	struct pyobjectp_set objects;
 } Program;
 
+typedef struct _GenericIterator {
+	PyObject_HEAD
+	Program *prog;
+	void *iter;
+	PyObject *(*next)(struct _GenericIterator *);
+	void (*iter_deinit)(void *);
+} GenericIterator;
+
 typedef struct {
 	PyObject_HEAD
 	const struct drgn_register *reg;
@@ -161,10 +169,13 @@ extern PyObject *PlatformFlags_class;
 extern PyObject *PrimitiveType_class;
 extern PyObject *ProgramFlags_class;
 extern PyObject *Qualifiers_class;
+extern PyObject *SymbolBinding_class;
+extern PyObject *SymbolKind_class;
 extern PyObject *TypeKind_class;
 extern PyTypeObject DrgnObject_type;
 extern PyTypeObject DrgnType_type;
 extern PyTypeObject FaultError_type;
+extern PyTypeObject GenericIterator_type;
 extern PyTypeObject Language_type;
 extern PyTypeObject ObjectIterator_type;
 extern PyTypeObject Platform_type;
@@ -280,6 +291,10 @@ int enum_converter(PyObject *o, void *p);
 
 PyObject *drgnpy_linux_helper_read_vm(PyObject *self, PyObject *args,
 				      PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_per_cpu_ptr(PyObject *self, PyObject *args,
+					    PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_idle_task(PyObject *self, PyObject *args,
+					  PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_radix_tree_lookup(PyObject *self,
 						  PyObject *args,
 						  PyObject *kwds);
@@ -291,11 +306,21 @@ DrgnObject *drgnpy_linux_helper_pid_task(PyObject *self, PyObject *args,
 					 PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_find_task(PyObject *self, PyObject *args,
 					  PyObject *kwds);
-PyObject *drgnpy_linux_helper_task_state_to_char(PyObject *self, PyObject *args,
-						 PyObject *kwds);
 PyObject *drgnpy_linux_helper_kaslr_offset(PyObject *self, PyObject *args,
 					   PyObject *kwds);
 PyObject *drgnpy_linux_helper_pgtable_l5_enabled(PyObject *self, PyObject *args,
 						 PyObject *kwds);
+GenericIterator *drgnpy_linux_helper_for_each_task(PyObject *self,
+						      PyObject *args,
+						      PyObject *kwds);
+GenericIterator *drgnpy_linux_helper_for_each_pid(PyObject *self,
+						     PyObject *args,
+						     PyObject *kwds);
+GenericIterator *drgnpy_linux_helper_idr_for_each(PyObject *self,
+						     PyObject *args,
+						     PyObject *kwds);
+GenericIterator *drgnpy_linux_helper_radix_tree_for_each(PyObject *self,
+							    PyObject *args,
+							    PyObject *kwds);
 
 #endif /* DRGNPY_H */

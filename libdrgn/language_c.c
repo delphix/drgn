@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <assert.h>
@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "array.h"
 #include "bitops.h"
 #include "error.h"
 #include "hash_table.h"
@@ -27,7 +28,7 @@
 static struct drgn_error *
 c_declare_variable(struct drgn_qualified_type qualified_type,
 		   struct string_callback *name, size_t indent,
-		   struct string_builder *sb);
+		   bool define_anonymous_type, struct string_builder *sb);
 
 static struct drgn_error *
 c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
@@ -59,7 +60,7 @@ static struct drgn_error *c_append_qualifiers(enum drgn_qualifiers qualifiers,
 	bool first = true;
 	unsigned int i;
 
-	static_assert((1 << ARRAY_SIZE(qualifier_names)) - 1 ==
+	static_assert((1 << array_size(qualifier_names)) - 1 ==
 		      DRGN_ALL_QUALIFIERS, "missing C qualifier name");
 
 	for (i = 0; (1U << i) & DRGN_ALL_QUALIFIERS; i++) {
@@ -155,16 +156,20 @@ c_append_tagged_name(struct drgn_qualified_type qualified_type, size_t indent,
 static struct drgn_error *
 c_declare_tagged(struct drgn_qualified_type qualified_type,
 		 struct string_callback *name, size_t indent,
-		 struct string_builder *sb)
+		 bool define_anonymous_type, struct string_builder *sb)
 {
 	struct drgn_error *err;
 
-	if (drgn_type_is_anonymous(qualified_type.type))
+	bool anonymous = drgn_type_is_anonymous(qualified_type.type);
+	if (anonymous && define_anonymous_type)
 		err = c_define_type(qualified_type, indent, sb);
 	else
 		err = c_append_tagged_name(qualified_type, indent, sb);
 	if (err)
 		return err;
+	if (anonymous && !define_anonymous_type &&
+	    !string_builder_append(sb, " <anonymous>"))
+		return &drgn_enomem;
 
 	if (name) {
 		if (!string_builder_appendc(sb, ' '))
@@ -228,7 +233,8 @@ c_declare_pointer(struct drgn_qualified_type qualified_type,
 	struct drgn_qualified_type referenced_type;
 
 	referenced_type = drgn_type_type(qualified_type.type);
-	return c_declare_variable(referenced_type, &pointer_name, indent, sb);
+	return c_declare_variable(referenced_type, &pointer_name, indent, false,
+				  sb);
 }
 
 static struct drgn_error *c_array_name(struct string_callback *name, void *arg,
@@ -266,7 +272,7 @@ c_declare_array(struct drgn_qualified_type qualified_type,
 	struct drgn_qualified_type element_type;
 
 	element_type = drgn_type_type(qualified_type.type);
-	return c_declare_variable(element_type, &array_name, indent, sb);
+	return c_declare_variable(element_type, &array_name, indent, false, sb);
 }
 
 static struct drgn_error *
@@ -288,7 +294,7 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 	num_parameters = drgn_type_num_parameters(qualified_type.type);
 
 	return_type = drgn_type_type(qualified_type.type);
-	err = c_declare_variable(return_type, name, indent, sb);
+	err = c_declare_variable(return_type, name, indent, false, sb);
 	if (err)
 		return err;
 
@@ -313,7 +319,7 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 		}
 		err = c_declare_variable(parameter_type,
 					 parameter_name && parameter_name[0] ?
-					 &name_cb : NULL, 0, sb);
+					 &name_cb : NULL, 0, false, sb);
 		if (err)
 			return err;
 	}
@@ -334,7 +340,7 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 static struct drgn_error *
 c_declare_variable(struct drgn_qualified_type qualified_type,
 		   struct string_callback *name, size_t indent,
-		   struct string_builder *sb)
+		   bool define_anonymous_type, struct string_builder *sb)
 {
 	SWITCH_ENUM(drgn_type_kind(qualified_type.type),
 	case DRGN_TYPE_VOID:
@@ -347,7 +353,8 @@ c_declare_variable(struct drgn_qualified_type qualified_type,
 	case DRGN_TYPE_UNION:
 	case DRGN_TYPE_CLASS:
 	case DRGN_TYPE_ENUM:
-		return c_declare_tagged(qualified_type, name, indent, sb);
+		return c_declare_tagged(qualified_type, name, indent,
+					define_anonymous_type, sb);
 	case DRGN_TYPE_POINTER:
 		return c_declare_pointer(qualified_type, name, indent, sb);
 	case DRGN_TYPE_ARRAY:
@@ -394,7 +401,7 @@ c_define_compound(struct drgn_qualified_type qualified_type, size_t indent,
 		};
 		err = c_declare_variable(member_type,
 					 member_name && member_name[0] ?
-					 &name_cb : NULL, indent + 1, sb);
+					 &name_cb : NULL, indent + 1, true, sb);
 		if (err)
 			return err;
 		if (member_bit_field_size &&
@@ -479,7 +486,7 @@ c_define_typedef(struct drgn_qualified_type qualified_type, size_t indent,
 		return &drgn_enomem;
 
 	aliased_type = drgn_type_type(qualified_type.type);
-	return c_declare_variable(aliased_type, &typedef_name, 0, sb);
+	return c_declare_variable(aliased_type, &typedef_name, 0, true, sb);
 }
 
 static struct drgn_error *
@@ -511,26 +518,10 @@ c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
 }
 
 static struct drgn_error *
-c_anonymous_type_name(struct drgn_qualified_type qualified_type,
-		      struct string_builder *sb)
-{
-	struct drgn_error *err;
-
-	err = c_append_tagged_name(qualified_type, 0, sb);
-	if (err)
-		return err;
-	if (!string_builder_append(sb, " <anonymous>"))
-		return &drgn_enomem;
-	return NULL;
-}
-
-static struct drgn_error *
 c_format_type_name_impl(struct drgn_qualified_type qualified_type,
 			struct string_builder *sb)
 {
-	if (drgn_type_is_anonymous(qualified_type.type)) {
-		return c_anonymous_type_name(qualified_type, sb);
-	} else if (drgn_type_kind(qualified_type.type) == DRGN_TYPE_FUNCTION) {
+	if (drgn_type_kind(qualified_type.type) == DRGN_TYPE_FUNCTION) {
 		struct string_callback name_cb = {
 			.fn = c_variable_name,
 			.arg = (void *)"",
@@ -538,7 +529,7 @@ c_format_type_name_impl(struct drgn_qualified_type qualified_type,
 
 		return c_declare_function(qualified_type, &name_cb, 0, sb);
 	} else {
-		return c_declare_variable(qualified_type, NULL, 0, sb);
+		return c_declare_variable(qualified_type, NULL, 0, false, sb);
 	}
 }
 
@@ -1685,7 +1676,8 @@ static const char *token_spelling[] = {
 	[C_TOKEN_ENUM] = "enum",
 };
 
-DEFINE_HASH_MAP(c_keyword_map, struct string, int, string_hash_pair, string_eq)
+DEFINE_HASH_MAP(c_keyword_map, struct nstring, int, nstring_hash_pair,
+		nstring_eq)
 
 static struct c_keyword_map c_keywords = HASH_TABLE_INIT;
 
@@ -1749,7 +1741,7 @@ struct drgn_error *drgn_lexer_c(struct drgn_lexer *lexer,
 		break;
 	default:
 		if (isalpha(*p) || *p == '_') {
-			struct string key;
+			struct nstring key;
 			struct c_keyword_map_iterator it;
 
 			do {
@@ -2453,6 +2445,8 @@ c_parse_abstract_declarator(struct drgn_program *prog,
 			return err;
 
 		err = drgn_lexer_peek(lexer, &token);
+		if (err)
+			return err;
 		if (token.kind == C_TOKEN_LPAREN ||
 		    token.kind == C_TOKEN_LBRACKET) {
 			struct c_declarator *tmp;
@@ -2708,15 +2702,13 @@ struct drgn_error *c_integer_literal(struct drgn_object *res, uint64_t uvalue)
 		DRGN_C_TYPE_UNSIGNED_LONG_LONG,
 	};
 	struct drgn_error *err;
-	unsigned int bits;
-	struct drgn_qualified_type qualified_type;
-	size_t i;
 
-	bits = fls(uvalue);
+	unsigned int bits = fls(uvalue);
+	struct drgn_qualified_type qualified_type;
 	qualified_type.qualifiers = 0;
-	for (i = 0; i < ARRAY_SIZE(types); i++) {
+	array_for_each(type, types) {
 		err = drgn_program_find_primitive_type(drgn_object_program(res),
-						       types[i],
+						       *type,
 						       &qualified_type.type);
 		if (err)
 			return err;
@@ -2860,7 +2852,7 @@ static struct drgn_error *c_integer_promotions(struct drgn_program *prog,
 	 * promotes it to the full width, but GCC does not. We implement the GCC
 	 * behavior of preserving the width.
 	 */
-	if (primitive >= ARRAY_SIZE(c_integer_conversion_rank) ||
+	if (primitive >= array_size(c_integer_conversion_rank) ||
 	    type->bit_field_size) {
 		err = drgn_program_find_primitive_type(prog, DRGN_C_TYPE_INT,
 						       &int_type);

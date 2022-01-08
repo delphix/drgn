@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import ctypes
@@ -47,15 +47,37 @@ class TestProgram(unittest.TestCase):
         prog.set_pid(os.getpid())
         self.assertEqual(prog.platform, host_platform)
         self.assertTrue(prog.flags & ProgramFlags.IS_LIVE)
-        data = b"hello, world!"
-        buf = ctypes.create_string_buffer(data)
-        self.assertEqual(prog.read(ctypes.addressof(buf), len(data)), data)
         self.assertRaisesRegex(
             ValueError,
             "program memory was already initialized",
             prog.set_pid,
             os.getpid(),
         )
+
+    def test_pid_memory(self):
+        data = b"hello, world!"
+        buf = ctypes.create_string_buffer(data)
+        address = ctypes.addressof(buf)
+
+        # QEMU user-mode emulation doesn't seem to emulate /proc/$pid/mem
+        # correctly on a 64-bit host with a 32-bit guest; see
+        # https://gitlab.com/qemu-project/qemu/-/issues/698. Packit uses mock
+        # to cross-compile and test packages, which in turn uses QEMU user-mode
+        # emulation. Skip this test if /proc/$pid/mem doesn't work so that
+        # those builds succeed.
+        try:
+            with open("/proc/self/mem", "rb") as f:
+                f.seek(address)
+                functional_proc_pid_mem = f.read(len(data)) == data
+        except OSError:
+            functional_proc_pid_mem = False
+        if not functional_proc_pid_mem:
+            self.skipTest("/proc/$pid/mem is not functional")
+
+        prog = Program()
+        prog.set_pid(os.getpid())
+
+        self.assertEqual(prog.read(ctypes.addressof(buf), len(data)), data)
 
     def test_lookup_error(self):
         prog = mock_program()
@@ -784,7 +806,7 @@ class TestCoreDump(TestCase):
         self.assertEqual(prog.read(0xFFFF0000, len(data)), data)
         self.assertEqual(prog.read(0xA0, len(data), physical=True), data)
 
-    def test_zero_fill(self):
+    def test_unsaved(self):
         data = b"hello, world"
         prog = Program()
         with tempfile.NamedTemporaryFile() as f:
@@ -803,4 +825,6 @@ class TestCoreDump(TestCase):
             )
             f.flush()
             prog.set_core_dump(f.name)
-        self.assertEqual(prog.read(0xFFFF0000, len(data) + 4), data + bytes(4))
+        with self.assertRaisesRegex(FaultError, "memory not saved in core dump") as cm:
+            prog.read(0xFFFF0000, len(data) + 4)
+        self.assertEqual(cm.exception.address, 0xFFFF000C)

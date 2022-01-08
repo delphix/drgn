@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "drgnpy.h"
@@ -7,7 +7,7 @@
 #include "../vector.h"
 #include "../util.h"
 
-DEFINE_HASH_TABLE_FUNCTIONS(pyobjectp_set, ptr_key_hash_pair, scalar_key_eq)
+DEFINE_HASH_SET_FUNCTIONS(pyobjectp_set, ptr_key_hash_pair, scalar_key_eq)
 
 int Program_hold_object(Program *prog, PyObject *obj)
 {
@@ -217,7 +217,8 @@ static struct drgn_error *py_type_find_fn(enum drgn_type_kind kind,
 	PyObject *type_obj;
 
 	gstate = PyGILState_Ensure();
-	kind_obj = PyObject_CallFunction(TypeKind_class, "k", kind);
+	kind_obj = PyObject_CallFunction(TypeKind_class, "k",
+					 (unsigned long)kind);
 	if (!kind_obj) {
 		err = drgn_error_from_python();
 		goto out_gstate;

@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import os
@@ -31,7 +31,7 @@ class TestFs(LinuxHelperTestCase):
     def test_path_lookup_bind_mount(self):
         with tempfile.NamedTemporaryFile(prefix="drgn-tests-") as f:
             old_mnt = path_lookup(self.prog, os.path.abspath(f.name)).mnt
-            mount(f.name, f.name, "", MS_BIND, "")
+            mount(f.name, f.name, "", MS_BIND)
             try:
                 new_mnt = path_lookup(self.prog, os.path.abspath(f.name)).mnt
                 self.assertNotEqual(old_mnt, new_mnt)
@@ -51,9 +51,9 @@ class TestFs(LinuxHelperTestCase):
         with tempfile.TemporaryDirectory(prefix="drgn-tests-") as dir:
             path1 = os.fsencode(os.path.abspath(os.path.join(dir, "a")))
             path2 = os.fsencode(os.path.abspath(os.path.join(dir, "b")))
-            with open(path1, "w") as f:
+            with open(path1, "w"):
                 os.link(path1, path2)
-                with open(path2, "r") as f:
+                with open(path2, "r"):
                     inode = path_lookup(self.prog, path1).dentry.d_inode
                     paths = list(inode_paths(inode))
                     self.assertEqual(len(paths), 2)

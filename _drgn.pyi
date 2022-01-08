@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
@@ -192,10 +192,19 @@ class Program:
     # address_or_name is positional-only.
     def symbol(self, address_or_name: Union[IntegerLike, str]) -> Symbol:
         """
-        Get the symbol containing the given address, or the global symbol with
-        the given name.
+        Get a symbol containing the given address, or a symbol with the given
+        name.
 
-        :param address_or_name: The address or name.
+        Global symbols are preferred over weak symbols, and weak symbols are
+        preferred over other symbols. In other words: if a matching
+        :attr:`SymbolBinding.GLOBAL` or :attr:`SymbolBinding.UNIQUE` symbol is
+        found, it is returned. Otherwise, if a matching
+        :attr:`SymbolBinding.WEAK` symbol is found, it is returned. Otherwise,
+        any matching symbol (e.g., :attr:`SymbolBinding.LOCAL`) is returned. If
+        there are multiple matching symbols with the same binding, one is
+        returned arbitrarily.
+
+        :param address_or_name: Address or name.
         :raises LookupError: if no symbol contains the given address or matches
             the given name
         """
@@ -235,7 +244,7 @@ class Program:
         Get the type with the given name.
 
         >>> prog.type('long')
-        int_type(name='long', size=8, is_signed=True)
+        prog.int_type(name='long', size=8, is_signed=True)
 
         :param name: The type name.
         :param filename: The source code file that contains the definition. See
@@ -1177,6 +1186,31 @@ class Object:
             ``void``)
         """
         ...
+    def to_bytes_(self) -> bytes:
+        """Return the binary representation of this object's value."""
+        ...
+    @classmethod
+    def from_bytes_(
+        cls,
+        prog: Program,
+        type: Union[str, Type],
+        bytes: bytes,
+        *,
+        bit_offset: IntegerLike = 0,
+        bit_field_size: Optional[IntegerLike] = None,
+    ) -> Object:
+        """
+        Return a value object from its binary representation.
+
+        :param prog: Program to create the object in.
+        :param type: Type of the object.
+        :param bytes: Buffer containing value of the object.
+        :param bit_offset: Offset in bits from the beginning of *bytes* to the
+            beginning of the object.
+        :param bit_field_size: Size in bits of the object if it is a bit field.
+            The default is ``None``, which means the object is not a bit field.
+        """
+        ...
     def format_(
         self,
         *,
@@ -1369,6 +1403,66 @@ class Symbol:
     size: int
     """Size of this symbol in bytes."""
 
+    binding: SymbolBinding
+    """Linkage behavior and visibility of this symbol."""
+
+    kind: SymbolKind
+    """Kind of entity represented by this symbol."""
+
+class SymbolBinding(enum.Enum):
+    """
+    A ``SymbolBinding`` describes the linkage behavior and visibility of a
+    symbol.
+    """
+
+    UNKNOWN = ...
+    """Unknown."""
+
+    LOCAL = ...
+    """Not visible outside of the object file containing its definition."""
+
+    GLOBAL = ...
+    """Globally visible."""
+
+    WEAK = ...
+    """Globally visible but may be overridden by a non-weak global symbol."""
+
+    UNIQUE = ...
+    """
+    Globally visible even if dynamic shared object is loaded locally. See GCC's
+    ``-fno-gnu-unique`` `option
+    <https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html>`_.
+    """
+
+class SymbolKind(enum.Enum):
+    """
+    A ``SymbolKind`` describes the kind of entity that a symbol represents.
+    """
+
+    UNKNOWN = ...
+    """Unknown or not defined."""
+
+    OBJECT = ...
+    """Data object (e.g., variable or array)."""
+
+    FUNC = ...
+    """Function or other executable code."""
+
+    SECTION = ...
+    """Object file section."""
+
+    FILE = ...
+    """Source file."""
+
+    COMMON = ...
+    """Data object in common block."""
+
+    TLS = ...
+    """Thread-local storage entity."""
+
+    IFUNC = ...
+    """`Indirect function <https://sourceware.org/glibc/wiki/GNU_IFUNC>`_."""
+
 class StackTrace:
     """
     A ``StackTrace`` is a :ref:`sequence <python:typesseq-common>` of
@@ -1522,7 +1616,7 @@ class Type:
     :func:`repr()` of a ``Type`` returns a Python representation of the type:
 
     >>> print(repr(prog.type('sector_t')))
-    typedef_type(name='sector_t', type=int_type(name='unsigned long', size=8, is_signed=False))
+    prog.typedef_type(name='sector_t', type=prog.int_type(name='unsigned long', size=8, is_signed=False))
 
     :class:`str() <str>` returns a representation of the type in programming
     language syntax:
@@ -2070,6 +2164,34 @@ def _linux_helper_radix_tree_lookup(root: Object, index: IntegerLike) -> Object:
     """
     ...
 
+def _linux_helper_per_cpu_ptr(ptr: Object, cpu: IntegerLike) -> Object:
+    """
+    Return the per-CPU pointer for a given CPU.
+
+    >>> prog["init_net"].loopback_dev.pcpu_refcnt
+    (int *)0x2c980
+    >>> per_cpu_ptr(prog["init_net"].loopback_dev.pcpu_refcnt, 7)
+    *(int *)0xffff925e3ddec980 = 4
+
+    :param ptr: Per-CPU pointer, i.e., ``type __percpu *``. For global
+        variables, it's usually easier to use :func:`per_cpu()`.
+    :param cpu: CPU number.
+    :return: ``type *`` object.
+    """
+    ...
+
+def _linux_helper_idle_task(prog: Program, cpu: IntegerLike) -> Object:
+    """
+    Return the idle thread (PID 0, a.k.a swapper) for the given CPU.
+
+    >>> idle_task(prog, 1).comm
+    (char [16])"swapper/1"
+
+    :param cpu: CPU number.
+    :return: ``struct task_struct *``
+    """
+    ...
+
 def _linux_helper_idr_find(idr: Object, id: IntegerLike) -> Object:
     """
     Look up the entry with the given ID in an IDR.
@@ -2124,4 +2246,42 @@ def _linux_helper_kaslr_offset(prog: Program) -> int:
 
 def _linux_helper_pgtable_l5_enabled(prog: Program) -> bool:
     """Return whether 5-level paging is enabled."""
+    ...
+
+def _linux_helper_radix_tree_for_each(root: Object) -> Iterator[Tuple[int, Object]]:
+    """
+    Iterate over all of the entries in a radix tree.
+
+    :param root: ``struct radix_tree_root *``
+    :return: Iterator of (index, ``void *``) tuples.
+    """
+    ...
+
+def _linux_helper_idr_for_each(idr: Object) -> Iterator[Tuple[int, Object]]:
+    """
+    Iterate over all of the entries in an IDR.
+
+    :param idr: ``struct idr *``
+    :return: Iterator of (index, ``void *``) tuples.
+    """
+    ...
+
+def _linux_helper_for_each_pid(prog_or_ns: Union[Program, Object]) -> Iterator[Object]:
+    """
+    Iterate over all PIDs in a namespace.
+
+    :param prog_or_ns: ``struct pid_namespace *`` to iterate over, or
+        :class:`Program` to iterate over initial PID namespace.
+    :return: Iterator of ``struct pid *`` objects.
+    """
+    ...
+
+def _linux_helper_for_each_task(prog_or_ns: Union[Program, Object]) -> Iterator[Object]:
+    """
+    Iterate over all of the tasks visible in a namespace.
+
+    :param prog_or_ns: ``struct pid_namespace *`` to iterate over, or
+        :class:`Program` to iterate over initial PID namespace.
+    :return: Iterator of ``struct task_struct *`` objects.
+    """
     ...

@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
@@ -67,6 +67,8 @@ from _drgn import (
     StackFrame,
     StackTrace,
     Symbol,
+    SymbolBinding,
+    SymbolKind,
     Type,
     TypeEnumerator,
     TypeKind,
@@ -110,6 +112,8 @@ __all__ = (
     "StackFrame",
     "StackTrace",
     "Symbol",
+    "SymbolBinding",
+    "SymbolKind",
     "Type",
     "TypeEnumerator",
     "TypeKind",

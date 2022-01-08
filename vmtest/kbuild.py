@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import argparse
@@ -23,7 +23,7 @@ from vmtest.asynciosubprocess import (
 
 logger = logging.getLogger(__name__)
 
-KERNEL_LOCALVERSION = "-vmtest3"
+KERNEL_LOCALVERSION = "-vmtest8"
 
 
 def kconfig() -> str:
@@ -59,29 +59,54 @@ CONFIG_TMPFS=y
 CONFIG_TMPFS_XATTR=y
 CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_PCI=y
-
-# drgn needs /proc/kcore for live debugging.
-CONFIG_PROC_KCORE=y
-# In some cases, it also needs /proc/kallsyms.
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
+CONFIG_HW_RANDOM=m
+CONFIG_HW_RANDOM_VIRTIO=m
 
 # drgn needs debug info.
 CONFIG_DEBUG_KERNEL=y
 CONFIG_DEBUG_INFO=y
 CONFIG_DEBUG_INFO_DWARF4=y
 
-# Before Linux kernel commit 8757dc970f55 ("x86/crash: Define
-# arch_crash_save_vmcoreinfo() if CONFIG_CRASH_CORE=y") (in v5.6), some
-# important information in VMCOREINFO is initialized by the kexec code.
+# For testing live kernel debugging with /proc/kcore.
+CONFIG_PROC_KCORE=y
+# drgn needs /proc/kallsyms in some cases. Some test cases also need it.
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+
+# For testing kernel core dumps with /proc/vmcore.
+CONFIG_CRASH_DUMP=y
+CONFIG_PROC_VMCORE=y
 CONFIG_KEXEC=y
+CONFIG_KEXEC_FILE=y
+# Needed for CONFIG_KEXEC_FILE.
+CONFIG_CRYPTO=y
+CONFIG_CRYPTO_SHA256=y
+
+# So that we can trigger a crash with /proc/sysrq-trigger.
+CONFIG_MAGIC_SYSRQ=y
 
 # For block tests.
 CONFIG_BLK_DEV_LOOP=m
 
+# For cgroup tests.
+CONFIG_CGROUPS=y
+
 # For kconfig tests.
 CONFIG_IKCONFIG=m
 CONFIG_IKCONFIG_PROC=y
+
+# For nodemask tests.
+CONFIG_NUMA=y
+
+# For Traffic Control tests.
+CONFIG_NET_SCHED=y
+CONFIG_NET_SCH_PRIO=m
+CONFIG_NET_SCH_SFQ=m
+CONFIG_NET_SCH_TBF=m
+CONFIG_NET_SCH_INGRESS=m
+CONFIG_NET_CLS_ACT=y
+CONFIG_NETDEVICES=y
+CONFIG_DUMMY=m
 """
 
 

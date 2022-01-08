@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <elfutils/libdwfl.h>
@@ -43,7 +43,7 @@ static PyObject *filename_matches(PyObject *self, PyObject *args,
 		return NULL;
 
 	struct path_iterator haystack = {
-		.components = (struct string [1]){},
+		.components = (struct nstring [1]){},
 		.num_components = 0,
 	};
 	if (haystack_arg.path) {
@@ -52,7 +52,7 @@ static PyObject *filename_matches(PyObject *self, PyObject *args,
 		haystack.num_components = 1;
 	}
 	struct path_iterator needle = {
-		.components = (struct string [1]){},
+		.components = (struct nstring [1]){},
 		.num_components = 0,
 	};
 	if (needle_arg.path) {
@@ -124,6 +124,11 @@ static PyMethodDef drgn_methods[] = {
 	 METH_VARARGS | METH_KEYWORDS, drgn_program_from_pid_DOC},
 	{"_linux_helper_read_vm", (PyCFunction)drgnpy_linux_helper_read_vm,
 	 METH_VARARGS | METH_KEYWORDS},
+	{"_linux_helper_per_cpu_ptr",
+	 (PyCFunction)drgnpy_linux_helper_per_cpu_ptr,
+	 METH_VARARGS | METH_KEYWORDS},
+	{"_linux_helper_idle_task", (PyCFunction)drgnpy_linux_helper_idle_task,
+	 METH_VARARGS | METH_KEYWORDS},
 	{"_linux_helper_radix_tree_lookup",
 	 (PyCFunction)drgnpy_linux_helper_radix_tree_lookup,
 	 METH_VARARGS | METH_KEYWORDS},
@@ -141,6 +146,18 @@ static PyMethodDef drgn_methods[] = {
 	{"_linux_helper_pgtable_l5_enabled",
 	 (PyCFunction)drgnpy_linux_helper_pgtable_l5_enabled,
 	 METH_VARARGS | METH_KEYWORDS},
+	{"_linux_helper_for_each_task",
+	 (PyCFunction)drgnpy_linux_helper_for_each_task,
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_for_each_task_DOC},
+	{"_linux_helper_for_each_pid",
+	 (PyCFunction)drgnpy_linux_helper_for_each_pid,
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_for_each_pid_DOC},
+	{"_linux_helper_idr_for_each",
+	 (PyCFunction)drgnpy_linux_helper_idr_for_each,
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_idr_for_each_DOC},
+	{"_linux_helper_radix_tree_for_each",
+	 (PyCFunction)drgnpy_linux_helper_radix_tree_for_each,
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_radix_tree_for_each_DOC},
 	{},
 };
 
@@ -230,6 +247,7 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	    add_type(m, &StackTrace_type) ||
 	    add_type(m, &Symbol_type) ||
 	    add_type(m, &DrgnType_type) ||
+	    add_type(m, &GenericIterator_type) ||
 	    add_type(m, &TypeEnumerator_type) ||
 	    add_type(m, &TypeMember_type) ||
 	    add_type(m, &TypeParameter_type) ||

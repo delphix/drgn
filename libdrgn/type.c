@@ -1,10 +1,11 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "array.h"
 #include "error.h"
 #include "hash_table.h"
 #include "language.h"
@@ -169,10 +170,10 @@ static bool drgn_member_key_eq(const struct drgn_member_key *a,
 		(!a->name_len || memcmp(a->name, b->name, a->name_len) == 0));
 }
 
-DEFINE_HASH_TABLE_FUNCTIONS(drgn_member_map, drgn_member_key_hash_pair,
-			    drgn_member_key_eq)
+DEFINE_HASH_MAP_FUNCTIONS(drgn_member_map, drgn_member_key_hash_pair,
+			  drgn_member_key_eq)
 
-DEFINE_HASH_TABLE_FUNCTIONS(drgn_type_set, ptr_key_hash_pair, scalar_key_eq)
+DEFINE_HASH_SET_FUNCTIONS(drgn_type_set, ptr_key_hash_pair, scalar_key_eq)
 
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_member_object(struct drgn_type_member *member,
@@ -328,8 +329,8 @@ static bool drgn_type_dedupe_eq(struct drgn_type * const *entry_a,
  * We don't deduplicate types with members, parameters, template parameters, or
  * enumerators, so the hash and comparison functions ignore those.
  */
-DEFINE_HASH_TABLE_FUNCTIONS(drgn_dedupe_type_set, drgn_type_dedupe_hash_pair,
-			    drgn_type_dedupe_eq)
+DEFINE_HASH_SET_FUNCTIONS(drgn_dedupe_type_set, drgn_type_dedupe_hash_pair,
+			  drgn_type_dedupe_eq)
 
 DEFINE_VECTOR_FUNCTIONS(drgn_typep_vector)
 
@@ -351,8 +352,8 @@ static struct drgn_error *find_or_create_type(struct drgn_type *key,
 		return &drgn_enomem;
 
 	*type = *key;
-	if (!drgn_dedupe_type_set_insert_searched(&prog->dedupe_types, &type,
-						  hp, NULL)) {
+	if (drgn_dedupe_type_set_insert_searched(&prog->dedupe_types, &type, hp,
+						 NULL) < 0) {
 		free(type);
 		return &drgn_enomem;
 	}
@@ -1294,7 +1295,7 @@ struct drgn_error *drgn_error_incomplete_type(const char *format,
 
 void drgn_program_init_types(struct drgn_program *prog)
 {
-	for (size_t i = 0; i < ARRAY_SIZE(prog->void_types); i++) {
+	for (size_t i = 0; i < array_size(prog->void_types); i++) {
 		struct drgn_type *type = &prog->void_types[i];
 		type->_private.kind = DRGN_TYPE_VOID;
 		type->_private.is_complete = false;
@@ -1439,11 +1440,10 @@ default_size_t_or_ptrdiff_t(struct drgn_program *prog,
 	err = drgn_program_address_size(prog, &address_size);
 	if (err)
 		return err;
-	for (size_t i = 0; i < ARRAY_SIZE(integer_types[0]); i++) {
-		enum drgn_primitive_type integer_type =
-			integer_types[type == DRGN_C_TYPE_PTRDIFF_T][i];
+	array_for_each(integer_type,
+		       integer_types[type == DRGN_C_TYPE_PTRDIFF_T]) {
 		struct drgn_qualified_type qualified_type;
-		err = drgn_program_find_primitive_type(prog, integer_type,
+		err = drgn_program_find_primitive_type(prog, *integer_type,
 						       &qualified_type.type);
 		if (err)
 			return err;

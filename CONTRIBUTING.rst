@@ -7,18 +7,25 @@ submit changes for drgn.
 Building
 --------
 
-The easiest way to develop drgn is by building and running it locally. See the
-`installation documentation
-<https://drgn.readthedocs.io/en/latest/installation.html#development>`_.
+The easiest way to develop drgn is by building and running it locally. Please
+build with warnings enabled. Install the dependencies from the `installation
+instructions <README.rst#from-source>`_, then run:
+
+.. code-block:: console
+
+    $ git clone https://github.com/osandov/drgn.git
+    $ cd drgn
+    $ CFLAGS="-Wall -Werror -g -O2" python3 setup.py build_ext -i
+    $ python3 -m drgn --help
 
 Testing
 -------
 
-.. highlight:: console
-
 Tests should be added for all features and bug fixes.
 
-drgn's test suite can be run with::
+drgn's test suite can be run with:
+
+.. code-block:: console
 
     $ python3 setup.py test
 
@@ -27,7 +34,9 @@ add ``-K``. See `vmtest <vmtest/README.rst>`_ for more details.
 
 Tests can also be run manually with `unittest
 <https://docs.python.org/3/library/unittest.html#command-line-interface>`_
-after building locally::
+after building locally:
+
+.. code-block:: console
 
     $ python3 -m unittest discover -v
 
@@ -49,14 +58,32 @@ C code in drgn mostly follows the `Linux kernel coding style
 <https://www.kernel.org/doc/html/latest/process/coding-style.html>`_ except
 that drgn requires C11 or newer, so declarations may be mixed with code.
 
-A few other guidelines:
+A few other guidelines/conventions:
 
+* Constants should be defined as enums or ``static const`` variables rather
+  than macros.
 * Functions that can fail should return a ``struct drgn_error *`` (and return
   their result via an out parameter if necessary).
 * Out parameters should be named ``ret`` (or suffixed with ``_ret`` if there
-  are multiple).
-* Constants should be defined as enums or ``static const`` variables rather
-  than macros.
+  are multiple) and be the last parameter(s) of the function.
+* Functions that initialize an already allocated structure should be suffixed
+  with ``_init`` and take the structure to initialize as the first argument,
+  e.g., ``struct drgn_error *foo_init(struct foo *foo, int foo_flags)``.
+* The matching function to deinitialize a structure should be suffixed with
+  ``_deinit``, e.g., ``void foo_deinit(struct foo *foo)``. If possible, the
+  definition should be placed directly after the definition of ``_init`` so
+  that it is easier to visually verify that everything is cleaned up.
+* Functions that allocate and initialize a structure should be suffixed with
+  ``_create`` and either return the structure as an out parameter (e.g.,
+  ``struct drgn_error *foo_create(int foo_flags, struct foo **ret)``) or as the
+  return value if they can only fail with an out-of-memory error (e.g.,
+  ``struct foo *foo_create(int foo_flags)``).
+* The matching function to free an allocated structure should be suffixed with
+  ``_destroy``, e.g., ``void foo_destroy(struct foo *foo)``. If possible, the
+  definition should be placed directly after the definition of ``_create``.
+  ``_destroy`` should usually allow a ``NULL`` argument, just like ``free()``.
+* Functions that return a result in a ``struct drgn_object *`` parameter should
+  only modify the object if the function succeeds.
 
 drgn assumes some `implementation-defined behavior
 <https://gcc.gnu.org/onlinedocs/gcc/C-Implementation.html>`_ for sanity:
@@ -74,7 +101,9 @@ Python
 Python code in drgn should be compatible with Python 3.6 and newer.
 
 Python code should be formatted with `black <https://github.com/psf/black>`_
-and `isort <https://github.com/timothycrosley/isort>`_::
+and `isort <https://github.com/timothycrosley/isort>`_:
+
+.. code-block:: console
 
     $ isort . && black .
 

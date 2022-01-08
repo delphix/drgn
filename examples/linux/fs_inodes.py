@@ -1,12 +1,11 @@
 #!/usr/bin/env drgn
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """List the paths of all inodes cached in a given filesystem"""
 
 import os
 import sys
-import time
 
 from drgn.helpers.linux.fs import for_each_mount, inode_path
 from drgn.helpers.linux.list import list_for_each_entry

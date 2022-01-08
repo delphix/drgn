@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <assert.h>
@@ -13,10 +13,11 @@
 #include "cfi.h"
 #include "debug_info.h"
 #include "drgn.h"
+#include "dwarf_info.h"
 #include "error.h"
-#include "hash_table.h"
 #include "helpers.h"
 #include "minmax.h"
+#include "nstring.h"
 #include "platform.h"
 #include "program.h"
 #include "register_state.h"
@@ -78,16 +79,18 @@ static void drgn_stack_trace_shrink_to_fit(struct drgn_stack_trace **trace,
 
 LIBDRGN_PUBLIC void drgn_stack_trace_destroy(struct drgn_stack_trace *trace)
 {
-	struct drgn_register_state *regs = NULL;
-	for (size_t i = 0; i < trace->num_frames; i++) {
-		if (trace->frames[i].regs != regs) {
-			drgn_register_state_destroy(regs);
-			regs = trace->frames[i].regs;
+	if (trace) {
+		struct drgn_register_state *regs = NULL;
+		for (size_t i = 0; i < trace->num_frames; i++) {
+			if (trace->frames[i].regs != regs) {
+				drgn_register_state_destroy(regs);
+				regs = trace->frames[i].regs;
+			}
+			free(trace->frames[i].scopes);
 		}
-		free(trace->frames[i].scopes);
+		drgn_register_state_destroy(regs);
+		free(trace);
 	}
-	drgn_register_state_destroy(regs);
-	free(trace);
 }
 
 LIBDRGN_PUBLIC size_t
@@ -443,7 +446,7 @@ not_found:;
 	}
 
 	Dwarf_Die function_die = frame->scopes[frame->function_scope];
-	return drgn_object_from_dwarf(trace->prog->_dbinfo, frame->regs->module,
+	return drgn_object_from_dwarf(trace->prog->dbinfo, frame->regs->module,
 				      &die,
 				      dwarf_tag(&die) == DW_TAG_enumerator ?
 				      &type_die : NULL,
@@ -525,7 +528,7 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 	struct drgn_error *err;
 	struct drgn_object obj;
 	struct drgn_object tmp;
-	struct string prstatus;
+	struct nstring prstatus;
 
 	drgn_object_init(&obj, prog);
 	drgn_object_init(&tmp, prog);

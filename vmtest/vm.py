@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 import errno
@@ -14,6 +14,8 @@ import tempfile
 
 from util import nproc, out_of_date
 
+_9PFS_MSIZE = 1024 * 1024
+
 # Script run as init in the virtual machine. This only depends on busybox. We
 # don't assume that any regular commands are built in (not even echo or test),
 # so we always explicitly run busybox.
@@ -22,6 +24,7 @@ _INIT_TEMPLATE = r"""#!{busybox} sh
 set -eu
 
 export BUSYBOX={busybox}
+export PYTHON={python}
 
 trap '"$BUSYBOX" poweroff -f' EXIT
 
@@ -55,8 +58,12 @@ cd /
 
 # Mount additional filesystems.
 "$BUSYBOX" mount -t devtmpfs -o nosuid,noexec dev /dev
+"$BUSYBOX" mkdir /dev/shm
+"$BUSYBOX" mount -t tmpfs -o nosuid,nodev tmpfs /dev/shm
 "$BUSYBOX" mount -t proc -o nosuid,nodev,noexec proc /proc
 "$BUSYBOX" mount -t sysfs -o nosuid,nodev,noexec sys /sys
+# cgroup2 was added in Linux v4.5.
+"$BUSYBOX" mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup || "$BUSYBOX" true
 # Ideally we'd just be able to create an opaque directory for /tmp on the upper
 # layer. However, before Linux kernel commit 51f7e52dc943 ("ovl: share inode
 # for hard link") (in v4.8), overlayfs doesn't handle hard links correctly,
@@ -65,8 +72,10 @@ cd /
 
 # Load kernel modules.
 "$BUSYBOX" mkdir -p "/lib/modules/$RELEASE"
-"$BUSYBOX" mount -t 9p -o trans=virtio,cache=loose,ro modules "/lib/modules/$RELEASE"
-"$BUSYBOX" modprobe configs
+"$BUSYBOX" mount -t 9p -o trans=virtio,cache=loose,ro,msize={_9PFS_MSIZE} modules "/lib/modules/$RELEASE"
+for module in configs rng_core virtio_rng; do
+	"$BUSYBOX" modprobe "$module"
+done
 
 # Create static device nodes.
 "$BUSYBOX" grep -v '^#' "/lib/modules/$RELEASE/modules.devname" |
@@ -162,7 +171,7 @@ class LostVMError(Exception):
 
 def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
     match = re.search(
-        "QEMU emulator version ([0-9]+(?:\.[0-9]+)*)",
+        r"QEMU emulator version ([0-9]+(?:\.[0-9]+)*)",
         subprocess.check_output(
             ["qemu-system-x86_64", "-version"], universal_newlines=True
         ),
@@ -204,7 +213,10 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
         with open(init, "w") as init_file:
             init_file.write(
                 _INIT_TEMPLATE.format(
-                    busybox=shlex.quote(busybox), command=shlex.quote(command)
+                    _9PFS_MSIZE=_9PFS_MSIZE,
+                    busybox=shlex.quote(busybox),
+                    python=shlex.quote(sys.executable),
+                    command=shlex.quote(command),
                 )
             )
         os.chmod(init, 0o755)
@@ -222,10 +234,12 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
                 "-no-reboot",
 
                 "-virtfs",
-                f"local,id=root,path=/,mount_tag=/dev/root,security_model=none,readonly{multidevs}",
+                f"local,id=root,path=/,mount_tag=/dev/root,security_model=none,readonly=on{multidevs}",
 
                 "-virtfs",
-                f"local,path={kernel_dir},mount_tag=modules,security_model=none,readonly",
+                f"local,path={kernel_dir},mount_tag=modules,security_model=none,readonly=on",
+
+                "-device", "virtio-rng-pci",
 
                 "-device", "virtio-serial",
                 "-chardev", f"socket,id=vmtest,path={socket_path}",
@@ -234,11 +248,11 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
 
                 "-kernel", str(kernel_dir / "vmlinuz"),
                 "-append",
-                f"rootfstype=9p rootflags=trans=virtio,cache=loose ro console=0,115200 panic=-1 init={init}",
+                f"rootfstype=9p rootflags=trans=virtio,cache=loose,msize={_9PFS_MSIZE} ro console=0,115200 panic=-1 crashkernel=256M init={init}",
                 # fmt: on
             ],
             env=env,
-        ) as qemu:
+        ):
             server_sock.settimeout(5)
             try:
                 sock = server_sock.accept()[0]
@@ -267,6 +281,11 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
 
 if __name__ == "__main__":
     import argparse
+    import logging
+
+    logging.basicConfig(
+        format="%(asctime)s:%(levelname)s:%(name)s:%(message)s", level=logging.INFO
+    )
 
     parser = argparse.ArgumentParser(
         description="run vmtest virtual machine",

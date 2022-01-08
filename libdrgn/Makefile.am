@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 ACLOCAL_AMFLAGS = -I m4
@@ -25,6 +25,7 @@ noinst_LTLIBRARIES = libdrgnimpl.la
 libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 $(ARCH_INCS) \
 			 arch_register_layout.h \
+			 array.h \
 			 binary_buffer.c \
 			 binary_buffer.h \
 			 binary_search_tree.h \
@@ -34,8 +35,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 cityhash.h \
 			 debug_info.c \
 			 debug_info.h \
-			 dwarf_index.c \
-			 dwarf_index.h \
+			 dwarf_info.c \
+			 dwarf_info.h \
 			 error.c \
 			 error.h \
 			 hash_table.c \
@@ -54,11 +55,14 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 memory_reader.c \
 			 memory_reader.h \
 			 minmax.h \
+			 nstring.h \
 			 object.c \
 			 object.h \
 			 object_index.c \
 			 object_index.h \
 			 orc.h \
+			 orc_info.c \
+			 orc_info.h \
 			 path.c \
 			 path.h \
 			 platform.c \
@@ -154,7 +158,8 @@ python/docstrings.c: ../_drgn.pyi $(drgndoc_docstrings_deps)
 python/docstrings.h: ../_drgn.pyi $(drgndoc_docstrings_deps)
 	$(AM_V_GEN)$(drgndoc_docstrings) -H -m _drgn:drgn $< > $@
 
-EXTRA_DIST = $(ARCH_DEFS) \
+EXTRA_DIST = Doxyfile \
+	     $(ARCH_DEFS) \
 	     build-aux/gen_arch.awk \
 	     build-aux/gen_constants.py \
 	     drgn.h.in

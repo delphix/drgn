@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 # setuptools must be imported before distutils (see pypa/setuptools#2230).
-import setuptools  # isort: skip
+import setuptools  # isort: skip  # noqa: F401
 
 import contextlib
 from distutils import log
@@ -125,7 +125,20 @@ class sdist(_sdist):
 class test(Command):
     description = "run unit tests after in-place build"
 
-    KERNELS = ["5.13", "5.12", "5.11", "5.10", "5.4", "4.19", "4.14", "4.9", "4.4"]
+    KERNELS = [
+        "5.16",
+        "5.15",
+        "5.14",
+        "5.13",
+        "5.12",
+        "5.11",
+        "5.10",
+        "5.4",
+        "4.19",
+        "4.14",
+        "4.9",
+        "4.4",
+    ]
 
     user_options = [
         (
@@ -174,9 +187,20 @@ class test(Command):
 
         import vmtest.vm
 
-        command = fr"""cd {shlex.quote(os.getcwd())} &&
-	DRGN_RUN_LINUX_HELPER_TESTS=1 {shlex.quote(sys.executable)} -Bm \
-		unittest discover -t . -s tests/helpers/linux {"-v" if self.verbose else ""}"""
+        command = fr"""
+set -e
+
+cd {shlex.quote(os.getcwd())}
+if "$BUSYBOX" [ -e /proc/vmcore ]; then
+    "$PYTHON" -Bm unittest discover -t . -s tests/linux_kernel/vmcore {"-v" if self.verbose else ""}
+else
+    DRGN_RUN_LINUX_HELPER_TESTS=1 "$PYTHON" -Bm \
+        unittest discover -t . -s tests/helpers/linux {"-v" if self.verbose else ""}
+    "$PYTHON" vmtest/enter_kdump.py
+    # We should crash and not reach this.
+    exit 1
+fi
+"""
         try:
             returncode = vmtest.vm.run_in_vm(
                 command, Path(kernel_dir), Path(self.vmtest_dir)

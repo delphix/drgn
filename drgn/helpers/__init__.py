@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
@@ -10,10 +10,6 @@ working with particular types of programs. Currently, there are only helpers
 for the Linux kernel. In the future, there may be helpers for, e.g., glibc and
 libstdc++.
 
-Parameter types and return types are :class:`drgn.Object` unless noted
-otherwise. Many helpers include a C function signature indicating the expected
-object types.
-
 Generic Helpers
 ===============
 
@@ -23,7 +19,7 @@ useful for scripts or for implementing other helpers.
 
 import enum
 import typing
-from typing import Container, Iterable, List, Tuple
+from typing import Container, Iterable
 
 from drgn import Type
 

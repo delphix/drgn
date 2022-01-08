@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 from functools import reduce
@@ -338,6 +338,67 @@ class TestPrettyPrintTypeName(MockProgramTestCase):
         self.assertTypeName(
             self.prog.function_type(self.prog.int_type("int", 4, True), (), False),
             "int (void)",
+        )
+
+    def test_pointer_to_anonymous_struct(self):
+        self.assertTypeName(
+            self.prog.pointer_type(
+                self.prog.struct_type(
+                    None, 8, (TypeMember(self.prog.int_type("int", 4, True), "x", 0),)
+                )
+            ),
+            "struct <anonymous> *",
+        )
+
+    def test_array_of_anonymous_struct(self):
+        self.assertTypeName(
+            self.prog.array_type(
+                self.prog.struct_type(
+                    None, 8, (TypeMember(self.prog.int_type("int", 4, True), "x", 0),)
+                ),
+                2,
+            ),
+            "struct <anonymous> [2]",
+        )
+
+    def test_function_returning_anonymous_struct(self):
+        self.assertTypeName(
+            self.prog.function_type(
+                self.prog.struct_type(
+                    None, 8, (TypeMember(self.prog.int_type("int", 4, True), "x", 0),)
+                ),
+                (),
+            ),
+            "struct <anonymous> (void)",
+        )
+
+    def test_function_of_anonymous_struct(self):
+        self.assertTypeName(
+            self.prog.function_type(
+                self.prog.int_type("int", 4, True),
+                (
+                    TypeParameter(
+                        self.prog.struct_type(
+                            None,
+                            8,
+                            (TypeMember(self.prog.int_type("int", 4, True), "x", 0),),
+                        ),
+                        "x",
+                    ),
+                ),
+            ),
+            "int (struct <anonymous> x)",
+        )
+
+    def test_typedef_of_anonymous_struct(self):
+        self.assertTypeName(
+            self.prog.typedef_type(
+                "onymous",
+                self.prog.struct_type(
+                    None, 8, (TypeMember(self.prog.int_type("int", 4, True), "x", 0),)
+                ),
+            ),
+            "onymous",
         )
 
 

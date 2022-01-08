@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
@@ -11,7 +11,8 @@ masks from :linux:`include/linux/cpumask.h`.
 
 from typing import Iterator
 
-from drgn import Object, Program, sizeof
+from drgn import Object, Program
+from drgn.helpers.linux.bitops import for_each_set_bit
 
 __all__ = (
     "for_each_cpu",
@@ -27,13 +28,11 @@ def for_each_cpu(mask: Object) -> Iterator[int]:
 
     :param mask: ``struct cpumask``
     """
-    bits = mask.bits
-    word_bits = 8 * sizeof(bits.type_.type)
-    for i in range(bits.type_.length):  # type: ignore
-        word = bits[i].value_()
-        for j in range(word_bits):
-            if word & (1 << j):
-                yield (word_bits * i) + j
+    try:
+        nr_cpu_ids = mask.prog_["nr_cpu_ids"].value_()
+    except KeyError:
+        nr_cpu_ids = 1
+    return for_each_set_bit(mask.bits, nr_cpu_ids)
 
 
 def _for_each_cpu_mask(prog: Program, name: str) -> Iterator[int]:

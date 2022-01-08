@@ -1,12 +1,10 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <assert.h>
 #include <byteswap.h>
-#include <dwarf.h>
 #include <elf.h>
 #include <elfutils/libdw.h>
-#include <elfutils/version.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gelf.h>
@@ -18,7 +16,6 @@
 #include <unistd.h>
 
 #include "debug_info.h"
-#include "dwarf_index.h"
 #include "error.h"
 #include "language.h"
 #include "linux_kernel.h"
@@ -31,16 +28,7 @@
 #include "util.h"
 
 DEFINE_VECTOR_FUNCTIONS(drgn_prstatus_vector)
-DEFINE_HASH_TABLE_FUNCTIONS(drgn_prstatus_map, int_key_hash_pair, scalar_key_eq)
-
-static Elf_Type note_header_type(GElf_Phdr *phdr)
-{
-#if _ELFUTILS_PREREQ(0, 175)
-	if (phdr->p_align == 8)
-		return ELF_T_NHDR8;
-#endif
-	return ELF_T_NHDR;
-}
+DEFINE_HASH_MAP_FUNCTIONS(drgn_prstatus_map, int_key_hash_pair, scalar_key_eq)
 
 LIBDRGN_PUBLIC enum drgn_program_flags
 drgn_program_flags(struct drgn_program *prog)
@@ -112,7 +100,7 @@ void drgn_program_deinit(struct drgn_program *prog)
 	if (prog->core_fd != -1)
 		close(prog->core_fd);
 
-	drgn_debug_info_destroy(prog->_dbinfo);
+	drgn_debug_info_destroy(prog->dbinfo);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -280,7 +268,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 
 			data = elf_getdata_rawchunk(prog->core, phdr->p_offset,
 						    phdr->p_filesz,
-						    note_header_type(phdr));
+						    note_header_type(phdr->p_align));
 			if (!data) {
 				err = drgn_error_libelf();
 				goto out_platform;
@@ -295,11 +283,13 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 
 				name = (char *)data->d_buf + name_offset;
 				desc = (char *)data->d_buf + desc_offset;
-				if (strncmp(name, "CORE", nhdr.n_namesz) == 0) {
+				if (nhdr.n_namesz == sizeof("CORE") &&
+				    memcmp(name, "CORE", sizeof("CORE")) == 0) {
 					if (nhdr.n_type == NT_TASKSTRUCT)
 						have_nt_taskstruct = true;
-				} else if (strncmp(name, "VMCOREINFO",
-						   nhdr.n_namesz) == 0) {
+				} else if (nhdr.n_namesz == sizeof("VMCOREINFO") &&
+					   memcmp(name, "VMCOREINFO",
+						  sizeof("VMCOREINFO")) == 0) {
 					vmcoreinfo_note = desc;
 					vmcoreinfo_size = nhdr.n_descsz;
 					/*
@@ -350,8 +340,10 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		goto out_platform;
 	}
 
-	if ((is_proc_kcore || vmcoreinfo_note) &&
-	    prog->platform.arch->linux_kernel_pgtable_iterator_next) {
+	bool pgtable_reader =
+		(is_proc_kcore || vmcoreinfo_note) &&
+		prog->platform.arch->linux_kernel_pgtable_iterator_next;
+	if (pgtable_reader) {
 		/*
 		 * Try to read any memory that isn't in the core dump via the
 		 * page table.
@@ -381,6 +373,13 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		prog->file_segments[j].fd = prog->core_fd;
 		prog->file_segments[j].eio_is_fault = false;
 		err = drgn_program_add_memory_segment(prog, phdr->p_vaddr,
+						      /*
+						       * Don't override the page
+						       * table reader for
+						       * unsaved regions.
+						       */
+						      pgtable_reader ?
+						      phdr->p_filesz :
 						      phdr->p_memsz,
 						      drgn_read_memory_file,
 						      &prog->file_segments[j],
@@ -391,6 +390,8 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		    phdr->p_paddr != (is_64_bit ? UINT64_MAX : UINT32_MAX)) {
 			err = drgn_program_add_memory_segment(prog,
 							      phdr->p_paddr,
+							      pgtable_reader ?
+							      phdr->p_filesz :
 							      phdr->p_memsz,
 							      drgn_read_memory_file,
 							      &prog->file_segments[j],
@@ -436,6 +437,8 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 				phys_addr = phdr->p_vaddr - direct_mapping;
 				err = drgn_program_add_memory_segment(prog,
 								      phys_addr,
+								      pgtable_reader ?
+								      phdr->p_filesz :
 								      phdr->p_memsz,
 								      drgn_read_memory_file,
 								      &prog->file_segments[j],
@@ -549,70 +552,19 @@ out_fd:
 	return err;
 }
 
-struct drgn_error *drgn_program_get_dbinfo(struct drgn_program *prog,
-					   struct drgn_debug_info **ret)
-{
-	struct drgn_error *err;
-
-	if (!prog->_dbinfo) {
-		struct drgn_debug_info *dbinfo;
-		err = drgn_debug_info_create(prog, &dbinfo);
-		if (err)
-			return err;
-		err = drgn_program_add_object_finder(prog,
-						     drgn_debug_info_find_object,
-						     dbinfo);
-		if (err) {
-			drgn_debug_info_destroy(dbinfo);
-			return err;
-		}
-		err = drgn_program_add_type_finder(prog,
-						   drgn_debug_info_find_type,
-						   dbinfo);
-		if (err) {
-			drgn_object_index_remove_finder(&prog->oindex);
-			drgn_debug_info_destroy(dbinfo);
-			return err;
-		}
-		prog->_dbinfo = dbinfo;
-	}
-	*ret = prog->_dbinfo;
-	return NULL;
-}
-
 /* Set the default language from the language of "main". */
-static void drgn_program_set_language_from_main(struct drgn_debug_info *dbinfo)
+static void drgn_program_set_language_from_main(struct drgn_program *prog)
 {
 	struct drgn_error *err;
-	struct drgn_dwarf_index_iterator it;
-	static const uint64_t tags[] = { DW_TAG_subprogram };
-	err = drgn_dwarf_index_iterator_init(&it, &dbinfo->dindex.global,
-					     "main", strlen("main"), tags,
-					     ARRAY_SIZE(tags));
-	if (err) {
-		drgn_error_destroy(err);
-		return;
-	}
-	struct drgn_dwarf_index_die *index_die;
-	while ((index_die = drgn_dwarf_index_iterator_next(&it))) {
-		Dwarf_Die die;
-		err = drgn_dwarf_index_get_die(index_die, &die);
-		if (err) {
-			drgn_error_destroy(err);
-			continue;
-		}
 
-		const struct drgn_language *lang;
-		err = drgn_language_from_die(&die, false, &lang);
-		if (err) {
-			drgn_error_destroy(err);
-			continue;
-		}
-		if (lang) {
-			dbinfo->prog->lang = lang;
-			break;
-		}
-	}
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+		return;
+	const struct drgn_language *lang;
+	err = drgn_debug_info_main_language(prog->dbinfo, &lang);
+	if (err)
+		drgn_error_destroy(err);
+	if (lang)
+		prog->lang = lang;
 }
 
 static int drgn_set_platform_from_dwarf(Dwfl_Module *module, void **userdatap,
@@ -644,16 +596,33 @@ drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
 	if (!n && !load_default && !load_main)
 		return NULL;
 
-	struct drgn_debug_info *dbinfo;
-	err = drgn_program_get_dbinfo(prog, &dbinfo);
-	if (err)
-		return err;
+	struct drgn_debug_info *dbinfo = prog->dbinfo;
+	if (!dbinfo) {
+		err = drgn_debug_info_create(prog, &dbinfo);
+		if (err)
+			return err;
+		err = drgn_program_add_object_finder(prog,
+						     drgn_debug_info_find_object,
+						     dbinfo);
+		if (err) {
+			drgn_debug_info_destroy(dbinfo);
+			return err;
+		}
+		err = drgn_program_add_type_finder(prog,
+						   drgn_debug_info_find_type,
+						   dbinfo);
+		if (err) {
+			drgn_object_index_remove_finder(&prog->oindex);
+			drgn_debug_info_destroy(dbinfo);
+			return err;
+		}
+		prog->dbinfo = dbinfo;
+	}
 
 	err = drgn_debug_info_load(dbinfo, paths, n, load_default, load_main);
 	if ((!err || err->code == DRGN_ERROR_MISSING_DEBUG_INFO)) {
-		if (!prog->lang &&
-		    !(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL))
-			drgn_program_set_language_from_main(dbinfo);
+		if (!prog->lang)
+			drgn_program_set_language_from_main(prog);
 		if (!prog->has_platform) {
 			dwfl_getdwarf(dbinfo->dwfl,
 				      drgn_set_platform_from_dwarf, prog, 0);
@@ -691,7 +660,7 @@ struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
 						     size_t size)
 {
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		struct string *entry =
+		struct nstring *entry =
 			drgn_prstatus_vector_append_entry(&prog->prstatus_vector);
 		if (!entry)
 			return &drgn_enomem;
@@ -756,7 +725,7 @@ static struct drgn_error *drgn_program_cache_prstatus(struct drgn_program *prog)
 
 		data = elf_getdata_rawchunk(prog->core, phdr->p_offset,
 					    phdr->p_filesz,
-					    note_header_type(phdr));
+					    note_header_type(phdr->p_align));
 		if (!data) {
 			err = drgn_error_libelf();
 			goto out;
@@ -796,7 +765,7 @@ out:
 
 struct drgn_error *drgn_program_find_prstatus_by_cpu(struct drgn_program *prog,
 						     uint32_t cpu,
-						     struct string *ret,
+						     struct nstring *ret,
 						     uint32_t *tid_ret)
 {
 	assert(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL);
@@ -816,7 +785,7 @@ struct drgn_error *drgn_program_find_prstatus_by_cpu(struct drgn_program *prog,
 
 struct drgn_error *drgn_program_find_prstatus_by_tid(struct drgn_program *prog,
 						     uint32_t tid,
-						     struct string *ret)
+						     struct nstring *ret)
 {
 	struct drgn_error *err;
 	struct drgn_prstatus_map_iterator it;
@@ -1095,8 +1064,8 @@ bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 						  struct drgn_symbol *ret)
 {
 	if (!module) {
-		if (prog->_dbinfo) {
-			module = dwfl_addrmodule(prog->_dbinfo->dwfl, address);
+		if (prog->dbinfo) {
+			module = dwfl_addrmodule(prog->dbinfo->dwfl, address);
 			if (!module)
 				return false;
 		} else {
@@ -1110,9 +1079,7 @@ bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 						&elf_sym, NULL, NULL, NULL);
 	if (!name)
 		return false;
-	ret->name = name;
-	ret->address = address - offset;
-	ret->size = elf_sym.st_size;
+	drgn_symbol_from_elf(name, address - offset, &elf_sym, ret);
 	return true;
 }
 
@@ -1143,8 +1110,9 @@ drgn_program_find_symbol_by_address(struct drgn_program *prog, uint64_t address,
 
 struct find_symbol_by_name_arg {
 	const char *name;
-	struct drgn_symbol **ret;
-	struct drgn_error *err;
+	GElf_Sym sym;
+	GElf_Addr addr;
+	bool found;
 	bool bad_symtabs;
 };
 
@@ -1153,34 +1121,43 @@ static int find_symbol_by_name_cb(Dwfl_Module *dwfl_module, void **userdatap,
 				  void *cb_arg)
 {
 	struct find_symbol_by_name_arg *arg = cb_arg;
-	int symtab_len, i;
-
-	symtab_len = dwfl_module_getsymtab(dwfl_module);
-	i = dwfl_module_getsymtab_first_global(dwfl_module);
-	if (symtab_len == -1 || i == -1) {
+	int symtab_len = dwfl_module_getsymtab(dwfl_module);
+	if (symtab_len == -1) {
 		arg->bad_symtabs = true;
 		return DWARF_CB_OK;
 	}
-	for (; i < symtab_len; i++) {
-		GElf_Sym elf_sym;
-		GElf_Addr elf_addr;
-		const char *name;
-
-		name = dwfl_module_getsym_info(dwfl_module, i, &elf_sym,
-					       &elf_addr, NULL, NULL, NULL);
+	/*
+	 * Global symbols are after local symbols, so by iterating backwards we
+	 * might find a global symbol faster. Ignore the zeroth null symbol.
+	 */
+	for (int i = symtab_len - 1; i > 0; i--) {
+		GElf_Sym sym;
+		GElf_Addr addr;
+		const char *name = dwfl_module_getsym_info(dwfl_module, i, &sym,
+							   &addr, NULL, NULL,
+							   NULL);
 		if (name && strcmp(arg->name, name) == 0) {
-			struct drgn_symbol *sym;
-
-			sym = malloc(sizeof(*sym));
-			if (sym) {
-				sym->name = name;
-				sym->address = elf_addr;
-				sym->size = elf_sym.st_size;
-				*arg->ret = sym;
-			} else {
-				arg->err = &drgn_enomem;
+			/*
+			 * The order of precedence is
+			 * GLOBAL = GNU_UNIQUE > WEAK > LOCAL = everything else
+			 *
+			 * If we found a global or unique symbol, return it
+			 * immediately. If we found a weak symbol, then save it,
+			 * which may overwrite a previously found weak or local
+			 * symbol. Otherwise, save the symbol only if we haven't
+			 * found another symbol.
+			 */
+			if (GELF_ST_BIND(sym.st_info) == STB_GLOBAL ||
+			    GELF_ST_BIND(sym.st_info) == STB_GNU_UNIQUE ||
+			    GELF_ST_BIND(sym.st_info) == STB_WEAK ||
+			    !arg->found) {
+				arg->sym = sym;
+				arg->addr = addr;
+				arg->found = true;
 			}
-			return DWARF_CB_ABORT;
+			if (GELF_ST_BIND(sym.st_info) == STB_GLOBAL ||
+			    GELF_ST_BIND(sym.st_info) == STB_GNU_UNIQUE)
+				return DWARF_CB_ABORT;
 		}
 	}
 	return DWARF_CB_OK;
@@ -1192,13 +1169,19 @@ drgn_program_find_symbol_by_name(struct drgn_program *prog,
 {
 	struct find_symbol_by_name_arg arg = {
 		.name = name,
-		.ret = ret,
 	};
-
-	if (prog->_dbinfo &&
-	    dwfl_getmodules(prog->_dbinfo->dwfl, find_symbol_by_name_cb,
-			    &arg, 0))
-		return arg.err;
+	if (prog->dbinfo) {
+		dwfl_getmodules(prog->dbinfo->dwfl, find_symbol_by_name_cb,
+				&arg, 0);
+		if (arg.found) {
+			struct drgn_symbol *sym = malloc(sizeof(*sym));
+			if (!sym)
+				return &drgn_enomem;
+			drgn_symbol_from_elf(name, arg.addr, &arg.sym, sym);
+			*ret = sym;
+			return NULL;
+		}
+	}
 	return drgn_error_format(DRGN_ERROR_LOOKUP,
 				 "could not find symbol with name '%s'%s", name,
 				 arg.bad_symtabs ?

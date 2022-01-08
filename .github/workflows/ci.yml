@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [3.9, 3.8, 3.7, 3.6]
+        python-version: ['3.10', '3.9', '3.8', '3.7', '3.6']
         cc: [gcc, clang]
       fail-fast: false
     env:
@@ -23,11 +23,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install busybox-static libelf-dev libdw-dev qemu-kvm zstd ${{ matrix.cc == 'clang' && 'libomp-$(clang --version | sed -rn "s/.*clang version ([0-9]+).*/\\1/p")-dev' || '' }}
-          pip install mypy
+          pip install mypy pyroute2
       - name: Generate version.py
         run: python setup.py --version
       - name: Check with mypy
-        run: mypy --strict --no-warn-return-any drgn _drgn.pyi
+        run: mypy --strict --no-warn-return-any --no-warn-unused-ignores drgn _drgn.pyi
       - name: Build and test with ${{ matrix.cc }}
         run: python setup.py test -K
 

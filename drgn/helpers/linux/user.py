@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """
@@ -32,7 +32,7 @@ def find_user(prog: Program, uid: Union[Object, IntegerLike]) -> Object:
     Return the user structure with the given UID.
 
     :param uid: ``kuid_t`` object or integer.
-    :return: ``struct user_state *``
+    :return: ``struct user_struct *`` (``NULL`` if not found)
     """
     try:
         uidhashentry = prog.cache["uidhashentry"]

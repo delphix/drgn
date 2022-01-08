@@ -1,4 +1,4 @@
-// Copyright (c) Facebook, Inc. and its affiliates.
+// Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <elfutils/libdwfl.h>
@@ -86,8 +86,8 @@ void drgn_register_state_set_pc(struct drgn_program *prog,
 	pc &= drgn_platform_address_mask(&prog->platform);
 	regs->_pc = pc;
 	drgn_register_state_set_known(regs, 0);
-	if (prog->_dbinfo) {
-		Dwfl_Module *dwfl_module = dwfl_addrmodule(prog->_dbinfo->dwfl,
+	if (prog->dbinfo) {
+		Dwfl_Module *dwfl_module = dwfl_addrmodule(prog->dbinfo->dwfl,
 							   pc - !regs->interrupted);
 		if (dwfl_module) {
 			void **userdatap;

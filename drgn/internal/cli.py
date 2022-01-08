@@ -1,4 +1,4 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
 
 """drgn command line interface"""
@@ -93,7 +93,8 @@ def main() -> None:
         "-q",
         "--quiet",
         action="store_true",
-        help="don't print non-fatal warnings (e.g., about missing debugging information)",
+        help="don't print download progress or non-fatal warnings "
+        "(e.g., about missing debugging information)",
     )
     parser.add_argument(
         "script",
@@ -105,6 +106,11 @@ def main() -> None:
     parser.add_argument("--version", action="version", version=version)
 
     args = parser.parse_args()
+
+    if not args.script:
+        print(version, file=sys.stderr, flush=True)
+    if not args.quiet:
+        os.environ["DEBUGINFOD_PROGRESS"] = "1"
 
     prog = drgn.Program()
     if args.core is not None:
@@ -170,13 +176,11 @@ def main() -> None:
 
         sys.displayhook = displayhook
 
-        banner = (
-            version
-            + """
+        banner = """\
 For help, type help(drgn).
 >>> import drgn
->>> from drgn import """
-            + ", ".join(drgn_globals)
+>>> from drgn import """ + ", ".join(
+            drgn_globals
         )
         if prog.flags & drgn.ProgramFlags.IS_LINUX_KERNEL:
             banner += "\n>>> from drgn.helpers.linux import *"
