@@ -3,16 +3,19 @@
 
 #include <assert.h>
 #include <byteswap.h>
+#include <dirent.h>
 #include <elf.h>
 #include <elfutils/libdw.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gelf.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/statfs.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "debug_info.h"
@@ -40,9 +43,16 @@ DEFINE_HASH_TABLE_FUNCTIONS(drgn_thread_set, drgn_thread_to_key,
 struct drgn_thread_iterator {
 	struct drgn_program *prog;
 	union {
+		/* For userspace core dumps. */
 		struct drgn_thread_set_iterator iterator;
 		struct {
-			struct linux_helper_task_iterator task_iter;
+			union {
+				/* For live processes. */
+				DIR *tasks_dir;
+				/* For the Linux kernel. */
+				struct linux_helper_task_iterator task_iter;
+			};
+			/* For both live processes and the Linux kernel. */
 			struct drgn_thread entry;
 		};
 	};
@@ -99,11 +109,15 @@ void drgn_program_deinit(struct drgn_program *prog)
 		else
 			drgn_thread_set_deinit(&prog->thread_set);
 	}
-	// When the target is a userspace core dump, `crashed_thread` will have
-	// been included in `prog->thread_set`, and thus freed by the above
-	// call to `drgn_thread_set_deinit`.
+	/*
+	 * For userspace core dumps, main_thread and crashed_thread are in
+	 * prog->thread_set and thus freed by the above call to
+	 * drgn_thread_set_deinit().
+	 */
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
 		drgn_thread_destroy(prog->crashed_thread);
+	else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
+		drgn_thread_destroy(prog->main_thread);
 	free(prog->pgtable_it);
 
 	drgn_object_deinit(&prog->vmemmap);
@@ -535,8 +549,10 @@ drgn_program_set_pid(struct drgn_program *prog, pid_t pid)
 	if (err)
 		return err;
 
-	char buf[64];
-	sprintf(buf, "/proc/%ld/mem", (long)pid);
+#define FORMAT "/proc/%ld/mem"
+	char buf[sizeof(FORMAT) - sizeof("%ld") + max_decimal_length(long) + 1];
+	snprintf(buf, sizeof(buf), FORMAT, (long)pid);
+#undef FORMAT
 	prog->core_fd = open(buf, O_RDONLY);
 	if (prog->core_fd == -1)
 		return drgn_error_create_os("open", errno, buf);
@@ -751,7 +767,8 @@ LIBDRGN_PUBLIC void drgn_thread_destroy(struct drgn_thread *thread)
 {
 	if (thread) {
 		drgn_thread_deinit(thread);
-		if (thread->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+		if (thread->prog->flags &
+		    (DRGN_PROGRAM_IS_LINUX_KERNEL | DRGN_PROGRAM_IS_LIVE))
 			free(thread);
 	}
 }
@@ -914,39 +931,64 @@ err:
 	return err;
 }
 
+static struct drgn_error *
+drgn_thread_iterator_init_linux_kernel(struct drgn_thread_iterator *it)
+{
+	struct drgn_error *err = linux_helper_task_iterator_init(&it->task_iter,
+								 it->prog);
+	if (err)
+		return err;
+	drgn_object_init(&it->entry.object, it->prog);
+	it->entry.prstatus = (struct nstring){};
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_thread_iterator_init_userspace_live(struct drgn_thread_iterator *it)
+{
+#define FORMAT "/proc/%ld/task"
+	char path[sizeof(FORMAT)
+		- sizeof("%ld")
+		+ max_decimal_length(long)
+		+ 1];
+	snprintf(path, sizeof(path), FORMAT, (long)it->prog->pid);
+#undef FORMAT
+	it->tasks_dir = opendir(path);
+	if (!it->tasks_dir)
+		return drgn_error_create_os("opendir", errno, path);
+	it->entry.prog = it->prog;
+	it->entry.prstatus = (struct nstring){};
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_thread_iterator_init_userspace_core(struct drgn_thread_iterator *it)
+{
+	struct drgn_error *err = drgn_program_cache_core_dump_notes(it->prog);
+	if (err)
+		return err;
+	it->iterator = drgn_thread_set_first(&it->prog->thread_set);
+	return NULL;
+}
+
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_thread_iterator_create(struct drgn_program *prog,
 			    struct drgn_thread_iterator **ret)
 {
 	struct drgn_error *err;
 
-	if ((prog->flags &
-	     (DRGN_PROGRAM_IS_LINUX_KERNEL | DRGN_PROGRAM_IS_LIVE)) ==
-	    DRGN_PROGRAM_IS_LIVE) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "finding threads is not yet supported for live processes");
-	}
-
 	*ret = malloc(sizeof(**ret));
 	if (!*ret)
 		return &drgn_enomem;
 	(*ret)->prog = prog;
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		err = linux_helper_task_iterator_init(&(*ret)->task_iter, prog);
-		if (err)
-			goto err;
-		drgn_object_init(&(*ret)->entry.object, prog);
-		(*ret)->entry.prstatus = (struct nstring){};
-	} else {
-		err = drgn_program_cache_core_dump_notes(prog);
-		if (err)
-			goto err;
-		(*ret)->iterator = drgn_thread_set_first(&prog->thread_set);
-	}
-	return NULL;
-
-err:
-	free(*ret);
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+		err = drgn_thread_iterator_init_linux_kernel(*ret);
+	else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
+		err = drgn_thread_iterator_init_userspace_live(*ret);
+	else
+		err = drgn_thread_iterator_init_userspace_core(*ret);
+	if (err)
+		free(*ret);
 	return err;
 }
 
@@ -957,9 +999,82 @@ drgn_thread_iterator_destroy(struct drgn_thread_iterator *it)
 		if (it->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 			drgn_object_deinit(&it->entry.object);
 			linux_helper_task_iterator_deinit(&it->task_iter);
+		} else if (it->prog->flags & DRGN_PROGRAM_IS_LIVE) {
+			closedir(it->tasks_dir);
 		}
 		free(it);
 	}
+}
+
+static struct drgn_error *
+drgn_thread_iterator_next_linux_kernel(struct drgn_thread_iterator *it,
+				       struct drgn_thread **ret)
+{
+	struct drgn_error *err;
+	const struct drgn_object *task;
+	err = linux_helper_task_iterator_next(&it->task_iter, &task);
+	if (err)
+		return err;
+	if (!task) {
+		*ret = NULL;
+		return NULL;
+	}
+	it->entry.prog = drgn_object_program(task);
+	err = drgn_object_copy(&it->entry.object, task);
+	if (err)
+		return err;
+	struct drgn_object tid;
+	union drgn_value tid_value;
+	drgn_object_init(&tid, drgn_object_program(task));
+	err = drgn_object_member_dereference(&tid, task, "pid");
+	if (!err)
+		err = drgn_object_read_integer(&tid, &tid_value);
+	drgn_object_deinit(&tid);
+	if (err)
+		return err;
+	it->entry.tid = tid_value.uvalue;
+	*ret = &it->entry;
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_thread_iterator_next_userspace_live(struct drgn_thread_iterator *it,
+					 struct drgn_thread **ret)
+{
+	struct dirent *task;
+	unsigned long tid;
+	char *end;
+	do {
+		errno = 0;
+		task = readdir(it->tasks_dir);
+		if (!task) {
+			if (errno) {
+				return drgn_error_create_os("readdir", errno,
+							    NULL);
+			}
+			*ret = NULL;
+			return NULL;
+		}
+
+		errno = 0;
+		tid = strtoul(task->d_name, &end, 10);
+		/*
+		 * Skip anything that isn't a number (like "." and "..") or
+		 * overflows (which is impossible normally).
+		 */
+	} while (*end != '\0' || (tid == ULONG_MAX && errno == ERANGE));
+	it->entry.tid = tid;
+	*ret = &it->entry;
+	return NULL;
+}
+
+static void
+drgn_thread_iterator_next_userspace_core(struct drgn_thread_iterator *it,
+					 struct drgn_thread **ret)
+{
+	*ret = it->iterator.entry;
+	if (it->iterator.entry)
+		it->iterator = drgn_thread_set_next(it->iterator);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -967,35 +1082,92 @@ drgn_thread_iterator_next(struct drgn_thread_iterator *it,
 			  struct drgn_thread **ret)
 {
 	if (it->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		const struct drgn_object *task;
-		struct drgn_error *err =
-			linux_helper_task_iterator_next(&it->task_iter, &task);
-		if (err)
-			return err;
-		if (!task) {
-			*ret = NULL;
-			return NULL;
-		}
-		it->entry.prog = drgn_object_program(task);
-		err = drgn_object_copy(&it->entry.object, task);
-		if (err)
-			return err;
-		struct drgn_object tid;
-		union drgn_value tid_value;
-		drgn_object_init(&tid, drgn_object_program(task));
-		err = drgn_object_member_dereference(&tid, task, "pid");
-		if (!err)
-			err = drgn_object_read_integer(&tid, &tid_value);
-		drgn_object_deinit(&tid);
-		if (err)
-			return err;
-		it->entry.tid = tid_value.uvalue;
-		*ret = &it->entry;
+		return drgn_thread_iterator_next_linux_kernel(it, ret);
+	} else if (it->prog->flags & DRGN_PROGRAM_IS_LIVE) {
+		return drgn_thread_iterator_next_userspace_live(it, ret);
 	} else {
-		*ret = it->iterator.entry;
-		if (it->iterator.entry)
-			it->iterator = drgn_thread_set_next(it->iterator);
+		drgn_thread_iterator_next_userspace_core(it, ret);
+		return NULL;
 	}
+}
+
+static struct drgn_error *
+drgn_program_find_thread_linux_kernel(struct drgn_program *prog, uint32_t tid,
+				      struct drgn_thread **ret)
+{
+	struct drgn_error *err;
+
+	*ret = malloc(sizeof(**ret));
+	if (!*ret)
+		return &drgn_enomem;
+	(*ret)->prog = prog;
+	(*ret)->tid = tid;
+	(*ret)->prstatus = (struct nstring){};
+
+	struct drgn_object *object = &(*ret)->object;
+	drgn_object_init(object, prog);
+	err = drgn_program_find_object(prog, "init_pid_ns", NULL,
+				       DRGN_FIND_OBJECT_VARIABLE, object);
+	if (err)
+		goto err;
+	err = drgn_object_address_of(object, object);
+	if (err)
+		goto err;
+	err = linux_helper_find_task(object, object, tid);
+	if (err)
+		goto err;
+	bool truthy;
+	err = drgn_object_bool(object, &truthy);
+	if (err)
+		goto err;
+	if (!truthy) {
+		drgn_thread_destroy(*ret);
+		*ret = NULL;
+	}
+	return NULL;
+
+err:
+	drgn_thread_destroy(*ret);
+	return err;
+}
+
+static struct drgn_error *
+drgn_program_find_thread_userspace_live(struct drgn_program *prog, uint32_t tid,
+					struct drgn_thread **ret)
+{
+#define FORMAT "/proc/%ld/task/%" PRIu32
+	char path[sizeof(FORMAT)
+		- sizeof("%ld%" PRIu32)
+		+ max_decimal_length(long)
+		+ max_decimal_length(uint32_t)
+		+ 1];
+	snprintf(path, sizeof(path), FORMAT, (long)prog->pid, tid);
+#undef FORMAT
+	int r = access(path, F_OK);
+	if (r == 0) {
+		*ret = malloc(sizeof(**ret));
+		if (!*ret)
+			return &drgn_enomem;
+		(*ret)->prog = prog;
+		(*ret)->tid = tid;
+		(*ret)->prstatus = (struct nstring){};
+		return NULL;
+	} else if (errno == ENOENT) {
+		*ret = NULL;
+		return NULL;
+	} else {
+		return drgn_error_create_os("access", errno, path);
+	}
+}
+
+static struct drgn_error *
+drgn_program_find_thread_userspace_core(struct drgn_program *prog, uint32_t tid,
+					struct drgn_thread **ret)
+{
+	struct drgn_error *err = drgn_program_cache_core_dump_notes(prog);
+	if (err)
+		return err;
+	*ret = drgn_thread_set_search(&prog->thread_set, &tid).entry;
 	return NULL;
 }
 
@@ -1003,44 +1175,12 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_find_thread(struct drgn_program *prog, uint32_t tid,
 			 struct drgn_thread **ret)
 {
-	struct drgn_error *err;
-
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
-		*ret = malloc(sizeof(**ret));
-		if (!*ret)
-			return &drgn_enomem;
-		(*ret)->prog = prog;
-		(*ret)->tid = tid;
-		(*ret)->prstatus = (struct nstring){};
-
-		struct drgn_object *object = &(*ret)->object;
-		drgn_object_init(object, prog);
-		err = drgn_program_find_object(prog, "init_pid_ns", NULL,
-					       DRGN_FIND_OBJECT_VARIABLE,
-					       object);
-		if (err)
-			goto kernel_err;
-		err = drgn_object_address_of(object, object);
-		if (err)
-			goto kernel_err;
-		err = linux_helper_find_task(object, object, tid);
-		if (err)
-			goto kernel_err;
-		return NULL;
-
-kernel_err:
-		drgn_thread_destroy(*ret);
-		return err;
-	} else if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "finding threads is not yet supported for live processes");
-	} else {
-		err = drgn_program_cache_core_dump_notes(prog);
-		if (err)
-			return err;
-		*ret = drgn_thread_set_search(&prog->thread_set, &tid).entry;
-		return NULL;
-	}
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
+		return drgn_program_find_thread_linux_kernel(prog, tid, ret);
+	else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
+		return drgn_program_find_thread_userspace_live(prog, tid, ret);
+	else
+		return drgn_program_find_thread_userspace_core(prog, tid, ret);
 }
 
 static struct drgn_error *
@@ -1111,12 +1251,19 @@ drgn_program_main_thread(struct drgn_program *prog, struct drgn_thread **ret)
 					 "main thread is not defined for the Linux kernel");
 	}
 	if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "finding threads is not yet supported for live processes");
+		if (!prog->main_thread) {
+			err = drgn_program_find_thread(prog, prog->pid,
+						       &prog->main_thread);
+			if (err) {
+				prog->main_thread = NULL;
+				return err;
+			}
+		}
+	} else {
+		err = drgn_program_cache_core_dump_notes(prog);
+		if (err)
+			return err;
 	}
-	err = drgn_program_cache_core_dump_notes(prog);
-	if (err)
-		return err;
 	if (!prog->main_thread) {
 		return drgn_error_create(DRGN_ERROR_OTHER,
 					 "main thread not found");
