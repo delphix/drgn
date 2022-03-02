@@ -89,15 +89,49 @@ AS_CASE(["x$with_libkdumpfile"],
 AM_CONDITIONAL([WITH_LIBKDUMPFILE], [test "x$with_libkdumpfile" = xyes])
 AM_COND_IF([WITH_LIBKDUMPFILE], [AC_DEFINE(WITH_LIBKDUMPFILE)])
 
+AC_ARG_ENABLE([compiler-warnings],
+	      [AS_HELP_STRING([--enable-compiler-warnings@<:@=no|yes|error@:>@],
+			      [enable compiler warnings. If no, then only the
+			       default compiler warnings are enabled. If yes,
+			       then additional warnings required by the package
+			       are enabled. If error, then warnings are treated
+			       as errors (this is only intended for
+			       developers). @<:@default=yes@:>@])],
+	      [], [enable_compiler_warnings=no])
+
+dnl Make Clang error instead of warn for unknown warning options.
+AX_CHECK_COMPILE_FLAG([-Werror=unknown-warning-option],
+		      [compiler_flags_test="-Werror=unknown-warning-option"],
+		      [compiler_flags_test=""])
+AS_IF([test "x$enable_compiler_warnings" != xno],
+      [AX_APPEND_COMPILE_FLAGS([ dnl
+       -Wall dnl
+       -Wformat-overflow=2 dnl
+       -Wformat-truncation=2 dnl
+       ], [WARN_CFLAGS], [$compiler_flags_test])])
+AS_IF([test "x$enable_compiler_warnings" = xerror],
+      [AX_APPEND_FLAG([-Werror], [WARN_CFLAGS])])
+AC_SUBST(WARN_CFLAGS)
+
 AC_ARG_ENABLE([asan],
 	      [AS_HELP_STRING([--enable-asan], [enable AddressSanitizer])],
 	      [], [enable_asan=no])
 
-SANITIZER_CFLAGS=
-SANITIZER_LDFLAGS=
 AS_IF([test "x$enable_asan" != xno],
-      [SANITIZER_CFLAGS="$SANITIZER_CFLAGS -fsanitize=address -fno-omit-frame-pointer"
-       SANITIZER_LDFLAGS="$SANITIZER_LDFLAGS -fsanitize=address"])
+      [AX_APPEND_FLAG([-fsanitize=address], [SANITIZER_CFLAGS])
+       AX_APPEND_FLAG([-fno-omit-frame-pointer], [SANITIZER_CFLAGS])
+       AX_APPEND_FLAG([-fsanitize=address], [SANITIZER_LDFLAGS])])
+
+AC_ARG_ENABLE([ubsan],
+	      [AS_HELP_STRING([--enable-ubsan],
+			      [enable UndefinedBehaviorSanitizer])],
+	      [], [enable_ubsan=no])
+
+AS_IF([test "x$enable_ubsan" != xno],
+      [AX_APPEND_FLAG([-fsanitize=undefined], [SANITIZER_CFLAGS])
+       AX_APPEND_FLAG([-fno-omit-frame-pointer], [SANITIZER_CFLAGS])
+       AX_APPEND_FLAG([-fsanitize=undefined], [SANITIZER_LDFLAGS])])
+
 AC_SUBST(SANITIZER_CFLAGS)
 AC_SUBST(SANITIZER_LDFLAGS)
 
