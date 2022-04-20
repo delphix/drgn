@@ -361,7 +361,12 @@ drgn_type_language(struct drgn_type *type);
 enum drgn_architecture {
 	DRGN_ARCH_UNKNOWN,
 	DRGN_ARCH_X86_64,
+	DRGN_ARCH_I386,
+	DRGN_ARCH_AARCH64,
+	DRGN_ARCH_ARM,
 	DRGN_ARCH_PPC64,
+	DRGN_ARCH_RISCV64,
+	DRGN_ARCH_RISCV32,
 };
 
 /** Flags describing a @ref drgn_platform. */
