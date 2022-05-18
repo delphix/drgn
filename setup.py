@@ -13,10 +13,12 @@ from distutils.errors import DistutilsError
 from distutils.file_util import copy_file
 import os
 import os.path
+from pathlib import Path
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 
 from setuptools import Command, find_packages, setup
 from setuptools.command.build_ext import build_ext as _build_ext
@@ -146,12 +148,20 @@ class test(Command):
         "4.4",
     ]
 
+    KERNEL_FLAVORS = ["default", "alternative", "tiny"]
+
     user_options = [
         (
             "kernel",
             "K",
-            "run Linux kernel helper tests in a virtual machine on all supported kernels "
+            "run Linux kernel tests in a virtual machine on all supported kernels "
             f"({', '.join(KERNELS)})",
+        ),
+        (
+            "all-kernel-flavors",
+            "F",
+            "when combined with -K, run Linux kernel tests on all supported flavors "
+            f"({', '.join(KERNEL_FLAVORS)}) instead of just the default flavor",
         ),
         (
             "extra-kernels=",
@@ -168,13 +178,17 @@ class test(Command):
 
     def initialize_options(self):
         self.kernel = False
+        self.all_kernel_flavors = False
         self.extra_kernels = ""
         self.vmtest_dir = None
 
     def finalize_options(self):
         self.kernels = [kernel for kernel in self.extra_kernels.split(",") if kernel]
         if self.kernel:
-            self.kernels.extend(kernel + ".*" for kernel in test.KERNELS)
+            flavors = test.KERNEL_FLAVORS if self.all_kernel_flavors else [""]
+            self.kernels.extend(
+                kernel + ".*" + flavor for kernel in test.KERNELS for flavor in flavors
+            )
         if self.vmtest_dir is None:
             build_base = self.get_finalized_command("build").build_base
             self.vmtest_dir = os.path.join(build_base, "vmtest")
@@ -188,29 +202,68 @@ class test(Command):
         test = unittest.main(module=None, argv=argv, exit=False)
         return test.result.wasSuccessful()
 
-    def _run_vm(self, kernel_dir):
-        from pathlib import Path
+    def _build_kmod(self, kernel_dir, kmod):
+        kernel_build_dir = kernel_dir / "build"
+        # External modules can't do out-of-tree builds for some reason, so copy
+        # the source files to a temporary directory and build the module there,
+        # then move it to the final location.
+        kmod_source_dir = Path("tests/linux_kernel/kmod")
+        source_files = ("drgn_test.c", "Makefile")
+        if out_of_date(
+            kmod, *[kmod_source_dir / filename for filename in source_files]
+        ):
+            with tempfile.TemporaryDirectory(dir=kmod.parent) as tmp_name:
+                tmp_dir = Path(tmp_name)
+                # Make sure that header files have the same paths as in the
+                # original kernel build.
+                debug_prefix_map = [
+                    f"{kernel_build_dir.resolve()}=.",
+                    f"{tmp_dir.resolve()}=./drgn_test",
+                ]
+                cflags = " ".join(
+                    ["-fdebug-prefix-map=" + map for map in debug_prefix_map]
+                )
+                for filename in source_files:
+                    copy_file(kmod_source_dir / filename, tmp_dir / filename)
+                if (
+                    subprocess.call(
+                        [
+                            "make",
+                            "-C",
+                            kernel_build_dir,
+                            f"M={tmp_dir.resolve()}",
+                            "KAFLAGS=" + cflags,
+                            "KCFLAGS=" + cflags,
+                            "-j",
+                            str(nproc()),
+                        ]
+                    )
+                    != 0
+                ):
+                    return False
+                (tmp_dir / "drgn_test.ko").rename(kmod)
+        return True
 
+    def _run_vm(self, kernel_dir, kernel_release):
         import vmtest.vm
 
-        kernel_release = kernel_dir.name
-        if kernel_release.startswith("kernel-"):
-            kernel_release = kernel_release[len("kernel-") :]
         self.announce(f"running tests in VM on Linux {kernel_release}", log.INFO)
+
+        kmod = kernel_dir.parent / f"drgn_test-{kernel_release}.ko"
+        if not self._build_kmod(kernel_dir, kmod):
+            return False
 
         command = rf"""
 set -e
 
 cd {shlex.quote(os.getcwd())}
+export DRGN_TEST_KMOD={shlex.quote(str(kmod))}
 if "$BUSYBOX" [ -e /proc/vmcore ]; then
     "$PYTHON" -Bm unittest discover -t . -s tests/linux_kernel/vmcore {"-v" if self.verbose else ""}
 else
-    # In Python 3.7 and newer, we can replace these two calls with:
-    # unittest discover -k 'tests.linux_kernel.*' -k 'tests.helpers.linux.*'
+    "$BUSYBOX" insmod "$DRGN_TEST_KMOD"
     DRGN_RUN_LINUX_KERNEL_TESTS=1 "$PYTHON" -Bm \
         unittest discover -t . -s tests/linux_kernel {"-v" if self.verbose else ""}
-    DRGN_RUN_LINUX_KERNEL_TESTS=1 "$PYTHON" -Bm \
-        unittest discover -t . -s tests/helpers/linux {"-v" if self.verbose else ""}
     "$PYTHON" vmtest/enter_kdump.py
     # We should crash and not reach this.
     exit 1
@@ -222,16 +275,30 @@ fi
             )
         except vmtest.vm.LostVMError as e:
             self.announce(f"error on Linux {kernel_release}: {e}", log.ERROR)
-            return kernel_release, False
+            return False
         self.announce(
             f"Tests in VM on Linux {kernel_release} returned {returncode}", log.INFO
         )
-        return kernel_release, returncode == 0
+        return returncode == 0
 
     def run(self):
-        from pathlib import Path
-
         from vmtest.download import download_kernels_in_thread
+
+        if os.getenv("GITHUB_ACTIONS") == "true":
+
+            @contextlib.contextmanager
+            def github_workflow_group(title):
+                print("::group::" + title, flush=True)
+                try:
+                    yield
+                finally:
+                    print("::endgroup::", flush=True)
+
+        else:
+
+            @contextlib.contextmanager
+            def github_workflow_group(title):
+                yield
 
         # Start downloads ASAP so that they're hopefully done by the time we
         # need them.
@@ -240,27 +307,36 @@ fi
         ) as kernel_downloads:
             if self.kernels:
                 self.announce("downloading kernels in the background", log.INFO)
-            self.run_command("egg_info")
-            self.reinitialize_command("build_ext", inplace=1)
-            self.run_command("build_ext")
+
+            with github_workflow_group("Build extension"):
+                self.run_command("egg_info")
+                self.reinitialize_command("build_ext", inplace=1)
+                self.run_command("build_ext")
 
             passed = []
             failed = []
 
-            if self.kernels:
-                self.announce("running tests locally", log.INFO)
-            if self._run_local():
-                passed.append("local")
-            else:
-                failed.append("local")
+            with github_workflow_group("Run unit tests"):
+                if self.kernels:
+                    self.announce("running tests locally", log.INFO)
+                    if self._run_local():
+                        passed.append("local")
+                    else:
+                        failed.append("local")
 
             if self.kernels:
                 for kernel in kernel_downloads:
-                    kernel_release, success = self._run_vm(kernel)
-                    if success:
-                        passed.append(kernel_release)
-                    else:
-                        failed.append(kernel_release)
+                    kernel_release = kernel.name
+                    if kernel_release.startswith("kernel-"):
+                        kernel_release = kernel_release[len("kernel-") :]
+
+                    with github_workflow_group(
+                        f"Run integration tests on Linux {kernel_release}"
+                    ):
+                        if self._run_vm(kernel, kernel_release):
+                            passed.append(kernel_release)
+                        else:
+                            failed.append(kernel_release)
 
                 if passed:
                     self.announce(f'Passed: {", ".join(passed)}', log.INFO)
