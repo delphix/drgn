@@ -30,7 +30,7 @@ class KernelFlavor(NamedTuple):
     config: str
 
     def localversion(self) -> str:
-        localversion = "-vmtest11"
+        localversion = "-vmtest12"
         # The default flavor should be the "latest" version.
         localversion += ".1" if self.name == "default" else ".0"
         localversion += self.name
@@ -145,6 +145,9 @@ CONFIG_NAMESPACES=y
 
 # For nodemask tests.
 CONFIG_NUMA=y
+
+# For slab allocator tests.
+CONFIG_SLAB_FREELIST_HARDENED=y
 
 # For Traffic Control tests.
 CONFIG_NET_SCHED=y
@@ -348,7 +351,11 @@ class KBuild:
                     dst_path = modules_build_dir / src_path.relative_to(src_dir)
                     dst_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(
-                        src_path, dst_path, symlinks=True, dirs_exist_ok=True
+                        src_path,
+                        dst_path,
+                        ignore=shutil.ignore_patterns("*.cmd"),
+                        symlinks=True,
+                        dirs_exist_ok=True,
                     )
 
     async def _test_external_module_build(self, modules_dir: Path) -> None:
