@@ -116,7 +116,7 @@ class TestInit(MockProgramTestCase):
             "unsupported integer bit size",
             Object,
             self.prog,
-            self.prog.int_type("BIG", 16, True),
+            self.prog.int_type("BIGGEST", 1024**3, True),
         )
 
     def test_float_size(self):
@@ -442,6 +442,59 @@ class TestReference(MockProgramTestCase):
             Object(self.prog, self.point_type, address=0xFFFF0004),
         )
 
+    def test_big_int(self):
+        buffer = (1000).to_bytes(16, "little")
+        self.add_memory_segment(buffer, virt_addr=0xFFFF0000)
+        obj = Object(
+            self.prog,
+            self.prog.int_type("unsigned __int128", 16, False),
+            address=0xFFFF0000,
+        )
+        self.assertIs(obj.prog_, self.prog)
+        self.assertFalse(obj.absent_)
+        self.assertEqual(obj.address_, 0xFFFF0000)
+        self.assertEqual(obj.bit_offset_, 0)
+        self.assertIsNone(obj.bit_field_size_)
+        self.assertEqual(obj.type_.size, 16)
+        self.assertRaisesRegex(
+            NotImplementedError,
+            "integer values larger than 64 bits are not yet supported",
+            obj.value_,
+        )
+        self.assertEqual(obj.to_bytes_(), buffer)
+        self.assertEqual(
+            repr(obj), "Object(prog, 'unsigned __int128', address=0xffff0000)"
+        )
+
+    def test_bit_field_of_big_int(self):
+        buffer = (1000).to_bytes(4, "little")
+        self.add_memory_segment(buffer, virt_addr=0xFFFF0000)
+        obj = Object(
+            self.prog,
+            self.prog.int_type("unsigned __int128", 16, False),
+            address=0xFFFF0000,
+            bit_field_size=32,
+        )
+        self.assertIs(obj.prog_, self.prog)
+        self.assertFalse(obj.absent_)
+        self.assertEqual(obj.address_, 0xFFFF0000)
+        self.assertEqual(obj.bit_offset_, 0)
+        self.assertEqual(obj.bit_field_size_, 32)
+        self.assertIdentical(
+            obj.value_(),
+            Object(
+                self.prog,
+                self.prog.int_type("unsigned __int128", 16, False),
+                bit_field_size=32,
+                value=1000,
+            ),
+        )
+        self.assertEqual(obj.to_bytes_(), buffer)
+        self.assertEqual(
+            repr(obj),
+            "Object(prog, 'unsigned __int128', address=0xffff0000, bit_field_size=32)",
+        )
+
 
 class TestValue(MockProgramTestCase):
     def test_positional(self):
@@ -462,9 +515,9 @@ class TestValue(MockProgramTestCase):
 
         self.assertIdentical(obj.read_(), obj)
 
-        self.assertIdentical(Object(self.prog, "int", value=2 ** 32 - 4), obj)
-        self.assertIdentical(Object(self.prog, "int", value=2 ** 64 - 4), obj)
-        self.assertIdentical(Object(self.prog, "int", value=2 ** 128 - 4), obj)
+        self.assertIdentical(Object(self.prog, "int", value=2**32 - 4), obj)
+        self.assertIdentical(Object(self.prog, "int", value=2**64 - 4), obj)
+        self.assertIdentical(Object(self.prog, "int", value=2**128 - 4), obj)
         self.assertIdentical(Object(self.prog, "int", value=-4.6), obj)
 
         self.assertRaisesRegex(
@@ -495,21 +548,21 @@ class TestValue(MockProgramTestCase):
             )
 
     def test_unsigned(self):
-        obj = Object(self.prog, "unsigned int", value=2 ** 32 - 1)
+        obj = Object(self.prog, "unsigned int", value=2**32 - 1)
         self.assertIs(obj.prog_, self.prog)
         self.assertIdentical(obj.type_, self.prog.type("unsigned int"))
         self.assertFalse(obj.absent_)
         self.assertIsNone(obj.address_)
         self.assertIsNone(obj.bit_offset_)
         self.assertIsNone(obj.bit_field_size_)
-        self.assertEqual(obj.value_(), 2 ** 32 - 1)
+        self.assertEqual(obj.value_(), 2**32 - 1)
         self.assertEqual(repr(obj), "Object(prog, 'unsigned int', value=4294967295)")
 
         self.assertIdentical(Object(self.prog, "unsigned int", value=-1), obj)
-        self.assertIdentical(Object(self.prog, "unsigned int", value=2 ** 64 - 1), obj)
-        self.assertIdentical(Object(self.prog, "unsigned int", value=2 ** 65 - 1), obj)
+        self.assertIdentical(Object(self.prog, "unsigned int", value=2**64 - 1), obj)
+        self.assertIdentical(Object(self.prog, "unsigned int", value=2**65 - 1), obj)
         self.assertIdentical(
-            Object(self.prog, "unsigned int", value=2 ** 32 - 1 + 0.9), obj
+            Object(self.prog, "unsigned int", value=2**32 - 1 + 0.9), obj
         )
 
         self.assertRaisesRegex(
@@ -780,6 +833,43 @@ class TestValue(MockProgramTestCase):
             ValueError, "non-scalar must be byte-aligned", obj.member_, "point"
         )
 
+    def test_big_int(self):
+        for type in [
+            self.prog.int_type("unsigned __int128", 16, False),
+            self.prog.int_type("__int128", 16, True),
+        ]:
+            self.assertRaisesRegex(
+                NotImplementedError,
+                "integer values larger than 64 bits are not yet supported",
+                Object,
+                self.prog,
+                type,
+                0,
+            )
+            self.assertRaisesRegex(
+                NotImplementedError,
+                "integer values larger than 64 bits are not yet supported",
+                Object.from_bytes_,
+                self.prog,
+                type,
+                (0).to_bytes(16, "little"),
+            )
+
+    def test_bit_field_of_big_int(self):
+        obj = Object(
+            self.prog,
+            self.prog.int_type("unsigned __int128", 16, False),
+            value=1000,
+            bit_field_size=32,
+        )
+        self.assertIsNone(obj.bit_offset_)
+        self.assertEqual(obj.bit_field_size_, 32)
+        self.assertEqual(obj.value_(), 1000)
+        self.assertEqual(
+            repr(obj),
+            "Object(prog, 'unsigned __int128', value=1000, bit_field_size=32)",
+        )
+
 
 class TestAbsent(MockProgramTestCase):
     def test_basic(self):
@@ -855,6 +945,15 @@ class TestAbsent(MockProgramTestCase):
 
         self.assertRaises(ObjectAbsentError, Object(self.prog, "char [16]").string_)
         self.assertRaises(ObjectAbsentError, Object(self.prog, "char *").string_)
+
+    def test_big_int(self):
+        obj = Object(self.prog, self.prog.int_type("BIG", 16, True))
+        self.assertIs(obj.prog_, self.prog)
+        self.assertEqual(obj.type_.size, 16)
+        self.assertIsNone(obj.address_)
+        self.assertIsNone(obj.bit_offset_)
+        self.assertIsNone(obj.bit_field_size_)
+        self.assertEqual(repr(obj), "Object(prog, 'BIG')")
 
 
 class TestConversions(MockProgramTestCase):
@@ -942,9 +1041,9 @@ class TestConversions(MockProgramTestCase):
                     Object(
                         self.prog,
                         self.prog.int_type("long", 8, True, byteorder),
-                        -(2 ** 32),
+                        -(2**32),
                     ).to_bytes_(),
-                    (-(2 ** 32)).to_bytes(8, byteorder, signed=True),
+                    (-(2**32)).to_bytes(8, byteorder, signed=True),
                 )
 
     def test_unsigned_int_value_to_bytes(self):
@@ -954,17 +1053,17 @@ class TestConversions(MockProgramTestCase):
                     Object(
                         self.prog,
                         self.prog.int_type("unsigned int", 4, False, byteorder),
-                        2 ** 31,
+                        2**31,
                     ).to_bytes_(),
-                    (2 ** 31).to_bytes(4, byteorder),
+                    (2**31).to_bytes(4, byteorder),
                 )
                 self.assertEqual(
                     Object(
                         self.prog,
                         self.prog.int_type("unsigned long", 8, False, byteorder),
-                        2 ** 60,
+                        2**60,
                     ).to_bytes_(),
-                    (2 ** 60).to_bytes(8, byteorder),
+                    (2**60).to_bytes(8, byteorder),
                 )
 
     def test_float64_value_to_bytes(self):
@@ -1299,7 +1398,7 @@ class TestGenericOperators(MockProgramTestCase):
         self.assertRaises(TypeError, obj.__getitem__, 0)
 
     def test_cast_primitive_value(self):
-        obj = Object(self.prog, "long", value=2 ** 32 + 1)
+        obj = Object(self.prog, "long", value=2**32 + 1)
         self.assertIdentical(cast("int", obj), Object(self.prog, "int", value=1))
         self.assertIdentical(
             cast("int", obj.read_()), Object(self.prog, "int", value=1)

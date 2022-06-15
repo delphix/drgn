@@ -1,6 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
-
 import ctypes
 import itertools
 import os
@@ -11,6 +10,7 @@ from drgn import (
     Architecture,
     FaultError,
     FindObjectFlags,
+    Language,
     Object,
     Platform,
     PlatformFlags,
@@ -18,6 +18,7 @@ from drgn import (
     ProgramFlags,
     Qualifiers,
     TypeKind,
+    TypeMember,
     host_platform,
 )
 from tests import (
@@ -38,7 +39,7 @@ def zero_memory_read(address, count, offset, physical):
     return bytes(count)
 
 
-class TestProgram(unittest.TestCase):
+class TestProgram(TestCase):
     def test_set_pid(self):
         # Debug the running Python interpreter itself.
         prog = Program()
@@ -127,7 +128,15 @@ class TestProgram(unittest.TestCase):
         Program().load_debug_info([])
 
     def test_language(self):
-        self.assertEqual(Program().language, DEFAULT_LANGUAGE)
+        prog = Program()
+        self.assertEqual(prog.language, DEFAULT_LANGUAGE)
+        prog.language = Language.CPP
+        self.assertEqual(prog.language, Language.CPP)
+        prog.language = Language.C
+        self.assertEqual(prog.language, Language.C)
+        self.assertRaisesRegex(
+            TypeError, "language must be Language", setattr, prog, "language", "CPP"
+        )
 
 
 class TestMemory(TestCase):
@@ -201,14 +210,14 @@ class TestMemory(TestCase):
                 prog = mock_program(
                     segments=[
                         MockMemorySegment(b"cd", 0x0),
-                        MockMemorySegment(b"abyz", 2 ** bits - 2),
+                        MockMemorySegment(b"abyz", 2**bits - 2),
                     ],
                     platform=MOCK_PLATFORM if bits == 64 else MOCK_32BIT_PLATFORM,
                 )
                 for start in range(3):
                     for size in range(4 - start):
                         self.assertEqual(
-                            prog.read((2 ** bits - 2 + start) % 2 ** 64, size),
+                            prog.read((2**bits - 2 + start) % 2**64, size),
                             b"abcd"[start : start + size],
                         )
 
@@ -398,6 +407,15 @@ class TestTypes(MockProgramTestCase):
         self.prog.add_type_finder(lambda kind, name, filename: None)
         self.assertRaises(LookupError, self.prog.type, "struct foo")
 
+    def test_already_type(self):
+        self.assertIdentical(
+            self.prog.type(self.prog.pointer_type(self.prog.void_type())),
+            self.prog.pointer_type(self.prog.void_type()),
+        )
+
+    def test_invalid_argument_type(self):
+        self.assertRaises(TypeError, self.prog.type, 1)
+
     def test_default_primitive_types(self):
         def spellings(tokens, num_optional=0):
             for i in range(len(tokens) - num_optional, len(tokens) + 1):
@@ -530,6 +548,33 @@ class TestTypes(MockProgramTestCase):
         self.assertIdentical(self.prog.type("struct point"), self.point_type)
         self.assertIdentical(self.prog.type("union option"), self.option_type)
         self.assertIdentical(self.prog.type("enum color"), self.color_type)
+
+    def test_class_type(self):
+        struct_class = self.prog.struct_type(
+            "class",
+            8,
+            (TypeMember(self.prog.pointer_type(self.prog.void_type()), "ptr"),),
+        )
+        class_point = self.prog.class_type(
+            "Point",
+            8,
+            (
+                TypeMember(self.prog.int_type("int", 4, True), "x", 0),
+                TypeMember(self.prog.int_type("int", 4, True), "y", 32),
+            ),
+        )
+        self.types.append(struct_class)
+        self.types.append(class_point)
+        self.prog.language = Language.C
+        self.assertIdentical(self.prog.type("struct class"), struct_class)
+        self.prog.language = Language.CPP
+        self.assertRaisesRegex(
+            SyntaxError,
+            "expected identifier after 'struct'",
+            self.prog.type,
+            "struct class",
+        )
+        self.assertIdentical(self.prog.type("class Point"), class_point)
 
     def test_typedef(self):
         self.types.append(self.pid_type)

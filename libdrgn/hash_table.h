@@ -1581,6 +1581,8 @@ static inline struct hash_pair hash_pair_from_avalanching_hash(size_t hash)
 static inline struct hash_pair hash_pair_from_non_avalanching_hash(size_t hash)
 {
 #if SIZE_MAX == 0xffffffffffffffff
+	_Static_assert(sizeof(size_t) == sizeof(uint64_t),
+		       "size_t/SIZE_MAX doesn't make sense");
 #ifdef __SSE4_2__
 	/* 64-bit with SSE4.2 uses CRC32 */
 	size_t c = _mm_crc32_u64(0, hash);
@@ -1601,6 +1603,8 @@ static inline struct hash_pair hash_pair_from_non_avalanching_hash(size_t hash)
 	};
 #endif
 #elif SIZE_MAX == 0xffffffff
+	_Static_assert(sizeof(size_t) == sizeof(uint32_t),
+		       "size_t/SIZE_MAX doesn't make sense");
 #ifdef __SSE4_2__
 	/* 32-bit with SSE4.2 uses CRC32 */
 	size_t c = _mm_crc32_u32(0, hash);
@@ -1619,7 +1623,7 @@ static inline struct hash_pair hash_pair_from_non_avalanching_hash(size_t hash)
 	};
 #endif
 #else
-#error "unknown SIZE_MAX"
+#error "unsupported SIZE_MAX"
 #endif
 }
 
@@ -1637,11 +1641,13 @@ static inline uint64_t hash_128_to_64(unsigned __int128 hash)
 	return cityhash_128_to_64(hash, hash >> 64);
 }
 
-#define int_key_hash_pair(key) ({				\
-	__auto_type _key = *(key);				\
-	sizeof(_key) > sizeof(size_t) ?				\
-	hash_pair_from_avalanching_hash(hash_128_to_64(_key)) :	\
-	hash_pair_from_non_avalanching_hash(_key);		\
+#define int_key_hash_pair(key) ({					\
+	__auto_type _key = *(key);					\
+	_Static_assert(sizeof(_key) <= sizeof(unsigned __int128),	\
+		       "unsupported integer size");			\
+	sizeof(_key) > sizeof(size_t) ?					\
+	hash_pair_from_avalanching_hash(hash_128_to_64(_key)) :		\
+	hash_pair_from_non_avalanching_hash(_key);			\
 })
 #else
 /* Thomas Wang downscaling hash function. */
@@ -1658,6 +1664,8 @@ static inline uint32_t hash_64_to_32(uint64_t hash)
 
 #define int_key_hash_pair(key) ({				\
 	__auto_type _key = *(key);				\
+	_Static_assert(sizeof(_key) <= sizeof(uint64_t),	\
+		       "unsupported integer size");		\
 	sizeof(_key) > sizeof(size_t) ?				\
 	hash_pair_from_avalanching_hash(hash_64_to_32(_key)) :	\
 	hash_pair_from_non_avalanching_hash(_key);		\
@@ -1693,27 +1701,51 @@ bool scalar_key_eq(const T *a, const T *b);
 #endif
 
 /**
- * Combine two hash values into one.
+ * Hash two integers.
  *
- * This is useful for hashing records with multiple fields (e.g., a structure or
- * an array). The input hash functions need not be avalanching; the output will
- * be avalanching regardless, so the following would be valid:
+ * This is an avalanching hash function. It can be used for any integer types.
+ * The two integers can have different types.
+ *
+ * This can be used to combine input hash functions in order to hash records
+ * with multiple fields (e.g., structures or arrays). For example:
  *
  * ```
- * static struct hash_pair point3d_key_hash(const struct point3d *key)
+ * struct point3d {
+ *         int x, y, z;
+ * };
+ *
+ * static struct hash_pair point3d_key_hash_pair(const struct point3d *key)
  * {
- *         return hash_pair_from_avalanching_hash(hash_combine(hash_combine(p->x, p->y), p->z));
+ *         return hash_pair_from_avalanching_hash(hash_combine(hash_combine(key->x, key->y), key->z));
  * }
  * ```
+ *
+ * Note that the input hash functions need not be avalanching; the output will
+ * be avalanching regardless.
  */
-static inline size_t hash_combine(size_t a, size_t b)
-{
-#if SIZE_MAX == 0xffffffffffffffff
-	return cityhash_128_to_64(b, a);
+#ifdef DOXYGEN
+size_t hash_combine(T1 a, T2 b);
 #else
-	return hash_64_to_32(((uint64_t)a << 32) | b);
+#if SIZE_MAX == 0xffffffffffffffff
+#define hash_combine(a, b) ({							\
+	_Static_assert(sizeof(a) <= sizeof(unsigned __int128) &&		\
+		       sizeof(b) <= sizeof(unsigned __int128),			\
+		       "unsupported integer size");				\
+	size_t _a = sizeof(a) > sizeof(size_t) ? hash_128_to_64(a) : (a);	\
+	size_t _b = sizeof(b) > sizeof(size_t) ? hash_128_to_64(b) : (b);	\
+	cityhash_128_to_64(_b, _a);						\
+})
+#else
+#define hash_combine(a, b) ({							\
+	_Static_assert(sizeof(a) <= sizeof(uint64_t) &&				\
+		       sizeof(b) <= sizeof(uint64_t),				\
+		       "unsupported integer size");				\
+	size_t _a = sizeof(a) > sizeof(size_t) ? hash_64_to_32(a) : (a);	\
+	size_t _b = sizeof(b) > sizeof(size_t) ? hash_64_to_32(b) : (b);	\
+	hash_64_to_32(((uint64_t)_a << 32) | _b);				\
+})
 #endif
-}
+#endif
 
 /**
  * Hash a byte buffer.

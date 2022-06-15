@@ -589,16 +589,32 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	struct drgn_error *err;
-	const char *name;
+	PyObject *name_or_type;
 	struct path_arg filename = {.allow_none = true};
-	struct drgn_qualified_type qualified_type;
-	bool clear;
-
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:type", keywords,
-					 &name, path_converter, &filename))
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&:type", keywords,
+					 &name_or_type, path_converter,
+					 &filename))
 		return NULL;
 
-	clear = set_drgn_in_python();
+	if (PyObject_TypeCheck(name_or_type, &DrgnType_type)) {
+		if (DrgnType_prog((DrgnType *)name_or_type) != self) {
+			PyErr_SetString(PyExc_ValueError,
+					"type is from different program");
+			return NULL;
+		}
+		Py_INCREF(name_or_type);
+		return name_or_type;
+	} else if (!PyUnicode_Check(name_or_type)) {
+		PyErr_SetString(PyExc_TypeError,
+				"type() argument 1 must be str or Type");
+		return NULL;
+	}
+
+	const char *name = PyUnicode_AsUTF8(name_or_type);
+	if (!name)
+		return NULL;
+	bool clear = set_drgn_in_python();
+	struct drgn_qualified_type qualified_type;
 	err = drgn_program_find_type(&self->prog, name, filename.path,
 				     &qualified_type);
 	if (clear)
@@ -698,14 +714,13 @@ static DrgnObject *Program_variable(Program *self, PyObject *args,
 				   DRGN_FIND_OBJECT_VARIABLE);
 }
 
-static StackTrace *Program_stack_trace(Program *self, PyObject *args,
-				       PyObject *kwds)
+static PyObject *Program_stack_trace(Program *self, PyObject *args,
+				     PyObject *kwds)
 {
 	static char *keywords[] = {"thread", NULL};
 	struct drgn_error *err;
 	PyObject *thread;
 	struct drgn_stack_trace *trace;
-	StackTrace *ret;
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:stack_trace", keywords,
 					 &thread))
@@ -724,14 +739,61 @@ static StackTrace *Program_stack_trace(Program *self, PyObject *args,
 	if (err)
 		return set_drgn_error(err);
 
-	ret = (StackTrace *)StackTrace_type.tp_alloc(&StackTrace_type, 0);
-	if (!ret) {
+	PyObject *ret = StackTrace_wrap(trace);
+	if (!ret)
 		drgn_stack_trace_destroy(trace);
+	return ret;
+}
+
+static PyObject *Program_symbols(Program *self, PyObject *args)
+{
+	struct drgn_error *err;
+
+	PyObject *arg = Py_None;
+	if (!PyArg_ParseTuple(args, "|O:symbols", &arg))
+		return NULL;
+
+	struct drgn_symbol **symbols;
+	size_t count;
+	if (arg == Py_None) {
+		err = drgn_program_find_symbols_by_name(&self->prog, NULL,
+							&symbols, &count);
+	} else if (PyUnicode_Check(arg)) {
+		const char *name = PyUnicode_AsUTF8(arg);
+		if (!name)
+			return NULL;
+		err = drgn_program_find_symbols_by_name(&self->prog, name,
+							&symbols, &count);
+	} else {
+		struct index_arg address = {};
+		if (!index_converter(arg, &address))
+			return NULL;
+		err = drgn_program_find_symbols_by_address(&self->prog,
+							   address.uvalue,
+							   &symbols, &count);
+	}
+	if (err)
+		return set_drgn_error(err);
+
+	PyObject *list = PyList_New(count);
+	if (!list) {
+		drgn_symbols_destroy(symbols, count);
 		return NULL;
 	}
-	ret->trace = trace;
-	Py_INCREF(self);
-	return ret;
+	for (size_t i = 0; i < count; i++) {
+		PyObject *pysym = Symbol_wrap(symbols[i], self);
+		if (!pysym) {
+			/* Free symbols which aren't yet added to list. */
+			drgn_symbols_destroy(symbols, count);
+			/* Free list and all symbols already added. */
+			Py_DECREF(list);
+			return NULL;
+		}
+		symbols[i] = NULL;
+		PyList_SET_ITEM(list, i, pysym);
+	}
+	free(symbols);
+	return list;
 }
 
 static PyObject *Program_symbol(Program *self, PyObject *arg)
@@ -763,6 +825,69 @@ static PyObject *Program_symbol(Program *self, PyObject *arg)
 		return NULL;
 	}
 	return ret;
+}
+
+static ThreadIterator *Program_threads(Program *self)
+{
+	struct drgn_thread_iterator *it;
+	struct drgn_error *err = drgn_thread_iterator_create(&self->prog, &it);
+	if (err)
+		return set_drgn_error(err);
+	ThreadIterator *ret =
+		(ThreadIterator *)ThreadIterator_type.tp_alloc(&ThreadIterator_type,
+							       0);
+	if (!ret) {
+		drgn_thread_iterator_destroy(it);
+		return NULL;
+	}
+	ret->prog = self;
+	ret->iterator = it;
+	Py_INCREF(self);
+	return ret;
+}
+
+static PyObject *Program_thread(Program *self, PyObject *args, PyObject *kwds)
+{
+	static char *keywords[] = {"tid", NULL};
+	struct drgn_error *err;
+	struct index_arg tid = {};
+
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&:thread", keywords,
+					 index_converter, &tid))
+		return NULL;
+
+	struct drgn_thread *thread;
+	err = drgn_program_find_thread(&self->prog, tid.uvalue, &thread);
+	if (err)
+		return set_drgn_error(err);
+	if (!thread) {
+		return PyErr_Format(PyExc_LookupError,
+				    "thread with ID %llu not found",
+				    tid.uvalue);
+	}
+	PyObject *ret = Thread_wrap(thread);
+	drgn_thread_destroy(thread);
+	return ret;
+}
+
+static PyObject *Program_main_thread(Program *self)
+{
+	struct drgn_error *err;
+	struct drgn_thread *thread;
+	err = drgn_program_main_thread(&self->prog, &thread);
+	if (err)
+		return set_drgn_error(err);
+	return Thread_wrap(thread);
+}
+
+static PyObject *Program_crashed_thread(Program *self)
+{
+	struct drgn_error *err;
+	struct drgn_thread *thread;
+	err = drgn_program_crashed_thread(&self->prog, &thread);
+	if (err)
+		return set_drgn_error(err);
+	return Thread_wrap(thread);
 }
 
 static DrgnObject *Program_subscript(Program *self, PyObject *key)
@@ -860,6 +985,16 @@ static PyObject *Program_get_language(Program *self, void *arg)
 	return Language_wrap(drgn_program_language(&self->prog));
 }
 
+static int Program_set_language(Program *self, PyObject *value, void *arg)
+{
+	if (!PyObject_TypeCheck(value, &Language_type)) {
+		PyErr_SetString(PyExc_TypeError, "language must be Language");
+		return -1;
+	}
+	drgn_program_set_language(&self->prog, ((Language *)value)->language);
+	return 0;
+}
+
 static PyMethodDef Program_methods[] = {
 	{"add_memory_segment", (PyCFunction)Program_add_memory_segment,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_memory_segment_DOC},
@@ -905,8 +1040,18 @@ static PyMethodDef Program_methods[] = {
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_variable_DOC},
 	{"stack_trace", (PyCFunction)Program_stack_trace,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_stack_trace_DOC},
+	{"symbols", (PyCFunction)Program_symbols, METH_VARARGS,
+	 drgn_Program_symbols_DOC},
 	{"symbol", (PyCFunction)Program_symbol, METH_O,
 	 drgn_Program_symbol_DOC},
+	{"threads", (PyCFunction)Program_threads, METH_NOARGS,
+	 drgn_Program_threads_DOC},
+	{"thread", (PyCFunction)Program_thread,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Program_thread_DOC},
+	{"main_thread", (PyCFunction)Program_main_thread, METH_NOARGS,
+	 drgn_Program_main_thread_DOC},
+	{"crashed_thread", (PyCFunction)Program_crashed_thread, METH_NOARGS,
+	 drgn_Program_crashed_thread_DOC},
 	{"void_type", (PyCFunction)Program_void_type,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_void_type_DOC},
 	{"int_type", (PyCFunction)Program_int_type,
@@ -944,7 +1089,7 @@ static PyGetSetDef Program_getset[] = {
 	{"flags", (getter)Program_get_flags, NULL, drgn_Program_flags_DOC},
 	{"platform", (getter)Program_get_platform, NULL,
 	 drgn_Program_platform_DOC},
-	{"language", (getter)Program_get_language, NULL,
+	{"language", (getter)Program_get_language, (setter)Program_set_language,
 	 drgn_Program_language_DOC},
 	{},
 };
