@@ -49,17 +49,18 @@ def _download_kernel(gh: GitHubApi, url: str, dir: Path) -> None:
         ) as zstd_proc, subprocess.Popen(
             ["tar", "-C", str(tmp_dir), "-x"],
             stdin=zstd_proc.stdout,
-        ) as tar_proc, gh.download(
-            url
-        ) as resp:
+        ) as tar_proc:
             assert zstd_proc.stdin is not None
-            shutil.copyfileobj(resp, zstd_proc.stdin)
-            zstd_proc.stdin.close()
+            try:
+                with gh.download(url) as resp:
+                    shutil.copyfileobj(resp, zstd_proc.stdin)
+            finally:
+                zstd_proc.stdin.close()
         if zstd_proc.returncode != 0:
             raise subprocess.CalledProcessError(zstd_proc.returncode, zstd_proc.args)
         if tar_proc.returncode != 0:
             raise subprocess.CalledProcessError(tar_proc.returncode, tar_proc.args)
-    except:
+    except BaseException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
     else:

@@ -6,6 +6,8 @@ ACLOCAL_AMFLAGS = -I m4
 .DELETE_ON_ERROR:
 
 AM_CPPFLAGS = -I $(top_srcdir)/include -D_GNU_SOURCE
+AM_CFLAGS = $(WARN_CFLAGS) $(SANITIZER_CFLAGS)
+AM_LDFLAGS= $(SANITIZER_LDFLAGS)
 
 noinst_HEADERS = include/dwarf.h \
 		 include/elf.h \
@@ -18,18 +20,23 @@ ARCH_DEFS = arch_ppc64.defs \
 
 ARCH_INCS = $(ARCH_DEFS:.defs=.inc)
 
-BUILT_SOURCES = drgn.h $(ARCH_INCS)
+BUILT_SOURCES = drgn.h $(ARCH_INCS) c_keywords.inc linux_kernel_object_find.inc
 
 noinst_LTLIBRARIES = libdrgnimpl.la
 
 libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 $(ARCH_INCS) \
+			 arch_aarch64.c \
+			 arch_arm.c \
+			 arch_i386.c \
 			 arch_register_layout.h \
+			 arch_riscv.c \
 			 array.h \
 			 binary_buffer.c \
 			 binary_buffer.h \
 			 binary_search_tree.h \
 			 bitops.h \
+			 c_keywords.inc \
 			 cfi.c \
 			 cfi.h \
 			 cityhash.h \
@@ -52,6 +59,7 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 linux_kernel.c \
 			 linux_kernel.h \
 			 linux_kernel_helpers.c \
+			 linux_kernel_object_find.inc \
 			 memory_reader.c \
 			 memory_reader.h \
 			 minmax.h \
@@ -87,8 +95,9 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS:.defs=.c) \
 			 vector.c \
 			 vector.h
 
-libdrgnimpl_la_CFLAGS = -fvisibility=hidden $(OPENMP_CFLAGS) $(elfutils_CFLAGS)
-libdrgnimpl_la_LIBADD = $(OPENMP_LIBS) $(elfutils_LIBS)
+libdrgnimpl_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden $(OPENMP_CFLAGS) \
+			$(elfutils_CFLAGS)
+libdrgnimpl_la_LIBADD = $(OPENMP_LIBS) $(elfutils_LIBS) -lm
 
 if WITH_LIBKDUMPFILE
 libdrgnimpl_la_SOURCES += kdump.c
@@ -96,8 +105,14 @@ libdrgnimpl_la_CFLAGS += $(libkdumpfile_CFLAGS)
 libdrgnimpl_la_LIBADD += $(libkdumpfile_LIBS)
 endif
 
-arch_%.inc: arch_%.defs build-aux/gen_arch.awk
-	$(AM_V_GEN)gawk -f $(word 2, $^) $< > $@
+%: %.strswitch build-aux/gen_strswitch.py build-aux/codegen_utils.py
+	$(AM_V_GEN)$(PYTHON) $(word 2, $^) -o $@ $<
+
+arch_%.inc: arch_%.defs build-aux/gen_arch_inc_strswitch.py build-aux/gen_strswitch.py build-aux/codegen_utils.py
+	$(AM_V_GEN)$(PYTHON) $(word 2, $^) < $< | $(PYTHON) $(word 3, $^) -o $@ -
+
+c_keywords.inc: build-aux/gen_c_keywords_inc_strswitch.py build-aux/gen_strswitch.py build-aux/codegen_utils.py
+	$(AM_V_GEN)$(PYTHON) $< | $(PYTHON) $(word 2, $^) -o $@ -
 
 drgn.h: drgn.h.in configure.ac
 	$(AM_V_GEN)sed \
@@ -109,10 +124,10 @@ drgn.h: drgn.h.in configure.ac
 lib_LTLIBRARIES = libdrgn.la
 
 libdrgn_la_SOURCES =
-libdrgn_la_LDFLAGS = -version-info 0:0:0
+libdrgn_la_LDFLAGS = $(AM_LDFLAGS) -version-info 0:0:0
 libdrgn_la_LIBADD = libdrgnimpl.la
 
-if WITH_PYTHON
+if ENABLE_PYTHON
 BUILT_SOURCES += python/docstrings.h
 
 noinst_LTLIBRARIES += _drgn.la
@@ -132,14 +147,15 @@ _drgn_la_SOURCES = python/constants.c \
 		   python/stack_trace.c \
 		   python/symbol.c \
 		   python/test.c \
+		   python/thread.c \
 		   python/type.c \
 		   python/util.c
 
-_drgn_la_CFLAGS = -fvisibility=hidden
+_drgn_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden
 _drgn_la_CPPFLAGS = $(AM_CPPFLAGS) $(PYTHON_CPPFLAGS) -iquote $(srcdir)/python \
 		    -iquote python
-_drgn_la_LDFLAGS = -Wl,--exclude-libs,ALL -avoid-version -module -shared \
-		   -rpath $(pkgpyexecdir)
+_drgn_la_LDFLAGS = $(AM_LDFLAGS) -Wl,--exclude-libs,ALL -avoid-version -module \
+		   -shared -rpath $(pkgpyexecdir)
 _drgn_la_LIBADD = libdrgnimpl.la
 
 if WITH_LIBKDUMPFILE
@@ -160,9 +176,13 @@ python/docstrings.h: ../_drgn.pyi $(drgndoc_docstrings_deps)
 
 EXTRA_DIST = Doxyfile \
 	     $(ARCH_DEFS) \
-	     build-aux/gen_arch.awk \
+	     build-aux/codegen_utils.py \
+	     build-aux/gen_arch_inc_strswitch.py \
+	     build-aux/gen_c_keywords_inc_strswitch.py \
 	     build-aux/gen_constants.py \
-	     drgn.h.in
+	     build-aux/gen_strswitch.py \
+	     drgn.h.in \
+	     linux_kernel_object_find.inc.strswitch
 
 EXTRA_PROGRAMS = examples/load_debug_info
 

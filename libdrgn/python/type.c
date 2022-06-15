@@ -804,12 +804,12 @@ static PyObject *TypeEnumerator_repr(TypeEnumerator *self)
 				    self->value);
 }
 
-Py_ssize_t TypeEnumerator_length(PyObject *self)
+static Py_ssize_t TypeEnumerator_length(PyObject *self)
 {
 	return 2;
 }
 
-PyObject *TypeEnumerator_item(TypeEnumerator *self, Py_ssize_t i)
+static PyObject *TypeEnumerator_item(TypeEnumerator *self, Py_ssize_t i)
 {
 	switch (i) {
 	case 0:
@@ -904,6 +904,7 @@ static DrgnObject *LazyObject_get_borrowed(LazyObject *self)
 				if (Py_TYPE(self) ==
 				    &TypeTemplateParameter_type &&
 				    obj->obj.kind == DRGN_OBJECT_ABSENT) {
+					Py_DECREF(ret);
 					PyErr_Format(PyExc_ValueError,
 						     "%s() callable must not return absent Object",
 						     PyType_name(Py_TYPE(self)));

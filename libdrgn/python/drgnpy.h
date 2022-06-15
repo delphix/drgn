@@ -97,13 +97,16 @@ typedef struct {
 	struct pyobjectp_set objects;
 } Program;
 
-typedef struct _GenericIterator {
+typedef struct {
+	PyObject_HEAD
+	struct drgn_thread thread;
+} Thread;
+
+typedef struct {
 	PyObject_HEAD
 	Program *prog;
-	void *iter;
-	PyObject *(*next)(struct _GenericIterator *);
-	void (*iter_deinit)(void *);
-} GenericIterator;
+	struct drgn_thread_iterator *iterator;
+} ThreadIterator;
 
 typedef struct {
 	PyObject_HEAD
@@ -175,7 +178,6 @@ extern PyObject *TypeKind_class;
 extern PyTypeObject DrgnObject_type;
 extern PyTypeObject DrgnType_type;
 extern PyTypeObject FaultError_type;
-extern PyTypeObject GenericIterator_type;
 extern PyTypeObject Language_type;
 extern PyTypeObject ObjectIterator_type;
 extern PyTypeObject Platform_type;
@@ -184,6 +186,8 @@ extern PyTypeObject Register_type;
 extern PyTypeObject StackFrame_type;
 extern PyTypeObject StackTrace_type;
 extern PyTypeObject Symbol_type;
+extern PyTypeObject Thread_type;
+extern PyTypeObject ThreadIterator_type;
 extern PyTypeObject TypeEnumerator_type;
 extern PyTypeObject TypeMember_type;
 extern PyTypeObject TypeParameter_type;
@@ -237,6 +241,10 @@ Program *program_from_kernel(PyObject *self);
 Program *program_from_pid(PyObject *self, PyObject *args, PyObject *kwds);
 
 PyObject *Symbol_wrap(struct drgn_symbol *sym, Program *prog);
+
+PyObject *Thread_wrap(struct drgn_thread *drgn_thread);
+
+PyObject *StackTrace_wrap(struct drgn_stack_trace *trace);
 
 static inline Program *DrgnType_prog(DrgnType *type)
 {
@@ -310,17 +318,5 @@ PyObject *drgnpy_linux_helper_kaslr_offset(PyObject *self, PyObject *args,
 					   PyObject *kwds);
 PyObject *drgnpy_linux_helper_pgtable_l5_enabled(PyObject *self, PyObject *args,
 						 PyObject *kwds);
-GenericIterator *drgnpy_linux_helper_for_each_task(PyObject *self,
-						      PyObject *args,
-						      PyObject *kwds);
-GenericIterator *drgnpy_linux_helper_for_each_pid(PyObject *self,
-						     PyObject *args,
-						     PyObject *kwds);
-GenericIterator *drgnpy_linux_helper_idr_for_each(PyObject *self,
-						     PyObject *args,
-						     PyObject *kwds);
-GenericIterator *drgnpy_linux_helper_radix_tree_for_each(PyObject *self,
-							    PyObject *args,
-							    PyObject *kwds);
 
 #endif /* DRGNPY_H */

@@ -1,13 +1,14 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <byteswap.h>
 #include <elf.h>
 #include <stdlib.h>
 
 #include "platform.h"
 #include "util.h"
 
-static const struct drgn_register *register_by_name_unknown(const char *name)
+const struct drgn_register *drgn_register_by_name_unknown(const char *name)
 {
 	return NULL;
 }
@@ -15,14 +16,28 @@ static const struct drgn_register *register_by_name_unknown(const char *name)
 const struct drgn_architecture_info arch_info_unknown = {
 	.name = "unknown",
 	.arch = DRGN_ARCH_UNKNOWN,
-	.register_by_name = register_by_name_unknown,
+	.register_by_name = drgn_register_by_name_unknown,
 };
 
 LIBDRGN_PUBLIC const struct drgn_platform drgn_host_platform = {
-#ifdef __x86_64__
+#if __x86_64__
 	.arch = &arch_info_x86_64,
+#elif __i386__
+	.arch = &arch_info_i386,
+#elif __aarch64__
+	.arch = &arch_info_aarch64,
+#elif __arm__
+	.arch = &arch_info_arm,
 #elif __powerpc64__
 	.arch = &arch_info_ppc64,
+#elif __riscv
+#if __riscv_xlen == 64
+	.arch = &arch_info_riscv64,
+#elif __riscv_xlen == 32
+	.arch = &arch_info_riscv32,
+#else
+#error "unknown __riscv_xlen"
+#endif
 #else
 	.arch = &arch_info_unknown,
 #endif
@@ -44,8 +59,23 @@ drgn_platform_create(enum drgn_architecture arch,
 	case DRGN_ARCH_X86_64:
 		arch_info = &arch_info_x86_64;
 		break;
+	case DRGN_ARCH_I386:
+		arch_info = &arch_info_i386;
+		break;
+	case DRGN_ARCH_AARCH64:
+		arch_info = &arch_info_aarch64;
+		break;
+	case DRGN_ARCH_ARM:
+		arch_info = &arch_info_arm;
+		break;
 	case DRGN_ARCH_PPC64:
 		arch_info = &arch_info_ppc64;
+		break;
+	case DRGN_ARCH_RISCV64:
+		arch_info = &arch_info_riscv64;
+		break;
+	case DRGN_ARCH_RISCV32:
+		arch_info = &arch_info_riscv32;
 		break;
 	default:
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
@@ -114,8 +144,23 @@ void drgn_platform_from_elf(GElf_Ehdr *ehdr, struct drgn_platform *ret)
 	case EM_X86_64:
 		arch = &arch_info_x86_64;
 		break;
+	case EM_386:
+		arch = &arch_info_i386;
+		break;
+	case EM_AARCH64:
+		arch = &arch_info_aarch64;
+		break;
+	case EM_ARM:
+		arch = &arch_info_arm;
+		break;
 	case EM_PPC64:
 		arch = &arch_info_ppc64;
+		break;
+	case EM_RISCV:
+		if (ehdr->e_ident[EI_CLASS] == ELFCLASS64)
+			arch = &arch_info_riscv64;
+		else
+			arch = &arch_info_riscv32;
 		break;
 	default:
 		arch = &arch_info_unknown;
@@ -150,3 +195,39 @@ drgn_register_names(const struct drgn_register *reg, size_t *num_names_ret)
 	*num_names_ret = reg->num_names;
 	return reg->names;
 }
+
+struct drgn_error drgn_invalid_relocation_offset = {
+	.code = DRGN_ERROR_OTHER,
+	.message = "invalid relocation offset",
+};
+
+#define DEFINE_DRGN_RELOC_ADD(bits)						\
+struct drgn_error *								\
+drgn_reloc_add##bits(const struct drgn_relocating_section *relocating,		\
+		     uint64_t r_offset, const int64_t *r_addend,		\
+		     uint##bits##_t addend)					\
+{										\
+	uint##bits##_t value;							\
+	if (r_offset > relocating->buf_size ||					\
+	    relocating->buf_size - r_offset < sizeof(value))			\
+		return &drgn_invalid_relocation_offset;				\
+	if (r_addend) {								\
+		value = *r_addend;						\
+	} else {								\
+		memcpy(&value, relocating->buf + r_offset, sizeof(value));	\
+		if (relocating->bswap)						\
+			value = bswap_##bits(value);				\
+	}									\
+	value += addend;							\
+	if (relocating->bswap)							\
+		value = bswap_##bits(value);					\
+	memcpy(relocating->buf + r_offset, &value, sizeof(value));		\
+	return NULL;								\
+}
+DEFINE_DRGN_RELOC_ADD(64)
+DEFINE_DRGN_RELOC_ADD(32)
+DEFINE_DRGN_RELOC_ADD(16)
+#define bswap_8(x) (x)
+DEFINE_DRGN_RELOC_ADD(8)
+#undef bswap_8
+#undef DEFINE_DRGN_RELOC_ADD
