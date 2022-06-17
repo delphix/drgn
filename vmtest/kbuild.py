@@ -10,7 +10,7 @@ import shlex
 import shutil
 import sys
 import tempfile
-from typing import IO, Any, Optional, Tuple, Union
+from typing import IO, Any, NamedTuple, Optional, Tuple, Union
 
 from util import nproc
 from vmtest.asynciosubprocess import (
@@ -23,17 +23,62 @@ from vmtest.asynciosubprocess import (
 
 logger = logging.getLogger(__name__)
 
-KERNEL_LOCALVERSION = "-vmtest8"
+
+class KernelFlavor(NamedTuple):
+    name: str
+    description: str
+    config: str
+
+    def localversion(self) -> str:
+        localversion = "-vmtest12"
+        # The default flavor should be the "latest" version.
+        localversion += ".1" if self.name == "default" else ".0"
+        localversion += self.name
+        return localversion
 
 
-def kconfig() -> str:
-    return rf"""# Minimal Linux kernel configuration for booting into vmtest and running drgn
-# tests.
-
-CONFIG_LOCALVERSION="{KERNEL_LOCALVERSION}"
-
+KERNEL_FLAVORS = [
+    KernelFlavor(
+        name="default",
+        description="Default configuration",
+        config="""
 CONFIG_SMP=y
+CONFIG_SLUB=y
+# For slab tests.
+CONFIG_SLUB_DEBUG=y
+""",
+    ),
+    KernelFlavor(
+        name="alternative",
+        description="SLAB allocator",
+        config="""
+CONFIG_SMP=y
+CONFIG_SLAB=y
+""",
+    ),
+    KernelFlavor(
+        name="tiny",
+        description="!SMP, !PREEMPT, and SLOB allocator",
+        config="""
+CONFIG_SMP=n
+CONFIG_SLOB=y
+# CONFIG_PREEMPT_DYNAMIC is not set
+CONFIG_PREEMPT_NONE=y
+# !PREEMPTION && !SMP will also select TINY_RCU.
+""",
+    ),
+]
+
+
+def kconfig(flavor: KernelFlavor) -> str:
+    return rf"""# Minimal Linux kernel configuration for booting into vmtest and running drgn
+# tests ({flavor.name} flavor).
+
+CONFIG_LOCALVERSION="{flavor.localversion()}"
+CONFIG_EXPERT=y
+{flavor.config}
 CONFIG_MODULES=y
+CONFIG_CC_OPTIMIZE_FOR_SIZE=y
 
 # We run the tests in KVM.
 CONFIG_HYPERVISOR_GUEST=y
@@ -95,8 +140,14 @@ CONFIG_CGROUPS=y
 CONFIG_IKCONFIG=m
 CONFIG_IKCONFIG_PROC=y
 
+# For net tests.
+CONFIG_NAMESPACES=y
+
 # For nodemask tests.
 CONFIG_NUMA=y
+
+# For slab allocator tests.
+CONFIG_SLAB_FREELIST_HARDENED=y
 
 # For Traffic Control tests.
 CONFIG_NET_SCHED=y
@@ -115,12 +166,15 @@ class KBuild:
         self,
         kernel_dir: Path,
         build_dir: Path,
+        flavor: KernelFlavor,
         arch: str,
         build_log_file: Union[int, IO[Any], None] = None,
     ) -> None:
         self._build_dir = build_dir
         self._kernel_dir = kernel_dir
+        self._flavor = flavor
         self._arch = arch
+        self._srcarch = {"x86_64": "x86"}.get(arch, arch)
         self._build_stdout = build_log_file
         self._build_stderr = (
             None if build_log_file is None else asyncio.subprocess.STDOUT
@@ -169,6 +223,7 @@ class KBuild:
                 "KBUILD_ABS_SRCTREE=1",
                 "KBUILD_BUILD_USER=drgn",
                 "KBUILD_BUILD_HOST=drgn",
+                "HOSTCFLAGS=" + cflags,
                 "KAFLAGS=" + cflags,
                 "KCFLAGS=" + cflags,
                 "-j",
@@ -192,7 +247,7 @@ class KBuild:
         return self._cached_kernel_release
 
     async def build(self) -> None:
-        logger.info("building kernel in %s", self._build_dir)
+        logger.info("building %s kernel in %s", self._flavor.name, self._build_dir)
         build_log_file_name = getattr(self._build_stdout, "name", None)
         if build_log_file_name is not None:
             logger.info("build logs in %s", build_log_file_name)
@@ -202,7 +257,7 @@ class KBuild:
         config = self._build_dir / ".config"
         tmp_config = self._build_dir / ".config.vmtest.tmp"
 
-        tmp_config.write_text(kconfig())
+        tmp_config.write_text(kconfig(self._flavor))
         await check_call(
             "make",
             *make_args,
@@ -234,6 +289,150 @@ class KBuild:
             stderr=self._build_stderr,
         )
         logger.info("built kernel %s in %s", kernel_release, self._build_dir)
+
+    def _copy_module_build(self, modules_dir: Path) -> None:
+        logger.info("copying module build files")
+
+        # `make modules_install` creates these as symlinks to the absolute path
+        # of the source directory. Delete them, populate build, and make source
+        # a symlink to build.
+        modules_build_dir = modules_dir / "build"
+        modules_source_dir = modules_dir / "source"
+        modules_build_dir.unlink()
+        modules_build_dir.mkdir()
+        modules_source_dir.unlink()
+        modules_source_dir.symlink_to("build")
+
+        # Files and directories (as glob patterns) required for external module
+        # builds. This list was determined through trial and error.
+        files = (
+            ".config",
+            "Module.symvers",
+            f"arch/{self._srcarch}/Makefile",
+            "scripts/Kbuild.include",
+            "scripts/Makefile*",
+            "scripts/basic/fixdep",
+            "scripts/check-local-export",
+            "scripts/gcc-goto.sh",
+            "scripts/gcc-version.sh",
+            "scripts/mod/modpost",
+            "scripts/module-common.lds",
+            "scripts/module.lds",
+            "scripts/modules-check.sh",
+            "scripts/pahole-flags.sh",
+            "scripts/pahole-version.sh",
+            "scripts/subarch.include",
+            "tools/objtool/objtool",
+        )
+        directories = (
+            f"arch/{self._srcarch}/include",
+            "include",
+        )
+
+        # Copy from the source and build directories.
+        src_dirs = [self._kernel_dir]
+        if not self._build_dir.samefile(self._kernel_dir):
+            src_dirs.append(self._build_dir)
+        # The top-level Makefile is a special case because we only want the one
+        # from the source directory; the one in the build directory is a stub.
+        shutil.copy2(
+            self._kernel_dir / "Makefile",
+            modules_build_dir / "Makefile",
+            follow_symlinks=False,
+        )
+        for glob in files:
+            for src_dir in src_dirs:
+                for src_path in src_dir.glob(glob):
+                    dst_path = modules_build_dir / src_path.relative_to(src_dir)
+                    dst_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_path, dst_path, follow_symlinks=False)
+        for glob in directories:
+            for src_dir in src_dirs:
+                for src_path in src_dir.glob(glob):
+                    dst_path = modules_build_dir / src_path.relative_to(src_dir)
+                    dst_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(
+                        src_path,
+                        dst_path,
+                        ignore=shutil.ignore_patterns("*.cmd"),
+                        symlinks=True,
+                        dirs_exist_ok=True,
+                    )
+
+    async def _test_external_module_build(self, modules_dir: Path) -> None:
+        logger.info("testing external module build")
+
+        with tempfile.TemporaryDirectory(
+            prefix="test_module.", dir=self._build_dir
+        ) as tmp_name:
+            test_module_dir = Path(tmp_name)
+            (test_module_dir / "test.c").write_text(
+                r"""
+#include <linux/module.h>
+
+static int __init test_init(void)
+{
+	return 0;
+}
+
+module_init(test_init);
+
+MODULE_LICENSE("GPL");
+"""
+            )
+            (test_module_dir / "Makefile").write_text("obj-m := test.o\n")
+            # Execute make and look for errors in its output. It's not
+            # enough to check its exit status because some of the build
+            # scripts limp along (possibly incorrectly) even if they're
+            # missing some files.
+            cmd = (
+                "make",
+                "-C",
+                modules_dir / "build",
+                f"M={test_module_dir.resolve()}",
+            )
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout_task = asyncio.create_task(proc.stdout.readline())
+                stderr_task = asyncio.create_task(proc.stderr.readline())
+                error = False
+                while stdout_task is not None or stderr_task is not None:
+                    aws = []
+                    if stdout_task is not None:
+                        aws.append(stdout_task)
+                    if stderr_task is not None:
+                        aws.append(stderr_task)
+                    done, pending = await asyncio.wait(
+                        aws, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        line = task.result()
+                        if b"No such file or directory" in line:
+                            error = True
+                        if task is stdout_task:
+                            sys.stdout.buffer.write(line)
+                            sys.stdout.buffer.flush()
+                            stdout_task = (
+                                asyncio.create_task(proc.stdout.readline())
+                                if line
+                                else None
+                            )
+                        else:
+                            sys.stderr.buffer.write(line)
+                            sys.stderr.buffer.flush()
+                            stderr_task = (
+                                asyncio.create_task(proc.stderr.readline())
+                                if line
+                                else None
+                            )
+            finally:
+                returncode = await proc.wait()
+                if returncode != 0:
+                    raise CalledProcessError(returncode, cmd)
+            if error:
+                raise Exception(f"Command {cmd} output contained error")
 
     async def package(self, output_dir: Path) -> Path:
         make_args = await self._prepare_make()
@@ -269,9 +468,6 @@ class KBuild:
                 stdout=self._build_stdout,
                 stderr=self._build_stderr,
             )
-            # Don't want these symlinks.
-            (modules_dir / "build").unlink()
-            (modules_dir / "source").unlink()
 
             logger.info("copying vmlinux")
             vmlinux = modules_dir / "vmlinux"
@@ -287,6 +483,9 @@ class KBuild:
             vmlinuz = modules_dir / "vmlinuz"
             shutil.copy(self._build_dir / image_name, vmlinuz)
             vmlinuz.chmod(0o644)
+
+            self._copy_module_build(modules_dir)
+            await self._test_external_module_build(modules_dir)
 
             logger.info("creating tarball")
             tarball.parent.mkdir(parents=True, exist_ok=True)
@@ -345,17 +544,29 @@ async def main() -> None:
         default=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "-f",
+        "--flavor",
+        choices=[flavor.name for flavor in KERNEL_FLAVORS],
+        help="kernel configuration flavor. "
+        + ". ".join(
+            [f"{flavor.name}: {flavor.description}" for flavor in KERNEL_FLAVORS]
+        ),
+        default=KERNEL_FLAVORS[0].name,
+    )
+    parser.add_argument(
         "--dump-kconfig",
         action="store_true",
         help="dump kernel configuration file to standard output instead of building",
     )
     args = parser.parse_args()
 
+    flavor = [flavor for flavor in KERNEL_FLAVORS if flavor.name == args.flavor][0]
+
     if args.dump_kconfig:
-        sys.stdout.write(kconfig())
+        sys.stdout.write(kconfig(flavor))
         return
 
-    kbuild = KBuild(args.kernel_directory, args.build_directory, "x86_64")
+    kbuild = KBuild(args.kernel_directory, args.build_directory, flavor, "x86_64")
     await kbuild.build()
     if hasattr(args, "package"):
         await kbuild.package(args.package)

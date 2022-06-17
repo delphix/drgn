@@ -115,12 +115,26 @@ static inline void *malloc64(uint64_t size)
 	return malloc(size);
 }
 
-static inline void *memdup(void *ptr, size_t size)
+static inline void *memdup(const void *ptr, size_t size)
 {
 	void *copy = malloc(size);
 	if (copy)
 		memcpy(copy, ptr, size);
 	return copy;
+}
+
+static inline bool alloc_or_reuse(void **buf, size_t *capacity, size_t size)
+{
+	if (size > *capacity) {
+		free(*buf);
+		*buf = malloc(size);
+		if (!*buf) {
+			*capacity = 0;
+			return false;
+		}
+		*capacity = size;
+	}
+	return true;
 }
 
 /** Return the maximum value of an @p n-byte unsigned integer. */
@@ -129,6 +143,43 @@ static inline uint64_t uint_max(int n)
 	assert(n >= 1 && n <= 8);
 	return UINT64_MAX >> (64 - 8 * n);
 }
+
+/*
+ * Calculate the number of decimal digits in 2^n.
+ *
+ * The number of decimal digits in a positive integer x is floor(log10(x)) + 1.
+ * By the power rule of logarithms, log10(2^n) = n * log10(2).
+ * Therefore, the number of decimal digits in 2^n is floor(n * log10(2))) + 1.
+ * 643 / 2136 is an approximation of log10(2) which is accurate enough that
+ * floor(n * 643 / 2136) = floor(n * log10(2))) for 1 <= n <= 15436.
+ */
+#define max_decimal_length_impl(n) ((n) * 643 / 2136 + 1)
+
+/**
+ * Get the maximum number of characters required to format an integer type in
+ * base 10. This is an integer constant expression.
+ */
+#define max_decimal_length(type)						\
+	((type)-1 < 0								\
+	/*									\
+	 * Let f(x) = floor(log10(x)) + 1, which is the number of decimal	\
+	 * digits in a positive integer x.					\
+	 *									\
+	 * For an n-bit two's-complement integer, the worst case is the minimum	\
+	 * value, -2^(n - 1), which is f(2^(n - 1)) decimal digits plus the	\
+	 * minus sign.								\
+	 */									\
+	 ? max_decimal_length_impl(sizeof(type) * CHAR_BIT - 1) + 1		\
+	/*									\
+	 * For an n-bit unsigned integer, the worst case is the maximum value,	\
+	 * 2^n - 1. Note that for any positive integer x, 2^x is not a power of	\
+	 * 10, so floor(log10(2^x - 1)) = floor(log10(2^x)). Therefore,		\
+	 *   f(2^x - 1)								\
+	 * = floor(log10(2^x - 1)) + 1						\
+	 * = floor(log10(2^x)) + 1						\
+	 * = f(2^x).								\
+	 */									\
+	 : max_decimal_length_impl(sizeof(type) * CHAR_BIT))
 
 /**
  * Safely add to a pointer which may be `NULL`.

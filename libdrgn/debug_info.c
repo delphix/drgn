@@ -635,9 +635,9 @@ DEFINE_HASH_MAP(drgn_mapped_files, const char *,
 
 struct userspace_core_report_state {
 	struct drgn_mapped_files files;
-	char *phdr_buf;
+	void *phdr_buf;
 	size_t phdr_buf_capacity;
-	char *segment_buf;
+	void *segment_buf;
 	size_t segment_buf_capacity;
 };
 
@@ -876,22 +876,6 @@ not_loaded:
 	*start_ret = start;
 	*end_ret = end;
 	return NULL;
-}
-
-static bool alloc_or_reuse(char **buf, size_t *capacity, uint64_t size)
-{
-	if (size > *capacity) {
-		if (size > SIZE_MAX)
-			return false;
-		free(*buf);
-		*buf = malloc(size);
-		if (!*buf) {
-			*capacity = 0;
-			return false;
-		}
-		*capacity = size;
-	}
-	return true;
 }
 
 /* ehdr_buf must be aligned as Elf64_Ehdr. */
@@ -1161,7 +1145,8 @@ userspace_core_identify_file(struct drgn_program *prog,
 		GElf_Phdr phdr;
 		core_get_phdr(&arg, i, &phdr);
 		if (phdr.p_type == PT_NOTE) {
-			if (!alloc_or_reuse(&core->segment_buf,
+			if (phdr.p_filesz > SIZE_MAX ||
+			    !alloc_or_reuse(&core->segment_buf,
 					    &core->segment_buf_capacity,
 					    phdr.p_filesz))
 				return &drgn_enomem;
@@ -1481,40 +1466,86 @@ userspace_report_debug_info(struct drgn_debug_info_load_state *load)
 	return NULL;
 }
 
-static struct drgn_error *relocate_elf_section(Elf_Scn *scn, Elf_Scn *reloc_scn,
-					       Elf_Scn *symtab_scn,
-					       const uint64_t *sh_addrs,
-					       size_t shdrnum,
-					       const struct drgn_platform *platform)
+static int should_apply_relocation_section(Elf *elf, size_t shstrndx,
+					   const GElf_Shdr *shdr)
+{
+	if (shdr->sh_type != SHT_RELA && shdr->sh_type != SHT_REL)
+		return 0;
+
+	const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
+	if (!scnname)
+		return -1;
+	if (shdr->sh_type == SHT_RELA) {
+		if (!strstartswith(scnname, ".rela."))
+			return 0;
+		scnname += sizeof(".rela.") - 1;
+	} else {
+		if (!strstartswith(scnname, ".rel."))
+			return 0;
+		scnname += sizeof(".rel.") - 1;
+	}
+	return (strstartswith(scnname, "debug_") ||
+		strstartswith(scnname, "orc_"));
+}
+
+static inline struct drgn_error *get_reloc_sym_value(const void *syms,
+						     size_t num_syms,
+						     const uint64_t *sh_addrs,
+						     size_t shdrnum,
+						     bool is_64_bit,
+						     bool bswap,
+						     uint32_t r_sym,
+						     uint64_t *ret)
+{
+	if (r_sym >= num_syms) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "invalid ELF relocation symbol");
+	}
+	uint16_t st_shndx;
+	uint64_t st_value;
+	if (is_64_bit) {
+		const Elf64_Sym *sym = (Elf64_Sym *)syms + r_sym;
+		memcpy(&st_shndx, &sym->st_shndx, sizeof(st_shndx));
+		memcpy(&st_value, &sym->st_value, sizeof(st_value));
+		if (bswap) {
+			st_shndx = bswap_16(st_shndx);
+			st_value = bswap_64(st_value);
+		}
+	} else {
+		const Elf32_Sym *sym = (Elf32_Sym *)syms + r_sym;
+		memcpy(&st_shndx, &sym->st_shndx, sizeof(st_shndx));
+		uint32_t st_value32;
+		memcpy(&st_value32, &sym->st_value, sizeof(st_value32));
+		if (bswap) {
+			st_shndx = bswap_16(st_shndx);
+			st_value32 = bswap_32(st_value32);
+		}
+		st_value = st_value32;
+	}
+	if (st_shndx >= shdrnum) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "invalid ELF symbol section index");
+	}
+	*ret = sh_addrs[st_shndx] + st_value;
+	return NULL;
+}
+
+static struct drgn_error *
+apply_elf_relas(const struct drgn_relocating_section *relocating,
+		Elf_Data *reloc_data, Elf_Data *symtab_data,
+		const uint64_t *sh_addrs, size_t shdrnum,
+		const struct drgn_platform *platform)
 {
 	struct drgn_error *err;
 
 	bool is_64_bit = drgn_platform_is_64_bit(platform);
 	bool bswap = drgn_platform_bswap(platform);
-	apply_elf_rela_fn *apply_elf_rela = platform->arch->apply_elf_rela;
+	apply_elf_reloc_fn *apply_elf_reloc = platform->arch->apply_elf_reloc;
 
-	Elf_Data *data, *reloc_data, *symtab_data;
-	err = read_elf_section(scn, &data);
-	if (err)
-		return err;
-
-	struct drgn_relocating_section relocating = {
-		.buf = data->d_buf,
-		.buf_size = data->d_size,
-		.addr = sh_addrs[elf_ndxscn(scn)],
-		.bswap = bswap,
-	};
-
-	err = read_elf_section(reloc_scn, &reloc_data);
-	if (err)
-		return err;
 	const void *relocs = reloc_data->d_buf;
 	size_t reloc_size = is_64_bit ? sizeof(Elf64_Rela) : sizeof(Elf32_Rela);
 	size_t num_relocs = reloc_data->d_size / reloc_size;
 
-	err = read_elf_section(symtab_scn, &symtab_data);
-	if (err)
-		return err;
 	const void *syms = symtab_data->d_buf;
 	size_t sym_size = is_64_bit ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
 	size_t num_syms = symtab_data->d_size / sym_size;
@@ -1525,7 +1556,7 @@ static struct drgn_error *relocate_elf_section(Elf_Scn *scn, Elf_Scn *reloc_scn,
 		uint32_t r_type;
 		int64_t r_addend;
 		if (is_64_bit) {
-			Elf64_Rela *rela = (Elf64_Rela *)relocs + i;
+			const Elf64_Rela *rela = (Elf64_Rela *)relocs + i;
 			uint64_t r_info;
 			memcpy(&r_offset, &rela->r_offset, sizeof(r_offset));
 			memcpy(&r_info, &rela->r_info, sizeof(r_info));
@@ -1538,7 +1569,7 @@ static struct drgn_error *relocate_elf_section(Elf_Scn *scn, Elf_Scn *reloc_scn,
 			r_sym = ELF64_R_SYM(r_info);
 			r_type = ELF64_R_TYPE(r_info);
 		} else {
-			Elf32_Rela *rela32 = (Elf32_Rela *)relocs + i;
+			const Elf32_Rela *rela32 = (Elf32_Rela *)relocs + i;
 			uint32_t r_offset32;
 			uint32_t r_info32;
 			int32_t r_addend32;
@@ -1555,54 +1586,80 @@ static struct drgn_error *relocate_elf_section(Elf_Scn *scn, Elf_Scn *reloc_scn,
 			r_type = ELF32_R_TYPE(r_info32);
 			r_addend = r_addend32;
 		}
-		if (r_sym >= num_syms) {
-			return drgn_error_create(DRGN_ERROR_OTHER,
-						 "invalid ELF relocation symbol");
-		}
-		uint16_t st_shndx;
-		uint64_t st_value;
-		if (is_64_bit) {
-			const Elf64_Sym *sym = (Elf64_Sym *)syms + r_sym;
-			memcpy(&st_shndx, &sym->st_shndx, sizeof(st_shndx));
-			memcpy(&st_value, &sym->st_value, sizeof(st_value));
-			if (bswap) {
-				st_shndx = bswap_16(st_shndx);
-				st_value = bswap_64(st_value);
-			}
-		} else {
-			const Elf32_Sym *sym = (Elf32_Sym *)syms + r_sym;
-			memcpy(&st_shndx, &sym->st_shndx, sizeof(st_shndx));
-			uint32_t st_value32;
-			memcpy(&st_value32, &sym->st_value, sizeof(st_value32));
-			if (bswap) {
-				st_shndx = bswap_16(st_shndx);
-				st_value32 = bswap_32(st_value32);
-			}
-			st_value = st_value32;
-		}
-		if (st_shndx >= shdrnum) {
-			return drgn_error_create(DRGN_ERROR_OTHER,
-						 "invalid ELF symbol section index");
-		}
+		uint64_t sym_value;
+		err = get_reloc_sym_value(syms, num_syms, sh_addrs, shdrnum,
+					  is_64_bit, bswap, r_sym, &sym_value);
+		if (err)
+			return err;
 
-		err = apply_elf_rela(&relocating, r_offset, r_type, r_addend,
-				     sh_addrs[st_shndx] + st_value);
+		err = apply_elf_reloc(relocating, r_offset, r_type, &r_addend,
+				      sym_value);
 		if (err)
 			return err;
 	}
+	return NULL;
+}
 
-	/*
-	 * Mark the relocation section as empty so that libdwfl doesn't try to
-	 * apply it again.
-	 */
-	GElf_Shdr *shdr, shdr_mem;
-	shdr = gelf_getshdr(reloc_scn, &shdr_mem);
-	if (!shdr)
-		return drgn_error_libelf();
-	shdr->sh_size = 0;
-	if (!gelf_update_shdr(reloc_scn, shdr))
-		return drgn_error_libelf();
-	reloc_data->d_size = 0;
+static struct drgn_error *
+apply_elf_rels(const struct drgn_relocating_section *relocating,
+	       Elf_Data *reloc_data, Elf_Data *symtab_data,
+	       const uint64_t *sh_addrs, size_t shdrnum,
+	       const struct drgn_platform *platform)
+{
+	struct drgn_error *err;
+
+	bool is_64_bit = drgn_platform_is_64_bit(platform);
+	bool bswap = drgn_platform_bswap(platform);
+	apply_elf_reloc_fn *apply_elf_reloc = platform->arch->apply_elf_reloc;
+
+	const void *relocs = reloc_data->d_buf;
+	size_t reloc_size = is_64_bit ? sizeof(Elf64_Rel) : sizeof(Elf32_Rel);
+	size_t num_relocs = reloc_data->d_size / reloc_size;
+
+	const void *syms = symtab_data->d_buf;
+	size_t sym_size = is_64_bit ? sizeof(Elf64_Sym) : sizeof(Elf32_Sym);
+	size_t num_syms = symtab_data->d_size / sym_size;
+
+	for (size_t i = 0; i < num_relocs; i++) {
+		uint64_t r_offset;
+		uint32_t r_sym;
+		uint32_t r_type;
+		if (is_64_bit) {
+			const Elf64_Rel *rel = (Elf64_Rel *)relocs + i;
+			uint64_t r_info;
+			memcpy(&r_offset, &rel->r_offset, sizeof(r_offset));
+			memcpy(&r_info, &rel->r_info, sizeof(r_info));
+			if (bswap) {
+				r_offset = bswap_64(r_offset);
+				r_info = bswap_64(r_info);
+			}
+			r_sym = ELF64_R_SYM(r_info);
+			r_type = ELF64_R_TYPE(r_info);
+		} else {
+			const Elf32_Rel *rel32 = (Elf32_Rel *)relocs + i;
+			uint32_t r_offset32;
+			uint32_t r_info32;
+			memcpy(&r_offset32, &rel32->r_offset, sizeof(r_offset32));
+			memcpy(&r_info32, &rel32->r_info, sizeof(r_info32));
+			if (bswap) {
+				r_offset32 = bswap_32(r_offset32);
+				r_info32 = bswap_32(r_info32);
+			}
+			r_offset = r_offset32;
+			r_sym = ELF32_R_SYM(r_info32);
+			r_type = ELF32_R_TYPE(r_info32);
+		}
+		uint64_t sym_value;
+		err = get_reloc_sym_value(syms, num_syms, sh_addrs, shdrnum,
+					  is_64_bit, bswap, r_sym, &sym_value);
+		if (err)
+			return err;
+
+		err = apply_elf_reloc(relocating, r_offset, r_type, NULL,
+				      sym_value);
+		if (err)
+			return err;
+	}
 	return NULL;
 }
 
@@ -1628,7 +1685,7 @@ static struct drgn_error *relocate_elf_file(Elf *elf)
 
 	struct drgn_platform platform;
 	drgn_platform_from_elf(ehdr, &platform);
-	if (!platform.arch->apply_elf_rela) {
+	if (!platform.arch->apply_elf_reloc) {
 		/* Unsupported; fall back to libdwfl. */
 		return NULL;
 	}
@@ -1659,41 +1716,89 @@ static struct drgn_error *relocate_elf_file(Elf *elf)
 
 	Elf_Scn *reloc_scn = NULL;
 	while ((reloc_scn = elf_nextscn(elf, reloc_scn))) {
-		GElf_Shdr *shdr, shdr_mem;
-		shdr = gelf_getshdr(reloc_scn, &shdr_mem);
-		if (!shdr) {
+		GElf_Shdr *reloc_shdr, reloc_shdr_mem;
+		reloc_shdr = gelf_getshdr(reloc_scn, &reloc_shdr_mem);
+		if (!reloc_shdr) {
 			err = drgn_error_libelf();
 			goto out;
 		}
 		/* We don't support any architectures that use SHT_REL yet. */
-		if (shdr->sh_type != SHT_RELA)
+		if (reloc_shdr->sh_type != SHT_RELA)
 			continue;
 
-		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!scnname) {
+		int r = should_apply_relocation_section(elf, shstrndx,
+							reloc_shdr);
+		if (r < 0) {
 			err = drgn_error_libelf();
 			goto out;
 		}
-
-		if (strstartswith(scnname, ".rela.debug_") ||
-		    strstartswith(scnname, ".rela.orc_")) {
-			Elf_Scn *scn = elf_getscn(elf, shdr->sh_info);
+		if (r) {
+			Elf_Scn *scn = elf_getscn(elf, reloc_shdr->sh_info);
 			if (!scn) {
 				err = drgn_error_libelf();
 				goto out;
 			}
+			GElf_Shdr *shdr, shdr_mem;
+			shdr = gelf_getshdr(scn, &shdr_mem);
+			if (!shdr) {
+				err = drgn_error_libelf();
+				goto out;
+			}
+			if (shdr->sh_type == SHT_NOBITS)
+				continue;
 
-			Elf_Scn *symtab_scn = elf_getscn(elf, shdr->sh_link);
+			Elf_Scn *symtab_scn = elf_getscn(elf,
+							 reloc_shdr->sh_link);
 			if (!symtab_scn) {
 				err = drgn_error_libelf();
 				goto out;
 			}
+			shdr = gelf_getshdr(symtab_scn, &shdr_mem);
+			if (!shdr) {
+				err = drgn_error_libelf();
+				goto out;
+			}
+			if (shdr->sh_type == SHT_NOBITS) {
+				err = drgn_error_create(DRGN_ERROR_OTHER,
+							"relocation symbol table has no data");
+				goto out;
+			}
 
-			err = relocate_elf_section(scn, reloc_scn, symtab_scn,
-						   sh_addrs, shdrnum,
-						   &platform);
+			Elf_Data *data, *reloc_data, *symtab_data;
+			if ((err = read_elf_section(scn, &data)) ||
+			    (err = read_elf_section(reloc_scn, &reloc_data)) ||
+			    (err = read_elf_section(symtab_scn, &symtab_data)))
+				goto out;
+
+			struct drgn_relocating_section relocating = {
+				.buf = data->d_buf,
+				.buf_size = data->d_size,
+				.addr = sh_addrs[elf_ndxscn(scn)],
+				.bswap = drgn_platform_bswap(&platform),
+			};
+
+			if (reloc_shdr->sh_type == SHT_RELA) {
+				err = apply_elf_relas(&relocating, reloc_data,
+						      symtab_data, sh_addrs,
+						      shdrnum, &platform);
+			} else {
+				err = apply_elf_rels(&relocating, reloc_data,
+						     symtab_data, sh_addrs,
+						     shdrnum, &platform);
+			}
 			if (err)
 				goto out;
+
+			/*
+			 * Mark the relocation section as empty so that libdwfl
+			 * doesn't try to apply it again.
+			 */
+			reloc_shdr->sh_size = 0;
+			if (!gelf_update_shdr(reloc_scn, reloc_shdr)) {
+				err = drgn_error_libelf();
+				goto out;
+			}
+			reloc_data->d_size = 0;
 		}
 	}
 	err = NULL;
@@ -2200,14 +2305,12 @@ struct drgn_error *find_elf_file(char **path_ret, int *fd_ret, Elf **elf_ret,
 struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret)
 {
 	GElf_Shdr shdr_mem, *shdr;
-	Elf_Data *data;
-
 	shdr = gelf_getshdr(scn, &shdr_mem);
 	if (!shdr)
 		return drgn_error_libelf();
 	if ((shdr->sh_flags & SHF_COMPRESSED) && elf_compress(scn, 0, 0) < 0)
 		return drgn_error_libelf();
-	data = elf_getdata(scn, NULL);
+	Elf_Data *data = elf_rawdata(scn, NULL);
 	if (!data)
 		return drgn_error_libelf();
 	*ret = data;

@@ -8,6 +8,7 @@
 
 #include "linux_kernel.h"
 #include "program.h" // IWYU pragma: associated
+#include "util.h"
 
 static struct drgn_error *drgn_platform_from_kdump(kdump_ctx_t *ctx,
 						   struct drgn_platform *ret)
@@ -26,8 +27,15 @@ static struct drgn_error *drgn_platform_from_kdump(kdump_ctx_t *ctx,
 	}
 	if (strcmp(str, KDUMP_ARCH_X86_64) == 0)
 		arch = &arch_info_x86_64;
+	else if (strcmp(str, KDUMP_ARCH_IA32) == 0)
+		arch = &arch_info_i386;
+	else if (strcmp(str, KDUMP_ARCH_AARCH64) == 0)
+		arch = &arch_info_aarch64;
+	else if (strcmp(str, KDUMP_ARCH_ARM) == 0)
+		arch = &arch_info_arm;
 	else if (strcmp(str, KDUMP_ARCH_PPC64) == 0)
 		arch = &arch_info_ppc64;
+	/* libkdumpfile doesn't support RISC-V */
 	else
 		arch = &arch_info_unknown;
 
@@ -159,7 +167,7 @@ err:
 	return err;
 }
 
-struct drgn_error *drgn_program_cache_prstatus_kdump(struct drgn_program *prog)
+struct drgn_error *drgn_program_cache_kdump_notes(struct drgn_program *prog)
 {
 	struct drgn_error *err;
 	kdump_num_t ncpus, i;
@@ -181,14 +189,18 @@ struct drgn_error *drgn_program_cache_prstatus_kdump(struct drgn_program *prog)
 	 */
 	for (i = 0; i < ncpus; i++) {
 		/* Enough for the longest possible PRSTATUS attribute name. */
-		char attr_name[64];
 		kdump_attr_ref_t prstatus_ref;
 		kdump_attr_t prstatus_attr;
 		void *prstatus_data;
 		size_t prstatus_size;
 
-		snprintf(attr_name, sizeof(attr_name),
-			 "cpu.%" PRIuFAST64 ".PRSTATUS", i);
+#define FORMAT "cpu.%" PRIuFAST64 ".PRSTATUS"
+		char attr_name[sizeof(FORMAT)
+			       - sizeof("%" PRIuFAST64)
+			       + max_decimal_length(uint_fast64_t)
+			       + 1];
+		snprintf(attr_name, sizeof(attr_name), FORMAT, i);
+#undef FORMAT
 		ks = kdump_attr_ref(prog->kdump_ctx, attr_name, &prstatus_ref);
 		if (ks != KDUMP_OK) {
 			return drgn_error_format(DRGN_ERROR_OTHER,
@@ -208,9 +220,9 @@ struct drgn_error *drgn_program_cache_prstatus_kdump(struct drgn_program *prog)
 
 		prstatus_data = kdump_blob_pin(prstatus_attr.val.blob);
 		prstatus_size = kdump_blob_size(prstatus_attr.val.blob);
-		err = drgn_program_cache_prstatus_entry(prog,
-							prstatus_data,
-							prstatus_size);
+		uint32_t _;
+		err = drgn_program_cache_prstatus_entry(prog, prstatus_data,
+							prstatus_size, &_);
 		if (err)
 			return err;
 	}

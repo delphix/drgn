@@ -4,7 +4,7 @@
 #include "drgnpy.h"
 #include "../error.h"
 
-int FaultError_init(PyObject *self, PyObject *args, PyObject *kwds)
+static int FaultError_init(PyObject *self, PyObject *args, PyObject *kwds)
 {
 	static char *keywords[] = {"message", "address", NULL};
 	PyObject *address, *message;
@@ -176,6 +176,9 @@ DRGNPY_PUBLIC void *set_drgn_error(struct drgn_error *err)
 		break;
 	case DRGN_ERROR_OBJECT_ABSENT:
 		PyErr_SetString(ObjectAbsentError, err->message);
+		break;
+	case DRGN_ERROR_NOT_IMPLEMENTED:
+		PyErr_SetString(PyExc_NotImplementedError, err->message);
 		break;
 	default:
 		PyErr_SetString(PyExc_Exception, err->message);

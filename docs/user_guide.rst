@@ -193,19 +193,73 @@ Of course, it would be a waste of time and effort for everyone to have to
 define these helpers for themselves, so drgn includes a collection of helpers
 for many use cases. See :doc:`helpers`.
 
+.. _validators:
+
+Validators
+""""""""""
+
+Validators are a special category of helpers that check the consistency of a
+data structure. In general, helpers assume that the data structures that they
+examine are valid. Validators do not make this assumption and do additional
+(potentially expensive) checks to detect broken invariants, corruption, etc.
+
+Validators raise :class:`drgn.helpers.ValidationError` if the data structure is
+not valid or :class:`drgn.FaultError` if the data structure is invalid in a way
+that causes a bad memory access. They have names prefixed with ``validate_``.
+
+For example, :func:`drgn.helpers.linux.list.validate_list()` checks the
+consistency of a linked list in the Linux kernel (in particular, the
+consistency of the ``next`` and ``prev`` pointers)::
+
+    >>> validate_list(prog["my_list"].address_of_())
+    drgn.helpers.ValidationError: (struct list_head *)0xffffffffc029e460 next 0xffffffffc029e000 has prev 0xffffffffc029e450
+
+:func:`drgn.helpers.linux.list.validate_list_for_each_entry()` does the same
+checks while also returning the entries in the list for further validation:
+
+.. code-block:: python3
+
+   def validate_my_list(prog):
+        for entry in validate_list_for_each_entry(
+            "struct my_entry",
+            prog["my_list"].address_of_(),
+            "list",
+        ):
+            if entry.value < 0:
+                raise ValidationError("list contains negative entry")
+
 Other Concepts
 --------------
 
 In addition to the core concepts above, drgn provides a few additional
 abstractions.
 
+Threads
+^^^^^^^
+
+The :class:`drgn.Thread` class represents a thread.
+:meth:`drgn.Program.threads()`, :meth:`drgn.Program.thread()`,
+:meth:`drgn.Program.main_thread()`, and :meth:`drgn.Program.crashed_thread()`
+can be used to find threads::
+
+    >>> for thread in prog.threads():
+    ...     print(thread.tid)
+    ...
+    39143
+    39144
+    >>> print(prog.main_thread().tid)
+    39143
+    >>> print(prog.crashed_thread().tid)
+    39144
+
 Stack Traces
 ^^^^^^^^^^^^
 
 drgn represents stack traces with the :class:`drgn.StackTrace` and
-:class:`drgn.StackFrame` classes. :meth:`drgn.Program.stack_trace()` returns
-the call stack for a thread. The :meth:`[] <drgn.StackFrame.__getitem__>`
-operator looks up an object in the scope of a ``StackFrame``::
+:class:`drgn.StackFrame` classes. :meth:`drgn.Thread.stack_trace()` and
+:meth:`drgn.Program.stack_trace()` return the call stack for a thread. The
+:meth:`[] <drgn.StackFrame.__getitem__>` operator looks up an object in the
+scope of a ``StackFrame``::
 
     >>> trace = prog.stack_trace(115)
     >>> trace

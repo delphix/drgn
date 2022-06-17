@@ -13,6 +13,7 @@ hlist_head``) in :linux:`include/linux/list.h`.
 from typing import Iterator, Union
 
 from drgn import NULL, Object, Type, container_of
+from drgn.helpers import ValidationError
 
 __all__ = (
     "hlist_empty",
@@ -29,6 +30,9 @@ __all__ = (
     "list_last_entry",
     "list_next_entry",
     "list_prev_entry",
+    "validate_list",
+    "validate_list_for_each",
+    "validate_list_for_each_entry",
 )
 
 
@@ -85,9 +89,7 @@ def list_first_entry_or_null(
     head = head.read_()
     pos = head.next.read_()
     if pos == head:
-        if isinstance(type, str):
-            type = head.prog_.type(type)
-        return NULL(head.prog_, head.prog_.pointer_type(type))
+        return NULL(head.prog_, head.prog_.pointer_type(head.prog_.type(type)))
     else:
         return container_of(pos, type, member)
 
@@ -167,6 +169,7 @@ def list_for_each_entry(
     :param member: Name of list node member in entry type.
     :return: Iterator of ``type *`` objects.
     """
+    type = head.prog_.type(type)
     for pos in list_for_each(head):
         yield container_of(pos, type, member)
 
@@ -182,7 +185,59 @@ def list_for_each_entry_reverse(
     :param member: Name of list node member in entry type.
     :return: Iterator of ``type *`` objects.
     """
+    type = head.prog_.type(type)
     for pos in list_for_each_reverse(head):
+        yield container_of(pos, type, member)
+
+
+def validate_list(head: Object) -> None:
+    """
+    Validate that the ``next`` and ``prev`` pointers in a list are consistent.
+
+    :param head: ``struct list_head *``
+    :raises ValidationError: if the list is invalid
+    """
+    for _ in validate_list_for_each(head):
+        pass
+
+
+def validate_list_for_each(head: Object) -> Iterator[Object]:
+    """
+    Like :func:`list_for_each()`, but validates the list like
+    :func:`validate_list()` while iterating.
+
+    :param head: ``struct list_head *``
+    :raises ValidationError: if the list is invalid
+    """
+    head = head.read_()
+    pos = head.next.read_()
+    while pos != head:
+        yield pos
+        next = pos.next.read_()
+        next_prev = next.prev.read_()
+        if next_prev != pos:
+            raise ValidationError(
+                f"{pos.format_(dereference=False, symbolize=False)}"
+                f" next {next.format_(dereference=False, symbolize=False, type_name=False)}"
+                f" has prev {next_prev.format_(dereference=False, symbolize=False, type_name=False)}"
+            )
+        pos = next
+
+
+def validate_list_for_each_entry(
+    type: Union[str, Type], head: Object, member: str
+) -> Iterator[Object]:
+    """
+    Like :func:`list_for_each_entry()`, but validates the list like
+    :func:`validate_list()` while iterating.
+
+    :param type: Entry type.
+    :param head: ``struct list_head *``
+    :param member: Name of list node member in entry type.
+    :raises ValidationError: if the list is invalid
+    """
+    type = head.prog_.type(type)
+    for pos in validate_list_for_each(head):
         yield container_of(pos, type, member)
 
 
@@ -219,5 +274,6 @@ def hlist_for_each_entry(
     :param member: Name of list node member in entry type.
     :return: Iterator of ``type *`` objects.
     """
+    type = head.prog_.type(type)
     for pos in hlist_for_each(head):
         yield container_of(pos, type, member)

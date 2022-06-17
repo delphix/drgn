@@ -16,6 +16,7 @@ from typing import (
     Dict,
     Iterable,
     Iterator,
+    List,
     Mapping,
     Optional,
     Sequence,
@@ -86,9 +87,12 @@ class Program:
     This is used for interpreting the type name given to :meth:`type()` and
     when creating an :class:`Object` without an explicit type.
 
-    For the Linux kernel, this is :attr:`Language.C`. For userspace programs,
-    this is determined from the language of ``main`` in the program, falling
+    For the Linux kernel, this defaults to :attr:`Language.C`. For userspace
+    programs, this defaults to the language of ``main`` in the program, falling
     back to :attr:`Language.C`. This heuristic may change in the future.
+
+    This can be explicitly set to a different language (e.g., if the heuristic
+    was incorrect).
     """
     def __getitem__(self, name: str) -> Object:
         """
@@ -189,7 +193,6 @@ class Program:
             the given file
         """
         ...
-    # address_or_name is positional-only.
     def symbol(self, address_or_name: Union[IntegerLike, str]) -> Symbol:
         """
         Get a symbol containing the given address, or a symbol with the given
@@ -202,11 +205,31 @@ class Program:
         :attr:`SymbolBinding.WEAK` symbol is found, it is returned. Otherwise,
         any matching symbol (e.g., :attr:`SymbolBinding.LOCAL`) is returned. If
         there are multiple matching symbols with the same binding, one is
-        returned arbitrarily.
+        returned arbitrarily. To retrieve all matching symbols, use
+        :meth:`symbols()`.
 
-        :param address_or_name: Address or name.
+        :param address_or_name: Address or name to search for. This parameter
+            is positional-only.
         :raises LookupError: if no symbol contains the given address or matches
             the given name
+        """
+        ...
+    def symbols(
+        self,
+        address_or_name: Union[None, IntegerLike, str] = None,
+    ) -> List[Symbol]:
+        """
+        Get a list of global and local symbols, optionally matching a name or
+        address.
+
+        If a string argument is given, this returns all symbols matching that
+        name. If an integer-like argument given, this returns a list of all
+        symbols containing that address. If no argument is given, all symbols
+        in the program are returned. In all cases, the symbols are returned in
+        an unspecified order.
+
+        :param address_or_name: Address or name to search for. This parameter
+            is positional-only.
         """
         ...
     def stack_trace(
@@ -239,6 +262,7 @@ class Program:
             ``struct task_struct *`` object.
         """
         ...
+    @overload
     def type(self, name: str, filename: Optional[str] = None) -> Type:
         """
         Get the type with the given name.
@@ -251,6 +275,62 @@ class Program:
             :ref:`api-filenames`.
         :raises LookupError: if no types with the given name are found in
             the given file
+        """
+        ...
+    @overload
+    # type is positional-only.
+    def type(self, type: Type) -> Type:
+        """
+        Return the given type.
+
+        This is mainly useful so that helpers can use ``prog.type()`` to get a
+        :class:`Type` regardless of whether they were given a :class:`str` or a
+        :class:`Type`. For example:
+
+        .. code-block:: python3
+
+            def my_helper(obj: Object, type: Union[str, Type]) -> bool:
+                # type may be str or Type.
+                type = obj.prog_.type(type)
+                # type is now always Type.
+                return sizeof(obj) > sizeof(type)
+
+        :param type: Type.
+        :return: The exact same type.
+        """
+        ...
+    def threads(self) -> Iterator[Thread]:
+        """Get an iterator over all of the threads in the program."""
+        ...
+    def thread(self, tid: IntegerLike) -> Thread:
+        """
+        Get the thread with the given thread ID.
+
+        :param tid: Thread ID (as defined by `gettid(2)
+            <http://man7.org/linux/man-pages/man2/gettid.2.html>`_).
+        :raises LookupError: if no thread has the given thread ID
+        """
+        ...
+    def main_thread(self) -> Thread:
+        """
+        Get the main thread of the program.
+
+        This is only defined for userspace programs.
+
+        :raises ValueError: if the program is the Linux kernel
+        """
+        ...
+    def crashed_thread(self) -> Thread:
+        """
+        Get the thread that caused the program to crash.
+
+        For userspace programs, this is the thread that received the fatal
+        signal (e.g., ``SIGSEGV`` or ``SIGQUIT``).
+
+        For the kernel, this is the thread that panicked (either directly or as
+        a result of an oops, ``BUG_ON()``, etc.).
+
+        :raises ValueError: if the program is live (i.e., not a core dump)
         """
         ...
     def read(
@@ -764,6 +844,28 @@ class FindObjectFlags(enum.Flag):
     ANY = ...
     ""
 
+class Thread:
+    """A thread in a program."""
+
+    tid: int
+    """
+    Thread ID (as defined by `gettid(2)
+    <http://man7.org/linux/man-pages/man2/gettid.2.html>`_).
+    """
+    object: Object
+    """
+    If the program is the Linux kernel, the ``struct task_struct *`` object for
+    this thread. Otherwise, not defined.
+    """
+    def stack_trace(self) -> StackTrace:
+        """
+        Get the stack trace for this thread.
+
+        This is equivalent to ``prog.stack_trace(thread.tid)``. See
+        :meth:`Program.stack_trace()`.
+        """
+        ...
+
 def filename_matches(haystack: Optional[str], needle: Optional[str]) -> bool:
     """
     Return whether a filename containing a definition (*haystack*) matches a
@@ -837,10 +939,25 @@ class Architecture(enum.Enum):
     """An ``Architecture`` represents an instruction set architecture."""
 
     X86_64 = ...
-    """The x86-64 architecture, a.k.a. AMD64."""
+    """The x86-64 architecture, a.k.a. AMD64 or Intel 64."""
+
+    I386 = ...
+    """The 32-bit x86 architecture, a.k.a. i386 or IA-32."""
+
+    AARCH64 = ...
+    """The AArch64 architecture, a.k.a. ARM64."""
+
+    ARM = ...
+    """The 32-bit Arm architecture."""
 
     PPC64 = ...
     """The 64-bit PowerPC architecture."""
+
+    RISCV64 = ...
+    """The 64-bit RISC-V architecture."""
+
+    RISCV32 = ...
+    """The 32-bit RISC-V architecture."""
 
     UNKNOWN = ...
     """
@@ -880,6 +997,9 @@ class Language:
 
     C: Language
     """The C programming language."""
+
+    CPP: Language
+    """The C++ programming language."""
 
 class Object:
     """
@@ -1525,6 +1645,19 @@ class StackFrame:
     """
     Name of the function at this frame, or ``None`` if it could not be
     determined.
+
+    The name cannot be determined if debugging information is not available for
+    the function, e.g., because it is implemented in assembly. It may be
+    desirable to use the symbol name or program counter as a fallback:
+
+    .. code-block:: python3
+
+        name = frame.name
+        if name is None:
+            try:
+                name = frame.symbol().name
+            except LookupError:
+                name = hex(frame.pc)
     """
 
     is_inline: bool
@@ -2246,42 +2379,4 @@ def _linux_helper_kaslr_offset(prog: Program) -> int:
 
 def _linux_helper_pgtable_l5_enabled(prog: Program) -> bool:
     """Return whether 5-level paging is enabled."""
-    ...
-
-def _linux_helper_radix_tree_for_each(root: Object) -> Iterator[Tuple[int, Object]]:
-    """
-    Iterate over all of the entries in a radix tree.
-
-    :param root: ``struct radix_tree_root *``
-    :return: Iterator of (index, ``void *``) tuples.
-    """
-    ...
-
-def _linux_helper_idr_for_each(idr: Object) -> Iterator[Tuple[int, Object]]:
-    """
-    Iterate over all of the entries in an IDR.
-
-    :param idr: ``struct idr *``
-    :return: Iterator of (index, ``void *``) tuples.
-    """
-    ...
-
-def _linux_helper_for_each_pid(prog_or_ns: Union[Program, Object]) -> Iterator[Object]:
-    """
-    Iterate over all PIDs in a namespace.
-
-    :param prog_or_ns: ``struct pid_namespace *`` to iterate over, or
-        :class:`Program` to iterate over initial PID namespace.
-    :return: Iterator of ``struct pid *`` objects.
-    """
-    ...
-
-def _linux_helper_for_each_task(prog_or_ns: Union[Program, Object]) -> Iterator[Object]:
-    """
-    Iterate over all of the tasks visible in a namespace.
-
-    :param prog_or_ns: ``struct pid_namespace *`` to iterate over, or
-        :class:`Program` to iterate over initial PID namespace.
-    :return: Iterator of ``struct task_struct *`` objects.
-    """
     ...

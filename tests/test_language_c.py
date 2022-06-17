@@ -1,9 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: GPL-3.0-or-later
-
 from functools import reduce
 import operator
-import unittest
 
 from drgn import (
     Object,
@@ -15,8 +13,8 @@ from drgn import (
     cast,
     container_of,
 )
-from tests import MockProgramTestCase
-from tests.libdrgn import C_TOKEN, Lexer, drgn_lexer_c
+from tests import MockProgramTestCase, TestCase
+from tests.libdrgn import C_TOKEN, Lexer, drgn_c_family_lexer_func
 
 
 class TestPrettyPrintTypeName(MockProgramTestCase):
@@ -712,9 +710,9 @@ typedef struct {
         )
 
 
-class TestLexer(unittest.TestCase):
-    def lex(self, s):
-        lexer = Lexer(drgn_lexer_c, s)
+class TestLexer(TestCase):
+    def lex(self, s, cpp=False):
+        lexer = Lexer(drgn_c_family_lexer_func, s, cpp)
         while True:
             token = lexer.pop()
             if token.kind == C_TOKEN.EOF:
@@ -722,7 +720,7 @@ class TestLexer(unittest.TestCase):
             yield token
 
     def test_empty(self):
-        lexer = Lexer(drgn_lexer_c, "")
+        lexer = Lexer(drgn_c_family_lexer_func, "")
         for i in range(64):
             self.assertEqual(lexer.pop().kind, C_TOKEN.EOF)
 
@@ -740,7 +738,7 @@ class TestLexer(unittest.TestCase):
 
     def test_keywords(self):
         s = """void char short int long signed unsigned _Bool float double
-        _Complex const restrict volatile _Atomic struct union enum"""
+        _Complex const restrict volatile _Atomic struct union class enum"""
         tokens = [
             C_TOKEN.VOID,
             C_TOKEN.CHAR,
@@ -759,12 +757,48 @@ class TestLexer(unittest.TestCase):
             C_TOKEN.ATOMIC,
             C_TOKEN.STRUCT,
             C_TOKEN.UNION,
+            C_TOKEN.IDENTIFIER,
             C_TOKEN.ENUM,
         ]
         self.assertEqual([token.kind for token in self.lex(s)], tokens)
 
+    def test_cpp_keywords(self):
+        s = """void char short int long signed unsigned _Bool float double
+        _Complex const restrict volatile _Atomic struct union class enum"""
+        tokens = [
+            C_TOKEN.VOID,
+            C_TOKEN.CHAR,
+            C_TOKEN.SHORT,
+            C_TOKEN.INT,
+            C_TOKEN.LONG,
+            C_TOKEN.SIGNED,
+            C_TOKEN.UNSIGNED,
+            C_TOKEN.BOOL,
+            C_TOKEN.FLOAT,
+            C_TOKEN.DOUBLE,
+            C_TOKEN.COMPLEX,
+            C_TOKEN.CONST,
+            C_TOKEN.RESTRICT,
+            C_TOKEN.VOLATILE,
+            C_TOKEN.ATOMIC,
+            C_TOKEN.STRUCT,
+            C_TOKEN.UNION,
+            C_TOKEN.CLASS,
+            C_TOKEN.ENUM,
+        ]
+        self.assertEqual([token.kind for token in self.lex(s, cpp=True)], tokens)
+
     def test_identifiers(self):
         s = "_ x foo _bar baz1"
+        tokens = s.split()
+        self.assertEqual(
+            [(token.kind, token.value) for token in self.lex(s)],
+            [(C_TOKEN.IDENTIFIER, value) for value in tokens],
+        )
+
+    def test_almost_keywords(self):
+        s = """voi cha shor in lon signe unsigne _Boo floa doubl
+        _Comple cons restric volatil _Atomi struc unio enu"""
         tokens = s.split()
         self.assertEqual(
             [(token.kind, token.value) for token in self.lex(s)],
@@ -796,30 +830,30 @@ class TestLiteral(MockProgramTestCase):
             Object(self.prog, value=-1), Object(self.prog, "int", value=-1)
         )
         self.assertIdentical(
-            Object(self.prog, value=2 ** 31 - 1),
-            Object(self.prog, "int", value=2 ** 31 - 1),
+            Object(self.prog, value=2**31 - 1),
+            Object(self.prog, "int", value=2**31 - 1),
         )
 
         self.assertIdentical(
-            Object(self.prog, value=2 ** 31), Object(self.prog, "long", value=2 ** 31)
+            Object(self.prog, value=2**31), Object(self.prog, "long", value=2**31)
         )
         # Not int, because this is treated as the negation operator applied to
         # 2**31.
         self.assertIdentical(
-            Object(self.prog, value=-(2 ** 31)),
-            Object(self.prog, "long", value=-(2 ** 31)),
+            Object(self.prog, value=-(2**31)),
+            Object(self.prog, "long", value=-(2**31)),
         )
 
         self.assertIdentical(
-            Object(self.prog, value=2 ** 63),
-            Object(self.prog, "unsigned long long", value=2 ** 63),
+            Object(self.prog, value=2**63),
+            Object(self.prog, "unsigned long long", value=2**63),
         )
         self.assertIdentical(
-            Object(self.prog, value=2 ** 64 - 1),
-            Object(self.prog, "unsigned long long", value=2 ** 64 - 1),
+            Object(self.prog, value=2**64 - 1),
+            Object(self.prog, "unsigned long long", value=2**64 - 1),
         )
         self.assertIdentical(
-            Object(self.prog, value=-(2 ** 64 - 1)),
+            Object(self.prog, value=-(2**64 - 1)),
             Object(self.prog, "unsigned long long", value=1),
         )
 
@@ -1425,10 +1459,10 @@ class TestOperators(MockProgramTestCase):
         self.assertIdentical(self.int(-2) * self.int(-3), self.int(6))
 
         # Integer overflow.
-        self.assertIdentical(self.int(0x8000) * self.int(0x10000), self.int(-(2 ** 31)))
+        self.assertIdentical(self.int(0x8000) * self.int(0x10000), self.int(-(2**31)))
 
         self.assertIdentical(
-            self.unsigned_int(0x8000) * self.int(0x10000), self.unsigned_int(2 ** 31)
+            self.unsigned_int(0x8000) * self.int(0x10000), self.unsigned_int(2**31)
         )
 
         self.assertIdentical(
@@ -1495,19 +1529,19 @@ class TestOperators(MockProgramTestCase):
 
     def test_and(self):
         self._test_arithmetic(operator.and_, 1, 3, 1)
-        self.assertIdentical(self.int(-1) & self.int(2 ** 31), self.int(2 ** 31))
+        self.assertIdentical(self.int(-1) & self.int(2**31), self.int(2**31))
         self._test_pointer_type_errors(operator.and_)
         self._test_floating_type_errors(operator.and_)
 
     def test_xor(self):
         self._test_arithmetic(operator.xor, 1, 3, 2)
-        self.assertIdentical(self.int(-1) ^ self.int(-(2 ** 31)), self.int(2 ** 31 - 1))
+        self.assertIdentical(self.int(-1) ^ self.int(-(2**31)), self.int(2**31 - 1))
         self._test_pointer_type_errors(operator.xor)
         self._test_floating_type_errors(operator.xor)
 
     def test_or(self):
         self._test_arithmetic(operator.or_, 1, 3, 3)
-        self.assertIdentical(self.int(-(2 ** 31)) | self.int(2 ** 31 - 1), self.int(-1))
+        self.assertIdentical(self.int(-(2**31)) | self.int(2**31 - 1), self.int(-1))
         self._test_pointer_type_errors(operator.or_)
         self._test_floating_type_errors(operator.or_)
 
