@@ -29,6 +29,8 @@
 #include "type.h"
 #include "util.h"
 
+#include "drgn_program_parse_vmcoreinfo.inc"
+
 struct drgn_error *read_memory_via_pgtable(void *buf, uint64_t address,
 					   size_t count, uint64_t offset,
 					   void *arg, bool physical)
@@ -36,102 +38,6 @@ struct drgn_error *read_memory_via_pgtable(void *buf, uint64_t address,
 	struct drgn_program *prog = arg;
 	return linux_helper_read_vm(prog, prog->vmcoreinfo.swapper_pg_dir,
 				    address, buf, count);
-}
-
-static inline bool linematch(const char **line, const char *prefix)
-{
-	size_t len = strlen(prefix);
-
-	if (strncmp(*line, prefix, len) == 0) {
-		*line += len;
-		return true;
-	} else {
-		return false;
-	}
-}
-
-static struct drgn_error *line_to_u64(const char *line, const char *newline,
-				      int base, uint64_t *ret)
-{
-	unsigned long long value;
-	char *end;
-
-	errno = 0;
-	value = strtoull(line, &end, base);
-	if (errno == ERANGE) {
-		return drgn_error_create(DRGN_ERROR_OVERFLOW,
-					 "number in VMCOREINFO is too large");
-	} else if (errno || end == line || end != newline) {
-		return drgn_error_create(DRGN_ERROR_OVERFLOW,
-					 "number in VMCOREINFO is invalid");
-	}
-	*ret = value;
-	return NULL;
-}
-
-struct drgn_error *parse_vmcoreinfo(const char *desc, size_t descsz,
-				    struct vmcoreinfo *ret)
-{
-	struct drgn_error *err;
-	const char *line = desc, *end = &desc[descsz];
-
-	ret->osrelease[0] = '\0';
-	ret->page_size = 0;
-	ret->kaslr_offset = 0;
-	ret->pgtable_l5_enabled = false;
-	while (line < end) {
-		const char *newline;
-
-		newline = memchr(line, '\n', end - line);
-		if (!newline)
-			break;
-
-		if (linematch(&line, "OSRELEASE=")) {
-			if ((size_t)(newline - line) >=
-			    sizeof(ret->osrelease)) {
-				return drgn_error_create(DRGN_ERROR_OTHER,
-							 "OSRELEASE in VMCOREINFO is too long");
-			}
-			memcpy(ret->osrelease, line, newline - line);
-			ret->osrelease[newline - line] = '\0';
-		} else if (linematch(&line, "PAGESIZE=")) {
-			err = line_to_u64(line, newline, 0, &ret->page_size);
-			if (err)
-				return err;
-		} else if (linematch(&line, "KERNELOFFSET=")) {
-			err = line_to_u64(line, newline, 16,
-					  &ret->kaslr_offset);
-			if (err)
-				return err;
-		} else if (linematch(&line, "SYMBOL(swapper_pg_dir)=")) {
-			err = line_to_u64(line, newline, 16,
-					  &ret->swapper_pg_dir);
-			if (err)
-				return err;
-		} else if (linematch(&line, "NUMBER(pgtable_l5_enabled)=")) {
-			uint64_t tmp;
-
-			err = line_to_u64(line, newline, 0, &tmp);
-			if (err)
-				return err;
-			ret->pgtable_l5_enabled = tmp;
-		}
-		line = newline + 1;
-	}
-	if (!ret->osrelease[0]) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
-					 "VMCOREINFO does not contain valid OSRELEASE");
-	}
-	if (!ret->page_size) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
-					 "VMCOREINFO does not contain valid PAGESIZE");
-	}
-	if (!ret->swapper_pg_dir) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
-					 "VMCOREINFO does not contain valid swapper_pg_dir");
-	}
-	/* KERNELOFFSET and pgtable_l5_enabled are optional. */
-	return NULL;
 }
 
 struct drgn_error *proc_kallsyms_symbol_addr(const char *name,
@@ -237,7 +143,7 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 		goto out;
 	}
 
-	err = parse_vmcoreinfo(buf + 24, nhdr->n_descsz, &prog->vmcoreinfo);
+	err = drgn_program_parse_vmcoreinfo(prog, buf + 24, nhdr->n_descsz);
 out:
 	free(buf);
 	return err;

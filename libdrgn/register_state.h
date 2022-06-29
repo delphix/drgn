@@ -34,10 +34,11 @@
  * This defines @ref drgn_register_state for storing the values of processor
  * registers.
  *
- * Several macros defined here take a register identifier as defined by @ref
- * DRGN_REGISTER_LAYOUT(). These are intended for use in architecture definition
- * files. These macros also have function equivalents (with names ending in
- * `_impl`) that take the register number, offset, and size instead.
+ * Several macros defined here take a register identifier as defined in an
+ * architecture definition file. These are intended for use in the corresponding
+ * architecture support file. These macros also have function equivalents (with
+ * names ending in `_impl`) that take the register number, offset, and size
+ * instead.
  *
  * @{
  */
@@ -86,6 +87,34 @@ struct drgn_register_state {
 	 */
 	unsigned char buf[];
 };
+
+/**
+ * Return the internal register number of a register.
+ *
+ * @param[in] id Register identifier.
+ */
+#define DRGN_REGISTER_NUMBER(id) DRGN_REGISTER_NUMBER__##id
+
+/**
+ * Return the offset of a register in the register buffer.
+ *
+ * @param[in] id Register identifier.
+ */
+#define DRGN_REGISTER_OFFSET(id) offsetof(struct drgn_arch_register_layout, id)
+
+/**
+ * Return the size of a register in bytes.
+ *
+ * @param[in] id Register identifier.
+ */
+#define DRGN_REGISTER_SIZE(id) sizeof(((struct drgn_arch_register_layout *)0)->id)
+
+/**
+ * Return one past the last byte of a register in the register buffer.
+ *
+ * @param[in] id Register identifier.
+ */
+#define DRGN_REGISTER_END(id) (DRGN_REGISTER_OFFSET(id) + DRGN_REGISTER_SIZE(id))
 
 struct drgn_register_state *drgn_register_state_create_impl(uint32_t regs_size,
 							    uint16_t num_regs,
@@ -203,6 +232,26 @@ void drgn_register_state_set_cfa(struct drgn_program *prog,
 				 struct drgn_register_state *regs,
 				 uint64_t cfa);
 
+struct optional_uint64
+drgn_register_state_get_u64_impl(struct drgn_program *prog,
+				 struct drgn_register_state *regs,
+				 drgn_register_number regno,
+				 size_t reg_offset, size_t reg_size)
+	__attribute__((__pure__));
+
+/**
+ * Get the least significant 64 bits of a register in a @ref
+ * drgn_register_state.
+ *
+ * @param[in] reg Identifier of register to get.
+ */
+#define drgn_register_state_get_u64(prog, regs, reg)			\
+	drgn_register_state_get_u64_impl(prog, regs,			\
+					 DRGN_REGISTER_NUMBER(reg),	\
+					 DRGN_REGISTER_OFFSET(reg),	\
+					 DRGN_REGISTER_SIZE(reg))
+
+
 static inline void
 drgn_register_state_set_from_buffer_impl(struct drgn_register_state *regs,
 					 drgn_register_number regno,
@@ -260,11 +309,11 @@ drgn_register_state_set_range_from_buffer_impl(struct drgn_register_state *regs,
 						       buf)
 
 static inline void
-drgn_register_state_set_from_integer_impl(struct drgn_program *prog,
-					  struct drgn_register_state *regs,
-					  drgn_register_number regno,
-					  size_t reg_offset, size_t reg_size,
-					  uint64_t value)
+drgn_register_state_set_from_u64_impl(struct drgn_program *prog,
+				      struct drgn_register_state *regs,
+				      drgn_register_number regno,
+				      size_t reg_offset, size_t reg_size,
+				      uint64_t value)
 {
 	copy_lsbytes(&regs->buf[reg_offset], reg_size,
 		     drgn_platform_is_little_endian(&prog->platform), &value,
@@ -282,12 +331,11 @@ drgn_register_state_set_from_integer_impl(struct drgn_program *prog,
  * @param[in] reg Identifier of register to set. Number must be less than @ref
  * drgn_register_state::num_regs.
  */
-#define drgn_register_state_set_from_integer(prog, regs, reg, value)		\
-	drgn_register_state_set_from_integer_impl(prog, regs,			\
-						  DRGN_REGISTER_NUMBER(reg),	\
-						  DRGN_REGISTER_OFFSET(reg),	\
-						  DRGN_REGISTER_SIZE(reg),	\
-						  value)
+#define drgn_register_state_set_from_u64(prog, regs, reg, value)		\
+	drgn_register_state_set_from_u64_impl(prog, regs,			\
+					      DRGN_REGISTER_NUMBER(reg),	\
+					      DRGN_REGISTER_OFFSET(reg),	\
+					      DRGN_REGISTER_SIZE(reg), value)
 
 /** @} */
 
