@@ -11,68 +11,10 @@
 #include "register_state.h"
 #include "serialize.h"
 
-/*
- * There are two conflicting definitions of DWARF register numbers after 63. The
- * original definition appears to be "64-bit PowerPC ELF Application Binary
- * Interface Supplement" [1]. The GNU toolchain instead uses its own that was
- * later codified in "Power Architecture 64-Bit ELF V2 ABI Specification" [2].
- * We use the latter.
- *
- * 1: https://refspecs.linuxfoundation.org/ELF/ppc64/PPC-elf64abi.html
- * 2: https://openpowerfoundation.org/?resource_lib=64-bit-elf-v2-abi-specification-power-architecture
- */
-#define DRGN_ARCH_REGISTER_LAYOUT						\
-	/*									\
-	 * The psABI calls register 65 the link register, but it's used as the	\
-	 * DWARF CFI return_address_register, so it usually contains the program\
-	 * counter.								\
-	 */									\
-	DRGN_REGISTER_LAYOUT(ra, 8, 65)						\
-	DRGN_REGISTER_LAYOUT(r0, 8, 0)						\
-	DRGN_REGISTER_LAYOUT(r1, 8, 1)						\
-	DRGN_REGISTER_LAYOUT(r2, 8, 2)						\
-	DRGN_REGISTER_LAYOUT(r3, 8, 3)						\
-	DRGN_REGISTER_LAYOUT(r4, 8, 4)						\
-	DRGN_REGISTER_LAYOUT(r5, 8, 5)						\
-	DRGN_REGISTER_LAYOUT(r6, 8, 6)						\
-	DRGN_REGISTER_LAYOUT(r7, 8, 7)						\
-	DRGN_REGISTER_LAYOUT(r8, 8, 8)						\
-	DRGN_REGISTER_LAYOUT(r9, 8, 9)						\
-	DRGN_REGISTER_LAYOUT(r10, 8, 10)					\
-	DRGN_REGISTER_LAYOUT(r11, 8, 11)					\
-	DRGN_REGISTER_LAYOUT(r12, 8, 12)					\
-	DRGN_REGISTER_LAYOUT(r13, 8, 13)					\
-	DRGN_REGISTER_LAYOUT(r14, 8, 14)					\
-	DRGN_REGISTER_LAYOUT(r15, 8, 15)					\
-	DRGN_REGISTER_LAYOUT(r16, 8, 16)					\
-	DRGN_REGISTER_LAYOUT(r17, 8, 17)					\
-	DRGN_REGISTER_LAYOUT(r18, 8, 18)					\
-	DRGN_REGISTER_LAYOUT(r19, 8, 19)					\
-	DRGN_REGISTER_LAYOUT(r20, 8, 20)					\
-	DRGN_REGISTER_LAYOUT(r21, 8, 21)					\
-	DRGN_REGISTER_LAYOUT(r22, 8, 22)					\
-	DRGN_REGISTER_LAYOUT(r23, 8, 23)					\
-	DRGN_REGISTER_LAYOUT(r24, 8, 24)					\
-	DRGN_REGISTER_LAYOUT(r25, 8, 25)					\
-	DRGN_REGISTER_LAYOUT(r26, 8, 26)					\
-	DRGN_REGISTER_LAYOUT(r27, 8, 27)					\
-	DRGN_REGISTER_LAYOUT(r28, 8, 28)					\
-	DRGN_REGISTER_LAYOUT(r29, 8, 29)					\
-	DRGN_REGISTER_LAYOUT(r30, 8, 30)					\
-	DRGN_REGISTER_LAYOUT(r31, 8, 31)					\
-	DRGN_REGISTER_LAYOUT(cr0, 8, 68)					\
-	DRGN_REGISTER_LAYOUT(cr1, 8, 69)					\
-	DRGN_REGISTER_LAYOUT(cr2, 8, 70)					\
-	DRGN_REGISTER_LAYOUT(cr3, 8, 71)					\
-	DRGN_REGISTER_LAYOUT(cr4, 8, 72)					\
-	DRGN_REGISTER_LAYOUT(cr5, 8, 73)					\
-	DRGN_REGISTER_LAYOUT(cr6, 8, 74)					\
-	DRGN_REGISTER_LAYOUT(cr7, 8, 75)
-
-#include "arch_ppc64.inc"
+#include "arch_ppc64_defs.inc"
 
 static const struct drgn_cfi_row default_dwarf_cfi_row_ppc64 = DRGN_CFI_ROW(
-	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(ra)),
+	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(lr)),
 	[DRGN_REGISTER_NUMBER(r1)] = { DRGN_CFI_RULE_CFA_PLUS_OFFSET },
 	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r14)),
 	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r15)),
@@ -97,6 +39,9 @@ static const struct drgn_cfi_row default_dwarf_cfi_row_ppc64 = DRGN_CFI_ROW(
 	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(cr4)),
 );
 
+// Unwind using the stack frame back chain. Note that leaf functions may not
+// allocate a stack frame, so this may skip the caller of a leaf function. I
+// don't know of a good way around that.
 static struct drgn_error *
 fallback_unwind_ppc64(struct drgn_program *prog,
 		      struct drgn_register_state *regs,
@@ -104,23 +49,27 @@ fallback_unwind_ppc64(struct drgn_program *prog,
 {
 	struct drgn_error *err;
 
-	if (!drgn_register_state_has_register(regs, DRGN_REGISTER_NUMBER(ra)) ||
-	    !drgn_register_state_has_register(regs, DRGN_REGISTER_NUMBER(r1)))
+	struct optional_uint64 r1 = drgn_register_state_get_u64(prog, regs, r1);
+	if (!r1.has_value)
 		return &drgn_stop;
 
-	bool little_endian = drgn_platform_is_little_endian(&prog->platform);
-	bool bswap = drgn_platform_bswap(&prog->platform);
-	uint64_t ra;
-	copy_lsbytes(&ra, sizeof(ra), HOST_LITTLE_ENDIAN,
-		     &regs->buf[DRGN_REGISTER_OFFSET(ra)],
-		     DRGN_REGISTER_SIZE(ra), little_endian);
-	uint64_t r1;
-	copy_lsbytes(&r1, sizeof(r1), HOST_LITTLE_ENDIAN,
-		     &regs->buf[DRGN_REGISTER_OFFSET(r1)],
-		     DRGN_REGISTER_SIZE(r1), little_endian);
-
-	uint64_t frame[3];
-	err = drgn_program_read_memory(prog, &frame, r1, sizeof(frame), false);
+	// The stack pointer (r1) points to the lowest address of the stack
+	// frame (the stack grows downwards from high addresses to low
+	// addresses), which contains the caller's stack pointer.
+	uint64_t unwound_r1;
+	err = drgn_program_read_u64(prog, r1.value, false, &unwound_r1);
+	uint64_t saved_lr;
+	if (!err) {
+		if (unwound_r1 <= r1.value) {
+			// The unwound stack pointer is either 0, indicating the
+			// first stack frame, or invalid.
+			return &drgn_stop;
+		}
+		// The return address (the saved lr) is stored 16 bytes into the
+		// caller's stack frame.
+		err = drgn_program_read_memory(prog, &saved_lr, unwound_r1 + 16,
+					       sizeof(saved_lr), false);
+	}
 	if (err) {
 		if (err->code == DRGN_ERROR_FAULT) {
 			drgn_error_destroy(err);
@@ -129,17 +78,13 @@ fallback_unwind_ppc64(struct drgn_program *prog,
 		return err;
 	}
 
-	uint64_t unwound_r1 = bswap ? bswap_64(frame[0]) : frame[0];
-	if (unwound_r1 <= r1)
-		return &drgn_stop;
-
 	struct drgn_register_state *unwound =
-		drgn_register_state_create(r1, true);
+		drgn_register_state_create(r1, false);
 	if (!unwound)
 		return &drgn_enomem;
-	drgn_register_state_set_from_buffer(unwound, ra, &frame[2]);
-	drgn_register_state_set_from_buffer(unwound, r1, &frame[0]);
-	drgn_register_state_set_pc(prog, unwound, ra);
+	drgn_register_state_set_from_buffer(unwound, lr, &saved_lr);
+	drgn_register_state_set_from_u64(prog, unwound, r1, unwound_r1);
+	drgn_register_state_set_pc_from_register(prog, unwound, lr);
 	*ret = unwound;
 	drgn_register_state_set_cfa(prog, regs, unwound_r1);
 	return NULL;
@@ -177,10 +122,11 @@ get_initial_registers_from_struct_ppc64(struct drgn_program *prog,
 		pc = bswap_64(pc);
 	drgn_register_state_set_pc(prog, regs, pc);
 
-	/* Switched out tasks in the Linux kernel don't save r0-r13 or lr. */
+	// Switched out tasks in the Linux kernel only save r14-r31, nip, and
+	// ccr.
 	if (!linux_kernel_switched_out) {
 		if (!linux_kernel_prstatus) {
-			drgn_register_state_set_from_buffer(regs, ra,
+			drgn_register_state_set_from_buffer(regs, lr,
 							    (uint64_t *)buf + 36);
 		}
 		drgn_register_state_set_range_from_buffer(regs, r0, r13, buf);
@@ -233,6 +179,9 @@ prstatus_get_initial_registers_ppc64(struct drgn_program *prog,
 						       ret);
 }
 
+// The Linux kernel saves the callee-saved registers in a struct pt_regs on the
+// thread's kernel stack. See _switch() in arch/powerpc/kernel/entry_64.S (as of
+// Linux v5.19).
 static struct drgn_error *
 linux_kernel_get_initial_registers_ppc64(const struct drgn_object *task_obj,
 					 struct drgn_register_state **ret)
@@ -269,8 +218,8 @@ linux_kernel_get_initial_registers_ppc64(const struct drgn_object *task_obj,
 	if (err)
 		goto out;
 
-	drgn_register_state_set_from_integer(prog, *ret, r1,
-					     ksp + SWITCH_FRAME_SIZE);
+	drgn_register_state_set_from_u64(prog, *ret, r1,
+					 ksp + SWITCH_FRAME_SIZE);
 
 	err = NULL;
 out:

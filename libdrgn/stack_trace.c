@@ -466,12 +466,9 @@ LIBDRGN_PUBLIC bool drgn_stack_frame_register(struct drgn_stack_trace *trace,
 		&prog->platform.arch->register_layout[reg->regno];
 	if (layout->size > sizeof(*ret))
 		return false;
-	*ret = 0;
 	copy_lsbytes(ret, sizeof(*ret), HOST_LITTLE_ENDIAN,
 		     &regs->buf[layout->offset], layout->size,
 		     drgn_platform_is_little_endian(&prog->platform));
-	if (drgn_platform_bswap(&prog->platform))
-		*ret = bswap_64(*ret);
 	return true;
 }
 
@@ -931,6 +928,10 @@ drgn_unwind_one_register(struct drgn_program *prog,
 		err = drgn_eval_cfi_dwarf_expression(prog, rule, regs, buf,
 						     size);
 		break;
+	case DRGN_CFI_RULE_CONSTANT:
+		copy_lsbytes(buf, size, little_endian, &rule->constant,
+			     sizeof(rule->constant), HOST_LITTLE_ENDIAN);
+		return NULL;
 	)
 	/*
 	 * If we couldn't read from memory, leave the register unknown instead
@@ -1023,6 +1024,11 @@ drgn_unwind_with_cfi(struct drgn_program *prog, struct drgn_cfi_row **row,
 		return &drgn_stop;
 	}
 	if (drgn_register_state_has_register(unwound, ret_addr_regno)) {
+		if (prog->platform.arch->demangle_return_address) {
+			prog->platform.arch->demangle_return_address(prog,
+								     unwound,
+								     ret_addr_regno);
+		}
 		layout = &prog->platform.arch->register_layout[ret_addr_regno];
 		drgn_register_state_set_pc_from_register_impl(prog, unwound,
 							      ret_addr_regno,

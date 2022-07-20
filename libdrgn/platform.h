@@ -18,13 +18,16 @@ struct drgn_register {
 	const char * const *names;
 	size_t num_names;
 	drgn_register_number regno;
-	uint64_t dwarf_number;
 };
 
 struct drgn_register_layout {
 	uint32_t offset;
 	uint32_t size;
 };
+
+// This is an ugly layering violation needed for DW_CFA_AARCH64_negate_ra_state.
+// We enforce that it stays up to date with a static_assert() in arch_aarch64.c.
+#define DRGN_AARCH64_RA_SIGN_STATE_REGNO 0
 
 /* ELF section to apply relocations to. */
 struct drgn_relocating_section {
@@ -117,10 +120,21 @@ struct drgn_architecture_info {
 	const char *name;
 	enum drgn_architecture arch;
 	enum drgn_platform_flags default_flags;
+	/* API-visible registers. */
 	const struct drgn_register *registers;
+	/* Number of API-visible registers. */
 	size_t num_registers;
+	/*
+	 * Return the API-visible register with the given name, or @c NULL if it
+	 * is not recognized.
+	 */
 	const struct drgn_register *(*register_by_name)(const char *name);
+	/* Internal register layouts indexed by internal register number. */
 	const struct drgn_register_layout *register_layout;
+	/*
+	 * Return the internal register number for the given DWARF register
+	 * number, or @ref DRGN_REGISTER_NUMBER_UNKNOWN if it is not recognized.
+	 */
 	drgn_register_number (*dwarf_regno_to_internal)(uint64_t);
 	/* CFI row containing default rules for DWARF CFI. */
 	const struct drgn_cfi_row *default_dwarf_cfi_row;
@@ -134,6 +148,9 @@ struct drgn_architecture_info {
 	struct drgn_error *(*fallback_unwind)(struct drgn_program *,
 					      struct drgn_register_state *,
 					      struct drgn_register_state **);
+	void (*demangle_return_address)(struct drgn_program *,
+					struct drgn_register_state *,
+					drgn_register_number);
 	/* Given pt_regs as a value buffer object. */
 	struct drgn_error *(*pt_regs_get_initial_registers)(const struct drgn_object *,
 							    struct drgn_register_state **);

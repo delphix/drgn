@@ -232,10 +232,11 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 	struct drgn_error *err;
 	GElf_Ehdr ehdr_mem, *ehdr;
 	bool had_platform;
-	bool is_64_bit, is_kdump;
+	bool is_64_bit, little_endian, is_kdump;
 	size_t phnum, i;
 	size_t num_file_segments, j;
 	bool have_phys_addrs = false;
+	bool have_qemu_note = false;
 	const char *vmcoreinfo_note = NULL;
 	size_t vmcoreinfo_size = 0;
 	bool have_nt_taskstruct = false, is_proc_kcore;
@@ -279,6 +280,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		drgn_program_set_platform(prog, &platform);
 	}
 	is_64_bit = ehdr->e_ident[EI_CLASS] == ELFCLASS64;
+	little_endian = ehdr->e_ident[EI_DATA] == ELFDATA2LSB;
 
 	if (elf_getphdrnum(prog->core, &phnum) != 0) {
 		err = drgn_error_libelf();
@@ -296,7 +298,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		phdr = gelf_getphdr(prog->core, i, &phdr_mem);
 		if (!phdr) {
 			err = drgn_error_libelf();
-			goto out_platform;
+			goto out_notes;
 		}
 
 		if (phdr->p_type == PT_LOAD) {
@@ -314,7 +316,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 						    note_header_type(phdr->p_align));
 			if (!data) {
 				err = drgn_error_libelf();
-				goto out_platform;
+				goto out_notes;
 			}
 
 			offset = 0;
@@ -330,6 +332,19 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 				    memcmp(name, "CORE", sizeof("CORE")) == 0) {
 					if (nhdr.n_type == NT_TASKSTRUCT)
 						have_nt_taskstruct = true;
+				} else if (nhdr.n_namesz == sizeof("LINUX") &&
+					   memcmp(name, "LINUX",
+						  sizeof("LINUX")) == 0) {
+					if (nhdr.n_type == NT_ARM_PAC_MASK &&
+					    nhdr.n_descsz >=
+					    2 * sizeof(uint64_t)) {
+						memcpy(&prog->aarch64_insn_pac_mask,
+						       (uint64_t *)desc + 1,
+						       sizeof(uint64_t));
+						if (little_endian !=
+						    HOST_LITTLE_ENDIAN)
+							bswap_64(prog->aarch64_insn_pac_mask);
+					}
 				} else if (nhdr.n_namesz == sizeof("VMCOREINFO") &&
 					   memcmp(name, "VMCOREINFO",
 						  sizeof("VMCOREINFO")) == 0) {
@@ -341,6 +356,10 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 					 * may be valid.
 					 */
 					have_phys_addrs = true;
+				} else if (nhdr.n_namesz == sizeof("QEMU") &&
+					   memcmp(name, "QEMU",
+						  sizeof("QEMU")) == 0) {
+					have_qemu_note = true;
 				}
 			}
 		}
@@ -356,7 +375,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		if (fstatfs(prog->core_fd, &fs) == -1) {
 			err = drgn_error_create_os("fstatfs", errno, path);
 			if (err)
-				goto out_platform;
+				goto out_notes;
 		}
 		is_proc_kcore = fs.f_type == 0x9fa0; /* PROC_SUPER_MAGIC */
 	} else {
@@ -371,7 +390,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		if (env && atoi(env)) {
 			err = drgn_program_set_kdump(prog);
 			if (err)
-				goto out_platform;
+				goto out_notes;
 			return NULL;
 		}
 	}
@@ -380,7 +399,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 					   sizeof(*prog->file_segments));
 	if (!prog->file_segments) {
 		err = &drgn_enomem;
-		goto out_platform;
+		goto out_notes;
 	}
 
 	bool pgtable_reader =
@@ -493,8 +512,8 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		}
 	}
 	if (vmcoreinfo_note) {
-		err = parse_vmcoreinfo(vmcoreinfo_note, vmcoreinfo_size,
-				       &prog->vmcoreinfo);
+		err = drgn_program_parse_vmcoreinfo(prog, vmcoreinfo_note,
+						    vmcoreinfo_size);
 		if (err)
 			goto out_segments;
 	}
@@ -511,6 +530,15 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		prog->core = NULL;
 	} else if (vmcoreinfo_note) {
 		prog->flags |= DRGN_PROGRAM_IS_LINUX_KERNEL;
+	} else if (have_qemu_note) {
+		err = drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					"unrecognized QEMU memory dump; "
+					"for Linux guests, run QEMU with '-device vmcoreinfo', "
+					"compile the kernel with CONFIG_CRASH_CORE and CONFIG_FW_CFG, "
+					"and load the qemu_fw_cfg kernel module "
+					"before dumping the guest memory "
+					"(requires Linux >= 4.17 and QEMU >= 2.11)");
+		goto out_segments;
 	}
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 		err = drgn_program_add_object_finder(prog,
@@ -529,6 +557,10 @@ out_segments:
 	drgn_memory_reader_init(&prog->reader);
 	free(prog->file_segments);
 	prog->file_segments = NULL;
+out_notes:
+	// Reset anything we parsed from ELF notes.
+	prog->aarch64_insn_pac_mask = 0;
+	memset(&prog->vmcoreinfo, 0, sizeof(prog->vmcoreinfo));
 out_platform:
 	prog->has_platform = had_platform;
 out_elf:

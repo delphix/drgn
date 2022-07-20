@@ -263,7 +263,13 @@ static int drgn_test_slab_init(void)
 	return 0;
 }
 
-static void __exit drgn_test_exit(void)
+// Dummy function symbol.
+int drgn_test_function(int x)
+{
+	return x + 1;
+}
+
+static void drgn_test_exit(void)
 {
 	drgn_test_slab_exit();
 }
