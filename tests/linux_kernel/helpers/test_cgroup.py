@@ -9,6 +9,7 @@ import unittest
 
 from drgn import NULL
 from drgn.helpers.linux.cgroup import (
+    cgroup_get_from_path,
     cgroup_name,
     cgroup_parent,
     cgroup_path,
@@ -16,15 +17,7 @@ from drgn.helpers.linux.cgroup import (
     css_for_each_descendant_pre,
 )
 from drgn.helpers.linux.pid import find_task
-from tests.linux_kernel import (
-    MS_NODEV,
-    MS_NOEXEC,
-    MS_NOSUID,
-    LinuxKernelTestCase,
-    fork_and_pause,
-    mount,
-    umount,
-)
+from tests.linux_kernel import LinuxKernelTestCase, fork_and_pause, iter_mounts
 
 
 class TestCgroup(LinuxKernelTestCase):
@@ -36,26 +29,12 @@ class TestCgroup(LinuxKernelTestCase):
         try:
             super().setUpClass()
 
-            # Don't enable cgroup2 on systems that aren't already using it (or
-            # don't support it).
-            cgroup2_enabled = False
-            try:
-                with open("/proc/self/cgroup", "rb") as f:
-                    for line in f:
-                        if line.startswith(b"0::"):
-                            cgroup2_enabled = True
-                            break
-            except FileNotFoundError:
-                pass
-            if not cgroup2_enabled:
-                raise unittest.SkipTest("cgroup2 not enabled")
-
-            # It's easier to mount the cgroup2 filesystem than to find it.
-            cgroup2_mount = Path(tempfile.mkdtemp(prefix="drgn-tests-"))
-            cls.__cleanups.append((cgroup2_mount.rmdir,))
-            mount("cgroup2", cgroup2_mount, "cgroup2", MS_NOSUID | MS_NODEV | MS_NOEXEC)
-            cls.__cleanups.append((umount, cgroup2_mount))
-
+            for mnt in iter_mounts():
+                if mnt.fstype == "cgroup2":
+                    cgroup2_mount = mnt.mount_point
+                    break
+            else:
+                raise unittest.SkipTest("cgroup2 not mounted")
             cls.root_cgroup = cls.prog["cgrp_dfl_root"].cgrp.address_of_()
 
             pid = fork_and_pause()
@@ -112,6 +91,19 @@ class TestCgroup(LinuxKernelTestCase):
         self.assertEqual(cgroup_path(self.root_cgroup), b"/")
         self.assertEqual(cgroup_path(self.parent_cgroup), self.parent_cgroup_path)
         self.assertEqual(cgroup_path(self.child_cgroup), self.child_cgroup_path)
+
+    def test_cgroup_get_from_path(self):
+        self.assertEqual(cgroup_get_from_path(self.prog, "/"), self.root_cgroup)
+        self.assertEqual(
+            cgroup_get_from_path(self.prog, self.parent_cgroup_path), self.parent_cgroup
+        )
+        self.assertEqual(
+            cgroup_get_from_path(self.prog, self.child_cgroup_path), self.child_cgroup
+        )
+        self.assertEqual(
+            cgroup_get_from_path(self.prog, self.parent_cgroup_path + b"/foo"),
+            NULL(self.prog, "struct cgroup *"),
+        )
 
     @staticmethod
     def _cgroup_iter_paths(fn, cgroup):

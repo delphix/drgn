@@ -80,13 +80,10 @@ apply_elf_reloc_fn(const struct drgn_relocating_section *relocating,
 
 /* Page table iterator. */
 struct pgtable_iterator {
-	struct drgn_program *prog;
 	/* Address of the top-level page table to iterate. */
 	uint64_t pgtable;
 	/* Current virtual address to translate. */
 	uint64_t virt_addr;
-	/* Architecture-specific data. */
-	char arch[];
 };
 
 /*
@@ -113,7 +110,8 @@ struct pgtable_iterator {
  * maps to, or @c UINT64_MAX if it is not mapped.
  */
 typedef struct drgn_error *
-(pgtable_iterator_next_fn)(struct pgtable_iterator *it, uint64_t *virt_addr_ret,
+(pgtable_iterator_next_fn)(struct drgn_program *prog,
+			   struct pgtable_iterator *it, uint64_t *virt_addr_ret,
 			   uint64_t *phys_addr_ret);
 
 struct drgn_architecture_info {
@@ -161,15 +159,17 @@ struct drgn_architecture_info {
 	struct drgn_error *(*linux_kernel_get_initial_registers)(const struct drgn_object *,
 								 struct drgn_register_state **);
 	apply_elf_reloc_fn *apply_elf_reloc;
-	struct drgn_error *(*linux_kernel_get_page_offset)(struct drgn_object *);
-	struct drgn_error *(*linux_kernel_get_vmemmap)(struct drgn_object *);
 	struct drgn_error *(*linux_kernel_live_direct_mapping_fallback)(struct drgn_program *,
 									uint64_t *,
 									uint64_t *);
-	/* Size to allocate for pgtable_iterator::arch. */
-	size_t pgtable_iterator_arch_size;
-	/* Initialize pgtable_iterator::arch. */
-	void (*pgtable_iterator_arch_init)(void *buf);
+	/* Allocate a Linux kernel page table iterator. */
+	struct drgn_error *(*linux_kernel_pgtable_iterator_create)(struct drgn_program *,
+								   struct pgtable_iterator **);
+	/* Destroy a Linux kernel page table iterator. */
+	void (*linux_kernel_pgtable_iterator_destroy)(struct pgtable_iterator *);
+	/* (Re)initialize a Linux kernel page table iterator. */
+	void (*linux_kernel_pgtable_iterator_init)(struct drgn_program *,
+						   struct pgtable_iterator *);
 	/* Iterate a (user or kernel) page table in the Linux kernel. */
 	pgtable_iterator_next_fn *linux_kernel_pgtable_iterator_next;
 };
