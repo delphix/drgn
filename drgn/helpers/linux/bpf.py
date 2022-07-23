@@ -19,6 +19,8 @@ from drgn.helpers.linux.idr import idr_for_each
 from drgn.helpers.linux.list import list_for_each_entry
 
 __all__ = (
+    "bpf_btf_for_each",
+    "bpf_link_for_each",
     "bpf_map_for_each",
     "bpf_prog_for_each",
     "cgroup_bpf_prog_for_each",
@@ -26,24 +28,68 @@ __all__ = (
 )
 
 
+def bpf_btf_for_each(prog: Program) -> Iterator[Object]:
+    """
+    Iterate over all BTF objects.
+
+    This is only supported since Linux v4.18.
+
+    :return: Iterator of ``struct btf *`` objects.
+    """
+    type = prog.type("struct btf *")
+    # BTF was introduced in Linux kernel commit 69b693f0aefa ("bpf: btf:
+    # Introduce BPF Type Format (BTF)") (in v4.18). btf_idr was added in a
+    # later commit in v4.18, 78958fca7ead ("bpf: btf: Introduce BTF ID").
+    for nr, entry in idr_for_each(prog["btf_idr"]):
+        yield cast(type, entry)
+
+
+def bpf_link_for_each(prog: Program) -> Iterator[Object]:
+    """
+    Iterate over all BPF links.
+
+    This is only supported since Linux v5.8.
+
+    :return: Iterator of ``struct bpf_link *`` objects.
+    """
+    type = prog.type("struct bpf_link *")
+    # link_idr didn't exist before Linux kernel commit a3b80e107894 ("bpf:
+    # Allocate ID for bpf_link") (in v5.8). struct bpf_link didn't exist at all
+    # before Linux kernel commit 70ed506c3bbc ("bpf: Introduce pinnable
+    # bpf_link abstraction") (in v5.7), and we don't support Linux v5.7
+    # anyways.
+    for nr, entry in idr_for_each(prog["link_idr"]):
+        yield cast(type, entry)
+
+
 def bpf_map_for_each(prog: Program) -> Iterator[Object]:
     """
     Iterate over all BPF maps.
 
+    This is only supported since Linux v4.13.
+
     :return: Iterator of ``struct bpf_map *`` objects.
     """
+    type = prog.type("struct bpf_map *")
+    # map_idr didn't exist before Linux kernel commit f3f1c054c288 ("bpf:
+    # Introduce bpf_map ID") (in v4.13).
     for nr, entry in idr_for_each(prog["map_idr"]):
-        yield cast("struct bpf_map *", entry)
+        yield cast(type, entry)
 
 
 def bpf_prog_for_each(prog: Program) -> Iterator[Object]:
     """
     Iterate over all BPF programs.
 
+    This is only supported since Linux v4.13.
+
     :return: Iterator of ``struct bpf_prog *`` objects.
     """
+    type = prog.type("struct bpf_prog *")
+    # prog_idr didn't exist before Linux kernel commit dc4bb0e23561 ("bpf:
+    # Introduce bpf_prog ID") (in v4.13).
     for nr, entry in idr_for_each(prog["prog_idr"]):
-        yield cast("struct bpf_prog *", entry)
+        yield cast(type, entry)
 
 
 def cgroup_bpf_prog_for_each(
@@ -57,11 +103,34 @@ def cgroup_bpf_prog_for_each(
     :param bpf_attach_type: ``enum bpf_attach_type``
     :return: Iterator of ``struct bpf_prog *`` objects.
     """
-    progs_head = cgrp.bpf.progs[bpf_attach_type]
-    for pl in list_for_each_entry(
-        "struct bpf_prog_list", progs_head.address_of_(), "node"
-    ):
-        yield pl.prog
+    # Before Linux kernel commit 3007098494be ("cgroup: add support for eBPF
+    # programs") (in v4.10), struct cgroup::bpf didn't exist because cgroup BPF
+    # programs didn't exist.
+    try:
+        cgrp_bpf = cgrp.bpf
+    except AttributeError:
+        return
+    # Since Linux kernel commit 324bda9e6c5a ("bpf: multi program support for
+    # cgroup+bpf") (in v4.15), the attached programs are stored in an array of
+    # lists, struct cgroup_bpf::progs. Before that, only one program of each
+    # attach type could be attached to a cgroup, so the attached programs are
+    # stored in an array of struct bpf_prog *, struct cgroup_bpf::prog.
+    try:
+        progs = cgrp_bpf.progs
+    except AttributeError:
+        # If the kernel was not configured with CONFIG_CGROUP_BPF, then struct
+        # cgroup_bpf is an empty structure.
+        try:
+            prog = cgrp_bpf.prog[bpf_attach_type]
+        except AttributeError:
+            return
+        if prog:
+            yield prog
+    else:
+        for pl in list_for_each_entry(
+            "struct bpf_prog_list", progs[bpf_attach_type].address_of_(), "node"
+        ):
+            yield pl.prog
 
 
 def cgroup_bpf_prog_for_each_effective(
@@ -75,9 +144,27 @@ def cgroup_bpf_prog_for_each_effective(
     :param bpf_attach_type: ``enum bpf_attach_type``
     :return: Iterator of ``struct bpf_prog *`` objects.
     """
-    prog_array_items = cgrp.bpf.effective[bpf_attach_type].items
-    for i in itertools.count():
-        prog = prog_array_items[i].prog.read_()
-        if not prog:
-            break
-        yield prog
+    # Before Linux kernel commit 3007098494be ("cgroup: add support for eBPF
+    # programs") (in v4.10), struct cgroup::bpf didn't exist because cgroup BPF
+    # programs didn't exist. Since then, if the kernel was not configured with
+    # CONFIG_CGROUP_BPF, then struct cgroup_bpf is an empty structure.
+    try:
+        effective = cgrp.bpf.effective[bpf_attach_type]
+    except AttributeError:
+        return
+    # Since Linux kernel commit 324bda9e6c5a ("bpf: multi program support for
+    # cgroup+bpf") (in v4.15), struct cgroup_bpf::effective is an array of
+    # struct bpf_prog_array. Before that, only one program of each attach type
+    # could be effective for a cgroup, so struct cgroup_bpf::effective is an
+    # array of struct bpf_prog *.
+    try:
+        effective_items = effective.items
+    except AttributeError:
+        if effective:
+            yield effective
+    else:
+        for i in itertools.count():
+            prog = effective_items[i].prog.read_()
+            if not prog:
+                break
+            yield prog
