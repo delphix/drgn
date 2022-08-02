@@ -161,20 +161,31 @@ struct drgn_program {
 		uint64_t kaslr_offset;
 		/** Kernel page table. */
 		uint64_t swapper_pg_dir;
-		/** Whether 5-level paging was enabled. */
+		/** Length of mem_section array (i.e., NR_SECTION_ROOTS). */
+		uint64_t mem_section_length;
+		/** VA_BITS on AArch64. */
+		uint64_t va_bits;
+		/** Whether 5-level paging was enabled on x86-64. */
 		bool pgtable_l5_enabled;
+		/** PAGE_SHIFT of the kernel (derived from PAGE_SIZE). */
+		int page_shift;
 	} vmcoreinfo;
-	/* Cached PAGE_OFFSET. */
-	struct drgn_object page_offset;
+	/*
+	 * Difference between a virtual address in the direct mapping and the
+	 * physical address it maps to.
+	 */
+	uint64_t direct_mapping_offset;
 	/* Cached vmemmap. */
 	struct drgn_object vmemmap;
-	/* Page table iterator for linux_helper_read_vm(). */
+	/* Page table iterator. */
 	struct pgtable_iterator *pgtable_it;
 	/*
-	 * Whether @ref drgn_program::pgtable_it is currently being used. Used
-	 * to prevent address translation from recursing.
+	 * Whether we are currently in address translation. Used to prevent
+	 * address translation from recursing.
 	 */
-	bool pgtable_it_in_use;
+	bool in_address_translation;
+	/* Whether @ref drgn_program::direct_mapping_offset has been cached. */
+	bool direct_mapping_offset_cached;
 };
 
 /** Initialize a @ref drgn_program. */

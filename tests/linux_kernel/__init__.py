@@ -5,11 +5,13 @@ import contextlib
 import ctypes
 import errno
 import os
+from pathlib import Path
 import platform
 import re
 import signal
 import socket
 import time
+from typing import NamedTuple
 import unittest
 
 import drgn
@@ -189,19 +191,26 @@ MS_STRICTATIME = 1 << 24
 MS_LAZYTIME = 1 << 25
 
 
+def _check_ctypes_syscall(ret, *args):
+    if ret == -1:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno), *args)
+    return ret
+
+
 def mount(source, target, fstype, flags=0, data=None):
-    if (
+    _check_ctypes_syscall(
         _mount(
             os.fsencode(source),
             os.fsencode(target),
             fstype.encode(),
             flags,
             None if data is None else data.encode(),
-        )
-        == -1
-    ):
-        errno = ctypes.get_errno()
-        raise OSError(errno, os.strerror(errno), source, None, target)
+        ),
+        source,
+        None,
+        target,
+    )
 
 
 _umount2 = _c.umount2
@@ -210,9 +219,33 @@ _umount2.argtypes = [ctypes.c_char_p, ctypes.c_int]
 
 
 def umount(target, flags=0):
-    if _umount2(os.fsencode(target), flags) == -1:
-        errno = ctypes.get_errno()
-        raise OSError(errno, os.strerror(errno), target)
+    _check_ctypes_syscall(_umount2(os.fsencode(target), flags), target)
+
+
+_MOUNTS_RE = re.compile(
+    rb"(?P<source>[^ ]+) (?P<mount_point>[^ ]+) (?P<fstype>[^ ]+) "
+    rb"(?P<mount_options>[^ ]+) [0-9]+ [0-9]+"
+)
+
+
+class Mount(NamedTuple):
+    source: str
+    mount_point: Path
+    fstype: str
+    mount_options: str
+
+
+def iter_mounts(pid="self"):
+    with open(f"/proc/{pid}/mounts", "rb") as f:
+        for line in f:
+            match = _MOUNTS_RE.match(line)
+            assert match
+            yield Mount(
+                source=match["source"].decode("unicode-escape"),
+                mount_point=Path(match["mount_point"].decode("unicode-escape")),
+                fstype=match["fstype"].decode("unicode-escape"),
+                mount_options=match["mount_options"].decode("unicode-escape"),
+            )
 
 
 _mlock = _c.mlock
@@ -221,9 +254,11 @@ _mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
 
 def mlock(addr, len):
-    if _mlock(addr, len) == -1:
-        errno = ctypes.get_errno()
-        raise OSError(errno, os.strerror(errno))
+    _check_ctypes_syscall(_mlock(addr, len))
+
+
+_syscall = _c.syscall
+_syscall.restype = ctypes.c_long
 
 
 def create_socket(*args, **kwds):
