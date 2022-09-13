@@ -341,115 +341,76 @@ static struct drgn_error *linux_kernel_get_vmemmap(struct drgn_program *prog,
 
 struct kernel_module_iterator {
 	char *name;
-	/* /proc/modules file or NULL. */
-	FILE *modules_file;
 	uint64_t start, end;
 	void *build_id_buf;
 	size_t build_id_buf_capacity;
-	union {
-		/* If using /proc/modules. */
-		size_t name_capacity;
-		/* If not using /proc/modules. */
-		struct {
-			struct drgn_qualified_type module_type;
-			struct drgn_object mod, node, tmp1, tmp2, tmp3;
-			uint64_t head;
-		};
-	};
+	/* `struct module` type. */
+	struct drgn_qualified_type module_type;
+	/* Current `struct module` (not a pointer). */
+	struct drgn_object mod;
+	/* `struct list_head *` in next module to return. */
+	struct drgn_object node;
+	/* Temporary objects reused for various purposes. */
+	struct drgn_object tmp1, tmp2, tmp3;
+	/* Address of `struct list_head modules`. */
+	uint64_t head;
+	bool use_sys_module;
 };
 
 static void kernel_module_iterator_deinit(struct kernel_module_iterator *it)
 {
-	if (it->modules_file) {
-		fclose(it->modules_file);
-	} else {
-		drgn_object_deinit(&it->tmp3);
-		drgn_object_deinit(&it->tmp2);
-		drgn_object_deinit(&it->tmp1);
-		drgn_object_deinit(&it->node);
-		drgn_object_deinit(&it->mod);
-	}
+	drgn_object_deinit(&it->tmp3);
+	drgn_object_deinit(&it->tmp2);
+	drgn_object_deinit(&it->tmp1);
+	drgn_object_deinit(&it->node);
+	drgn_object_deinit(&it->mod);
 	free(it->build_id_buf);
 	free(it->name);
 }
 
 static struct drgn_error *
 kernel_module_iterator_init(struct kernel_module_iterator *it,
-			    struct drgn_program *prog, bool use_proc_and_sys)
+			    struct drgn_program *prog, bool use_sys_module)
 {
 	struct drgn_error *err;
 
 	it->name = NULL;
 	it->build_id_buf = NULL;
 	it->build_id_buf_capacity = 0;
-	if (use_proc_and_sys) {
-		it->modules_file = fopen("/proc/modules", "r");
-		if (!it->modules_file) {
-			return drgn_error_create_os("fopen", errno,
-						    "/proc/modules");
-		}
-		it->name_capacity = 0;
-	} else {
-		it->modules_file = NULL;
+	it->use_sys_module = use_sys_module;
+	err = drgn_program_find_type(prog, "struct module", NULL,
+				     &it->module_type);
+	if (err)
+		return err;
 
-		err = drgn_program_find_type(prog, "struct module", NULL,
-					     &it->module_type);
-		if (err)
-			return err;
+	drgn_object_init(&it->mod, prog);
+	drgn_object_init(&it->node, prog);
+	drgn_object_init(&it->tmp1, prog);
+	drgn_object_init(&it->tmp2, prog);
+	drgn_object_init(&it->tmp3, prog);
 
-		drgn_object_init(&it->mod, prog);
-		drgn_object_init(&it->node, prog);
-		drgn_object_init(&it->tmp1, prog);
-		drgn_object_init(&it->tmp2, prog);
-		drgn_object_init(&it->tmp3, prog);
-
-		err = drgn_program_find_object(prog, "modules", NULL,
-					       DRGN_FIND_OBJECT_VARIABLE,
-					       &it->node);
-		if (err)
-			goto err;
-		err = drgn_object_address_of(&it->node, &it->node);
-		if (err)
-			goto err;
-		err = drgn_object_read(&it->node, &it->node);
-		if (err)
-			goto err;
-		err = drgn_object_read_unsigned(&it->node, &it->head);
-		if (err)
-			goto err;
+	err = drgn_program_find_object(prog, "modules", NULL,
+				       DRGN_FIND_OBJECT_VARIABLE, &it->node);
+	if (err)
+		goto err;
+	if (it->node.kind != DRGN_OBJECT_REFERENCE) {
+		err = drgn_error_create(DRGN_ERROR_OTHER,
+					"can't get address of modules list");
+	      goto err;
 	}
+	it->head = it->node.address;
+	err = drgn_object_member(&it->node, &it->node, "next");
+	if (err)
+		goto err;
+	err = drgn_object_read(&it->node, &it->node);
+	if (err)
+		goto err;
 
 	return NULL;
 
 err:
 	kernel_module_iterator_deinit(it);
 	return err;
-}
-
-static struct drgn_error *
-kernel_module_iterator_next_live(struct kernel_module_iterator *it)
-{
-
-	errno = 0;
-	ssize_t ret = getline(&it->name, &it->name_capacity, it->modules_file);
-	if (ret == -1) {
-		if (errno) {
-			return drgn_error_create_os("getline", errno,
-						    "/proc/modules");
-		} else {
-			return &drgn_stop;
-		}
-	}
-	char *p = strchr(it->name, ' ');
-	if (!p ||
-	    sscanf(p + 1, "%" SCNu64 " %*s %*s %*s %" SCNx64, &it->end,
-		   &it->start) != 2) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
-					 "could not parse /proc/modules");
-	}
-	it->end += it->start;
-	*p = '\0';
-	return NULL;
 }
 
 /**
@@ -466,17 +427,8 @@ kernel_module_iterator_next_live(struct kernel_module_iterator *it)
 static struct drgn_error *
 kernel_module_iterator_next(struct kernel_module_iterator *it)
 {
-	if (it->modules_file)
-		return kernel_module_iterator_next_live(it);
-
 	struct drgn_error *err;
 
-	err = drgn_object_member_dereference(&it->node, &it->node, "next");
-	if (err)
-		return err;
-	err = drgn_object_read(&it->node, &it->node);
-	if (err)
-		return err;
 	uint64_t addr;
 	err = drgn_object_read_unsigned(&it->node, &addr);
 	if (err)
@@ -488,10 +440,25 @@ kernel_module_iterator_next(struct kernel_module_iterator *it)
 				       "list");
 	if (err)
 		return err;
+	err = drgn_object_dereference(&it->mod, &it->mod);
+	if (err)
+		return err;
+	// We need several fields from the `struct module`. Especially for
+	// /proc/kcore, it is faster to read the entire structure (which is <1kB
+	// as of Linux 6.0) from the core dump all at once than it is to read
+	// each field individually.
+	err = drgn_object_read(&it->mod, &it->mod);
+	if (err)
+		return err;
+	err = drgn_object_member(&it->node, &it->mod, "list");
+	if (err)
+		return err;
+	err = drgn_object_member(&it->node, &it->node, "next");
+	if (err)
+		return err;
 
 	// Set tmp1 to the module base address and tmp2 to the size.
-	err = drgn_object_member_dereference(&it->tmp1, &it->mod,
-					     "core_layout");
+	err = drgn_object_member(&it->tmp1, &it->mod, "core_layout");
 	if (!err) {
 		// Since Linux kernel commit 7523e4dc5057 ("module: use a
 		// structure to encapsulate layout.") (in v4.5), the base and
@@ -507,12 +474,10 @@ kernel_module_iterator_next(struct kernel_module_iterator *it)
 		// Before that, they are directly in the `struct module`.
 		drgn_error_destroy(err);
 
-		err = drgn_object_member_dereference(&it->tmp2, &it->mod,
-						     "core_size");
+		err = drgn_object_member(&it->tmp2, &it->mod, "core_size");
 		if (err)
 			return err;
-		err = drgn_object_member_dereference(&it->tmp1, &it->mod,
-						     "module_core");
+		err = drgn_object_member(&it->tmp1, &it->mod, "module_core");
 		if (err)
 			return err;
 	} else {
@@ -526,7 +491,7 @@ kernel_module_iterator_next(struct kernel_module_iterator *it)
 		return err;
 	it->end += it->start;
 
-	err = drgn_object_member_dereference(&it->tmp2, &it->mod, "name");
+	err = drgn_object_member(&it->tmp2, &it->mod, "name");
 	if (err)
 		return err;
 	char *name;
@@ -667,7 +632,7 @@ kernel_module_iterator_gnu_build_id(struct kernel_module_iterator *it,
 				    const void **build_id_ret,
 				    size_t *build_id_len_ret)
 {
-	if (it->modules_file) {
+	if (it->use_sys_module) {
 		return kernel_module_iterator_gnu_build_id_live(it,
 								build_id_ret,
 								build_id_len_ret);
@@ -675,8 +640,7 @@ kernel_module_iterator_gnu_build_id(struct kernel_module_iterator *it,
 
 	struct drgn_error *err;
 	struct drgn_program *prog = drgn_object_program(&it->mod);
-	const bool bswap =
-		drgn_type_little_endian(it->mod.type) != HOST_LITTLE_ENDIAN;
+	const bool bswap = drgn_platform_bswap(&prog->platform);
 
 	struct drgn_object attrs, attr, tmp;
 	drgn_object_init(&attrs, prog);
@@ -685,7 +649,7 @@ kernel_module_iterator_gnu_build_id(struct kernel_module_iterator *it,
 
 	// n = mod->notes_attrs->notes
 	uint64_t n;
-	err = drgn_object_member_dereference(&attrs, &it->mod, "notes_attrs");
+	err = drgn_object_member(&attrs, &it->mod, "notes_attrs");
 	if (err)
 		goto out;
 	err = drgn_object_member_dereference(&tmp, &attrs, "notes");
@@ -757,6 +721,7 @@ out:
 
 struct kernel_module_section_iterator {
 	struct kernel_module_iterator *kmod_it;
+	bool yielded_percpu;
 	/* /sys/module/$module/sections directory or NULL. */
 	DIR *sections_dir;
 	/* If not using /sys/module/$module/sections. */
@@ -772,7 +737,8 @@ kernel_module_section_iterator_init(struct kernel_module_section_iterator *it,
 	struct drgn_error *err;
 
 	it->kmod_it = kmod_it;
-	if (kmod_it->modules_file) {
+	it->yielded_percpu = false;
+	if (kmod_it->use_sys_module) {
 		char *path;
 		if (asprintf(&path, "/sys/module/%s/sections",
 			     kmod_it->name) == -1)
@@ -790,9 +756,8 @@ kernel_module_section_iterator_init(struct kernel_module_section_iterator *it,
 		it->i = 0;
 		it->name = NULL;
 		/* it->nsections = mod->sect_attrs->nsections */
-		err = drgn_object_member_dereference(&kmod_it->tmp1,
-						     &kmod_it->mod,
-						     "sect_attrs");
+		err = drgn_object_member(&kmod_it->tmp1, &kmod_it->mod,
+					 "sect_attrs");
 		if (err)
 			return err;
 		err = drgn_object_member_dereference(&kmod_it->tmp2,
@@ -879,13 +844,42 @@ kernel_module_section_iterator_next(struct kernel_module_section_iterator *it,
 				    const char **name_ret,
 				    uint64_t *address_ret)
 {
+	struct drgn_error *err;
+	struct kernel_module_iterator *kmod_it = it->kmod_it;
+
+	// As of Linux 6.0, the .data..percpu section is not included in the
+	// section attributes. (kernel/module/sysfs.c:add_sect_attrs() only
+	// creates attributes for sections with the SHF_ALLOC flag set, but
+	// kernel/module/main.c:layout_and_allocate() clears the SHF_ALLOC flag
+	// for the .data..percpu section.) However, we need this address so that
+	// global per-CPU variables will be relocated correctly. Get it from
+	// `struct module`.
+	if (!it->yielded_percpu) {
+		it->yielded_percpu = true;
+		err = drgn_object_member(&kmod_it->tmp2, &kmod_it->mod,
+					 "percpu");
+		if (!err) {
+			err = drgn_object_read_unsigned(&kmod_it->tmp2, address_ret);
+			if (err)
+				return err;
+			// struct module::percpu is NULL if the module doesn't
+			// have any per-CPU data.
+			if (*address_ret) {
+				*name_ret = ".data..percpu";
+				return NULL;
+			}
+		} else if (err->code == DRGN_ERROR_LOOKUP) {
+			// struct module::percpu doesn't exist if !SMP.
+			drgn_error_destroy(err);
+		} else {
+			return err;
+		}
+	}
+
 	if (it->sections_dir) {
 		return kernel_module_section_iterator_next_live(it, name_ret,
 								address_ret);
 	}
-
-	struct drgn_error *err;
-	struct kernel_module_iterator *kmod_it = it->kmod_it;
 
 	if (it->i >= it->nsections)
 		return &drgn_stop;
@@ -1403,14 +1397,13 @@ report_default_kernel_module(struct drgn_debug_info_load_state *load,
 static struct drgn_error *
 report_loaded_kernel_modules(struct drgn_debug_info_load_state *load,
 			     struct kernel_module_table *kmod_table,
-			     struct depmod_index *depmod,
-			     bool use_proc_and_sys)
+			     struct depmod_index *depmod, bool use_sys_module)
 {
 	struct drgn_program *prog = load->dbinfo->prog;
 	struct drgn_error *err;
 
 	struct kernel_module_iterator kmod_it;
-	err = kernel_module_iterator_init(&kmod_it, prog, use_proc_and_sys);
+	err = kernel_module_iterator_init(&kmod_it, prog, use_sys_module);
 	if (err) {
 kernel_module_iterator_error:
 		return drgn_debug_info_report_error(load, "kernel modules",
@@ -1481,20 +1474,21 @@ report_kernel_modules(struct drgn_debug_info_load_state *load,
 		return NULL;
 
 	/*
-	 * If we're debugging the running kernel, we can get the loaded kernel
-	 * modules from /proc and /sys instead of from the core dump. This fast
-	 * path can be disabled via an environment variable for testing.
+	 * If we're debugging the running kernel, we can use
+	 * /sys/module/$module/notes and /sys/module/$module/sections instead of
+	 * getting the equivalent information from the core dump. This fast path
+	 * can be disabled via an environment variable for testing.
 	 */
-	bool use_proc_and_sys = false;
+	bool use_sys_module = false;
 	if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
-		char *env = getenv("DRGN_USE_PROC_AND_SYS_MODULES");
-		use_proc_and_sys = !env || atoi(env);
+		char *env = getenv("DRGN_USE_SYS_MODULE");
+		use_sys_module = !env || atoi(env);
 	}
 	/*
-	 * If we're not using /proc and /sys, then we need to index vmlinux now
-	 * so that we can walk the list of modules in the kernel.
+	 * We need to index vmlinux now so that we can walk the list of modules
+	 * in the kernel.
 	 */
-	if (vmlinux_is_pending && !use_proc_and_sys) {
+	if (vmlinux_is_pending) {
 		err = drgn_debug_info_report_flush(load);
 		if (err)
 			return err;
@@ -1536,10 +1530,9 @@ report_kernel_modules(struct drgn_debug_info_load_state *load,
 		}
 	}
 
-	err = report_loaded_kernel_modules(load,
-					   num_kmods ? &kmod_table : NULL,
+	err = report_loaded_kernel_modules(load, num_kmods ? &kmod_table : NULL,
 					   load->load_default ? &depmod : NULL,
-					   use_proc_and_sys);
+					   use_sys_module);
 	if (err)
 		goto out;
 
