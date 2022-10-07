@@ -42,46 +42,54 @@ struct string_builder {
 	 * Current string buffer.
 	 *
 	 * This may be reallocated when appending. It must be freed with @c
-	 * free() when it will no longer be used. It should be initialized to @c
-	 * NULL.
+	 * free() when it will no longer be used.
 	 */
 	char *str;
-	/**
-	 * Length of @c str.
-	 *
-	 * It should be initialized to zero.
-	 */
+	/** Length of @c str. */
 	size_t len;
-	/**
-	 * Allocated size of @c str.
-	 *
-	 * It should be initialized to zero.
-	 */
+	/** Allocated size of @c str. */
 	size_t capacity;
 };
+
+/** String builder initializer. */
+#define STRING_BUILDER_INIT { 0 }
 
 /**
  * Null-terminate and return a string from a @ref string_builder.
  *
- * On success, the string builder must be reinitialized before being reused.
+ * This appends a null character without incrementing @ref string_builder::len.
  *
- * @param[out] ret Returned string.
- * @return @c true on success, @c false on error (if we couldn't allocate
- * memory).
+ * @return @ref string_builder::str on success, @c NULL on error (if we couldn't
+ * allocate memory).
  */
-bool string_builder_finalize(struct string_builder *sb, char **ret);
+char *string_builder_null_terminate(struct string_builder *sb);
 
 /**
- * Resize the buffer of a @ref string_builder.
+ * Resize the buffer of a @ref string_builder to a given capacity.
  *
  * On success, the allocated size of the string buffer is at least @p capacity.
  *
  * @param[in] sb String builder.
- * @param[in] capacity New minimum size of the string buffer.
+ * @param[in] capacity New minimum allocated size of the string buffer.
  * @return @c true on success, @c false on error (if we couldn't allocate
  * memory).
  */
 bool string_builder_reserve(struct string_builder *sb, size_t capacity);
+
+/**
+ * Resize the buffer of a @ref string_builder to accomodate appending
+ * characters.
+ *
+ * On success, the allocated size of the string buffer is at least
+ * `sb->len + n`. This will also allocate extra space so that appends have
+ * amortized constant time complexity.
+ *
+ * @param[in] sb String builder.
+ * @param[in] n Minimum number of additional characters to reserve.
+ * @return @c true on success, @c false on error (if we couldn't allocate
+ * memory).
+ */
+bool string_builder_reserve_for_append(struct string_builder *sb, size_t n);
 
 /**
  * Append a character to a @ref string_builder.

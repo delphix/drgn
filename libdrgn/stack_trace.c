@@ -107,7 +107,7 @@ drgn_stack_trace_num_frames(struct drgn_stack_trace *trace)
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_format_stack_trace(struct drgn_stack_trace *trace, char **ret)
 {
-	struct string_builder str = {};
+	struct string_builder str = STRING_BUILDER_INIT;
 	for (size_t frame = 0; frame < trace->num_frames; frame++) {
 		if (!string_builder_appendf(&str, "#%-2zu ", frame))
 			goto enomem;
@@ -160,7 +160,7 @@ drgn_format_stack_trace(struct drgn_stack_trace *trace, char **ret)
 		    !string_builder_appendc(&str, '\n'))
 			goto enomem;
 	}
-	if (!string_builder_finalize(&str, ret))
+	if (!(*ret = string_builder_null_terminate(&str)))
 		goto enomem;
 	return NULL;
 
@@ -172,7 +172,7 @@ enomem:
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret)
 {
-	struct string_builder str = {};
+	struct string_builder str = STRING_BUILDER_INIT;
 	struct drgn_register_state *regs = trace->frames[frame].regs;
 	if (!string_builder_appendf(&str, "#%zu at ", frame))
 		goto enomem;
@@ -219,7 +219,7 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 	    !string_builder_append(&str, " (inlined)"))
 		goto enomem;
 
-	if (!string_builder_finalize(&str, ret))
+	if (!(*ret = string_builder_null_terminate(&str)))
 		goto enomem;
 	return NULL;
 
@@ -738,8 +738,8 @@ drgn_stack_trace_add_frames(struct drgn_stack_trace **trace,
 	uint64_t bias;
 	Dwarf_Die *scopes;
 	size_t num_scopes;
-	err = drgn_debug_info_module_find_dwarf_scopes(regs->module, pc, &bias,
-						       &scopes, &num_scopes);
+	err = drgn_module_find_dwarf_scopes(regs->module, pc, &bias, &scopes,
+					    &num_scopes);
 	if (err)
 		goto out;
 	pc -= bias;
@@ -975,10 +975,9 @@ drgn_unwind_with_cfi(struct drgn_program *prog, struct drgn_cfi_row **row,
 	bool interrupted;
 	drgn_register_number ret_addr_regno;
 	/* If we found the module, then we must have the PC. */
-	err = drgn_debug_info_module_find_cfi(prog, regs->module,
-					      regs->_pc - !regs->interrupted,
-					      row, &interrupted,
-					      &ret_addr_regno);
+	err = drgn_module_find_cfi(prog, regs->module,
+				   regs->_pc - !regs->interrupted,
+				   row, &interrupted, &ret_addr_regno);
 	if (err)
 		return err;
 
