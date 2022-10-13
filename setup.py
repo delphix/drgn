@@ -258,6 +258,7 @@ class test(Command):
         command = rf"""
 set -e
 
+export PYTHON={shlex.quote(sys.executable)}
 export DRGN_TEST_KMOD={shlex.quote(str(kmod))}
 if [ -e /proc/vmcore ]; then
     "$PYTHON" -Bm unittest discover -t . -s tests/linux_kernel/vmcore {"-v" if self.verbose else ""}
@@ -265,14 +266,14 @@ else
     insmod "$DRGN_TEST_KMOD"
     DRGN_RUN_LINUX_KERNEL_TESTS=1 "$PYTHON" -Bm \
         unittest discover -t . -s tests/linux_kernel {"-v" if self.verbose else ""}
-    "$PYTHON" vmtest/enter_kdump.py
+    "$PYTHON" -Bm vmtest.enter_kdump
     # We should crash and not reach this.
     exit 1
 fi
 """
         try:
             returncode = vmtest.vm.run_in_vm(
-                command, Path(kernel_dir), Path(self.vmtest_dir)
+                command, Path("/"), Path(kernel_dir), Path(self.vmtest_dir)
             )
         except vmtest.vm.LostVMError as e:
             self.announce(f"error on Linux {kernel_release}: {e}", log.ERROR)
