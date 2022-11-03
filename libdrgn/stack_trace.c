@@ -1,8 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
-#include <dwarf.h>
 #include <elfutils/libdw.h>
 #include <elfutils/libdwfl.h>
 #include <inttypes.h>
@@ -12,6 +11,7 @@
 #include "cfi.h"
 #include "debug_info.h"
 #include "drgn.h"
+#include "dwarf_constants.h"
 #include "dwarf_info.h"
 #include "error.h"
 #include "helpers.h"
