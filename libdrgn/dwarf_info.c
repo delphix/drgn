@@ -5314,15 +5314,94 @@ drgn_object_from_dwarf(struct drgn_debug_info *dbinfo,
 					       function_die, regs, ret);
 }
 
+DEFINE_VECTOR(const_char_p_vector, const char *);
+
+static struct drgn_error *add_dwarf_enumerators(Dwarf_Die *enumeration_type,
+						struct const_char_p_vector *vec)
+{
+	Dwarf_Die child;
+	int r = dwarf_child(enumeration_type, &child);
+	while (r == 0) {
+		if (dwarf_tag(&child) == DW_TAG_enumerator) {
+			const char *die_name = dwarf_diename(&child);
+			if (!die_name)
+				continue;
+			if (!const_char_p_vector_append(vec, &die_name))
+				return &drgn_enomem;
+		}
+		r = dwarf_siblingof(&child, &child);
+	}
+	if (r < 0)
+		return drgn_error_libdw();
+	return NULL;
+}
+
+struct drgn_error *drgn_dwarf_scopes_names(Dwarf_Die *scopes,
+					   size_t num_scopes,
+					   const char ***names_ret,
+					   size_t *count_ret)
+{
+	struct drgn_error *err;
+	Dwarf_Die die;
+	struct const_char_p_vector vec = VECTOR_INIT;
+	for (size_t scope = 0; scope < num_scopes; scope++) {
+		if (dwarf_child(&scopes[scope], &die) != 0)
+			continue;
+		do {
+			switch (dwarf_tag(&die)) {
+			case DW_TAG_variable:
+			case DW_TAG_formal_parameter:
+			case DW_TAG_subprogram: {
+				const char *die_name = dwarf_diename(&die);
+				if (!die_name)
+					continue;
+				if (!const_char_p_vector_append(&vec,
+								&die_name)) {
+					err = &drgn_enomem;
+					goto err;
+				}
+				break;
+			}
+			case DW_TAG_enumeration_type: {
+				bool enum_class;
+				if (dwarf_flag_integrate(&die, DW_AT_enum_class,
+							 &enum_class)) {
+					err = drgn_error_libdw();
+					goto err;
+				}
+				if (!enum_class) {
+					err = add_dwarf_enumerators(&die, &vec);
+					if (err)
+						goto err;
+				}
+				break;
+			}
+			default:
+				continue;
+			}
+		} while (dwarf_siblingof(&die, &die) == 0);
+	}
+	const_char_p_vector_shrink_to_fit(&vec);
+	*names_ret = vec.data;
+	*count_ret = vec.size;
+	return NULL;
+
+err:
+	const_char_p_vector_deinit(&vec);
+	return err;
+}
+
 static struct drgn_error *find_dwarf_enumerator(Dwarf_Die *enumeration_type,
 						const char *name,
 						Dwarf_Die *ret)
 {
 	int r = dwarf_child(enumeration_type, ret);
 	while (r == 0) {
-		if (dwarf_tag(ret) == DW_TAG_enumerator &&
-		    strcmp(dwarf_diename(ret), name) == 0)
-			return NULL;
+		if (dwarf_tag(ret) == DW_TAG_enumerator) {
+			const char *die_name = dwarf_diename(ret);
+			if (die_name && strcmp(die_name, name) == 0)
+				return NULL;
+		}
 		r = dwarf_siblingof(ret, ret);
 	}
 	if (r < 0)
@@ -7332,11 +7411,12 @@ static void drgn_debug_info_cache_sh_addr(struct drgn_module *module,
 	}
 }
 
-static int drgn_dwarf_fde_compar(const void *_a, const void *_b, void *arg)
+static _Thread_local struct drgn_dwarf_cie *drgn_dwarf_fde_compar_cies;
+static int drgn_dwarf_fde_compar(const void *_a, const void *_b)
 {
 	const struct drgn_dwarf_fde *a = _a;
 	const struct drgn_dwarf_fde *b = _b;
-	const struct drgn_dwarf_cie *cies = arg;
+	const struct drgn_dwarf_cie *cies = drgn_dwarf_fde_compar_cies;
 	if (a->initial_location < b->initial_location)
 		return -1;
 	else if (a->initial_location > b->initial_location)
@@ -7374,8 +7454,9 @@ drgn_debug_info_parse_frames(struct drgn_module *module)
 	 * Sort FDEs and remove duplicates, preferring .debug_frame over
 	 * .eh_frame.
 	 */
-	qsort_r(fdes.data, fdes.size, sizeof(fdes.data[0]),
-		drgn_dwarf_fde_compar, cies.data);
+	drgn_dwarf_fde_compar_cies = cies.data;
+	qsort(fdes.data, fdes.size, sizeof(fdes.data[0]),
+	      drgn_dwarf_fde_compar);
 	if (fdes.size > 0) {
 		size_t src = 1, dst = 1;
 		for (; src < fdes.size; src++) {
