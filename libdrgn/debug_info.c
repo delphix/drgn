@@ -17,52 +17,11 @@
 #include <unistd.h>
 
 #include "debug_info.h"
+#include "elf_file.h"
 #include "error.h"
 #include "linux_kernel.h"
 #include "program.h"
 #include "util.h"
-
-static const char * const drgn_debug_scn_names[] = {
-	[DRGN_SCN_DEBUG_INFO] = ".debug_info",
-	[DRGN_SCN_DEBUG_TYPES] = ".debug_types",
-	[DRGN_SCN_DEBUG_ABBREV] = ".debug_abbrev",
-	[DRGN_SCN_DEBUG_STR] = ".debug_str",
-	[DRGN_SCN_DEBUG_STR_OFFSETS] = ".debug_str_offsets",
-	[DRGN_SCN_DEBUG_LINE] = ".debug_line",
-	[DRGN_SCN_DEBUG_LINE_STR] = ".debug_line_str",
-	[DRGN_SCN_DEBUG_ADDR] = ".debug_addr",
-	[DRGN_SCN_DEBUG_FRAME] = ".debug_frame",
-	[DRGN_SCN_EH_FRAME] = ".eh_frame",
-	[DRGN_SCN_ORC_UNWIND_IP] = ".orc_unwind_ip",
-	[DRGN_SCN_ORC_UNWIND] = ".orc_unwind",
-	[DRGN_SCN_DEBUG_LOC] = ".debug_loc",
-	[DRGN_SCN_DEBUG_LOCLISTS] = ".debug_loclists",
-	[DRGN_SCN_TEXT] = ".text",
-	[DRGN_SCN_GOT] = ".got",
-};
-
-struct drgn_error *drgn_error_debug_info_scn(struct drgn_module *module,
-					     enum drgn_debug_info_scn scn,
-					     const char *ptr,
-					     const char *message)
-{
-	const char *name = dwfl_module_info(module->dwfl_module, NULL, NULL,
-					    NULL, NULL, NULL, NULL, NULL);
-	return drgn_error_format(DRGN_ERROR_OTHER, "%s: %s+%#tx: %s",
-				 name, drgn_debug_scn_names[scn],
-				 ptr - (const char *)module->scn_data[scn]->d_buf,
-				 message);
-}
-
-struct drgn_error *drgn_debug_info_buffer_error(struct binary_buffer *bb,
-						const char *pos,
-						const char *message)
-{
-	struct drgn_debug_info_buffer *buffer =
-		container_of(bb, struct drgn_debug_info_buffer, bb);
-	return drgn_error_debug_info_scn(buffer->module, buffer->scn, pos,
-					 message);
-}
 
 DEFINE_VECTOR_FUNCTIONS(drgn_module_vector)
 
@@ -220,6 +179,9 @@ static void drgn_module_destroy(struct drgn_module *module)
 		if (module->fd != -1)
 			close(module->fd);
 		free(module->path);
+		if (module->debug_file != module->loaded_file)
+			drgn_elf_file_destroy(module->debug_file);
+		drgn_elf_file_destroy(module->loaded_file);
 		free(module->name);
 		free(module);
 	}
@@ -1799,7 +1761,8 @@ out:
 }
 
 static struct drgn_error *
-drgn_debug_info_find_sections(struct drgn_module *module)
+drgn_module_find_files(struct drgn_debug_info_load_state *load,
+		       struct drgn_module *module)
 {
 	struct drgn_error *err;
 
@@ -1809,60 +1772,61 @@ drgn_debug_info_find_sections(struct drgn_module *module)
 			return err;
 	}
 
-	/*
-	 * Note: not dwfl_module_getelf(), because then libdwfl applies
-	 * ELF relocations to all sections, not just debug sections.
-	 */
-	Dwarf_Addr bias;
+	GElf_Addr loaded_file_bias;
+	Elf *loaded_elf = NULL;
+	Dwarf_Addr debug_file_bias;
 	Dwarf *dwarf;
-	#pragma omp critical(drgn_dwfl_module_getdwarf)
-	dwarf = dwfl_module_getdwarf(module->dwfl_module, &bias);
-	if (!dwarf)
-		return drgn_error_libdwfl();
-	Elf *elf = dwarf_getelf(dwarf);
-	if (!elf)
-		return drgn_error_libdw();
-	GElf_Ehdr ehdr_mem, *ehdr = gelf_getehdr(elf, &ehdr_mem);
-	if (!ehdr)
-		return drgn_error_libelf();
-	drgn_platform_from_elf(ehdr, &module->platform);
-
-	size_t shstrndx;
-	if (elf_getshdrstrndx(elf, &shstrndx))
-		return drgn_error_libelf();
-
-	Elf_Scn *scn = NULL;
-	while ((scn = elf_nextscn(elf, scn))) {
-		GElf_Shdr shdr_mem;
-		GElf_Shdr *shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr)
-			return drgn_error_libelf();
-
-		if (shdr->sh_type != SHT_PROGBITS)
-			continue;
-		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!scnname)
-			return drgn_error_libelf();
-
-		for (size_t i = 0; i < DRGN_NUM_DEBUG_SCNS; i++) {
-			if (!module->scns[i] &&
-			    strcmp(scnname, drgn_debug_scn_names[i]) == 0) {
-				module->scns[i] = scn;
-				break;
-			}
+	err = NULL;
+	#pragma omp critical(drgn_module_find_files)
+	{
+		// We don't need the loaded file for the Linux kernel, and we
+		// always report the debug file as the main file to libdwfl.
+		if (!(load->dbinfo->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)) {
+			loaded_elf = dwfl_module_getelf(module->dwfl_module,
+							&loaded_file_bias);
+			if (!loaded_elf)
+				err = drgn_error_libdwfl();
 		}
+		if (!err) {
+			dwarf = dwfl_module_getdwarf(module->dwfl_module,
+						     &debug_file_bias);
+			if (!dwarf)
+				err = drgn_error_libdwfl();
+		}
+	}
+	if (err)
+		return err;
+
+	const char *loaded_file_path;
+	const char *debug_file_path;
+	dwfl_module_info(module->dwfl_module, NULL, NULL, NULL, NULL, NULL,
+			 &loaded_file_path, &debug_file_path);
+
+	module->debug_file_bias = debug_file_bias;
+	err = drgn_elf_file_create(module, debug_file_path, dwarf_getelf(dwarf),
+				   &module->debug_file);
+	if (err) {
+		module->debug_file = NULL;
+		return err;
+	}
+	module->debug_file->dwarf = dwarf;
+	if (!module->debug_file->scns[DRGN_SCN_DEBUG_INFO] ||
+	    !module->debug_file->scns[DRGN_SCN_DEBUG_ABBREV]) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "missing debugging information sections");
 	}
 
 	Dwarf *altdwarf = dwarf_getalt(dwarf);
 	if (altdwarf) {
-		elf = dwarf_getelf(altdwarf);
-		if (!elf)
+		Elf *altelf = dwarf_getelf(altdwarf);
+		if (!altelf)
 			return drgn_error_libdw();
-		if (elf_getshdrstrndx(elf, &shstrndx))
+		size_t shstrndx;
+		if (elf_getshdrstrndx(altelf, &shstrndx))
 			return drgn_error_libelf();
 
-		scn = NULL;
-		while ((scn = elf_nextscn(elf, scn))) {
+		Elf_Scn *scn = NULL;
+		while ((scn = elf_nextscn(altelf, scn))) {
 			GElf_Shdr shdr_mem;
 			GElf_Shdr *shdr = gelf_getshdr(scn, &shdr_mem);
 			if (!shdr)
@@ -1870,7 +1834,8 @@ drgn_debug_info_find_sections(struct drgn_module *module)
 
 			if (shdr->sh_type != SHT_PROGBITS)
 				continue;
-			const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
+			const char *scnname = elf_strptr(altelf, shstrndx,
+							 shdr->sh_name);
 			if (!scnname)
 				return drgn_error_libelf();
 
@@ -1878,71 +1843,39 @@ drgn_debug_info_find_sections(struct drgn_module *module)
 			 * TODO: save more sections and support imported units.
 			 */
 			if (strcmp(scnname, ".debug_info") == 0 &&
-			    !module->alt_debug_info)
-				module->alt_debug_info = scn;
-			else if (strcmp(scnname, ".debug_str") == 0 &&
-				   !module->alt_debug_str)
-				module->alt_debug_str = scn;
+			    !module->debug_file->alt_debug_info_data) {
+				err = read_elf_section(scn,
+						       &module->debug_file->alt_debug_info_data);
+				if (err)
+					return err;
+			} else if (strcmp(scnname, ".debug_str") == 0 &&
+				   !module->debug_file->alt_debug_str_data) {
+				err = read_elf_section(scn,
+						       &module->debug_file->alt_debug_str_data);
+				if (err)
+					return err;
+			}
 		}
 	}
+	err = drgn_elf_file_precache_sections(module->debug_file);
+	if (err)
+		return err;
 
-	return NULL;
-}
-
-static void truncate_null_terminated_section(Elf_Data *data)
-{
-	if (data) {
-		const char *buf = data->d_buf;
-		const char *nul = memrchr(buf, '\0', data->d_size);
-		if (nul)
-			data->d_size = nul - buf + 1;
-		else
-			data->d_size = 0;
-	}
-}
-
-static struct drgn_error *
-drgn_debug_info_precache_sections(struct drgn_module *module)
-{
-	struct drgn_error *err;
-
-	for (size_t i = 0; i < DRGN_NUM_DEBUG_SCN_DATA_PRECACHE; i++) {
-		if (module->scns[i]) {
-			err = read_elf_section(module->scns[i],
-					       &module->scn_data[i]);
-			if (err)
+	if (loaded_elf) {
+		module->loaded_file_bias = loaded_file_bias;
+		if (loaded_elf == module->debug_file->elf) {
+			module->loaded_file = module->debug_file;
+		} else {
+			err = drgn_elf_file_create(module, loaded_file_path,
+						   loaded_elf,
+						   &module->loaded_file);
+			if (err) {
+				module->loaded_file = NULL;
 				return err;
+			}
 		}
 	}
-	if (module->alt_debug_info) {
-		err = read_elf_section(module->alt_debug_info,
-				       &module->alt_debug_info_data);
-		if (err)
-			return err;
-	}
-	if (module->alt_debug_str) {
-		err = read_elf_section(module->alt_debug_str,
-				       &module->alt_debug_str_data);
-		if (err)
-			return err;
-	}
-
-	/*
-	 * Truncate any extraneous bytes so that we can assume that a pointer
-	 * within .debug_{,line_}str is always null-terminated.
-	 */
-	truncate_null_terminated_section(module->scn_data[DRGN_SCN_DEBUG_STR]);
-	truncate_null_terminated_section(module->scn_data[DRGN_SCN_DEBUG_LINE_STR]);
-	truncate_null_terminated_section(module->alt_debug_str_data);
 	return NULL;
-}
-
-struct drgn_error *drgn_module_cache_section(struct drgn_module *module,
-					     enum drgn_debug_info_scn scn)
-{
-	if (module->scn_data[scn])
-		return NULL;
-	return read_elf_section(module->scns[scn], &module->scn_data[scn]);
 }
 
 static struct drgn_error *
@@ -1953,22 +1886,13 @@ drgn_debug_info_read_module(struct drgn_debug_info_load_state *load,
 	struct drgn_error *err;
 	struct drgn_module *module;
 	for (module = head; module; module = module->next) {
-		err = drgn_debug_info_find_sections(module);
+		err = drgn_module_find_files(load, module);
 		if (err) {
 			module->err = err;
 			continue;
 		}
-		if (module->scns[DRGN_SCN_DEBUG_INFO] &&
-		    module->scns[DRGN_SCN_DEBUG_ABBREV]) {
-			err = drgn_debug_info_precache_sections(module);
-			if (err) {
-				module->err = err;
-				continue;
-			}
-			module->state = DRGN_DEBUG_INFO_MODULE_INDEXING;
-			return drgn_dwarf_index_read_module(index,
-							    module);
-		}
+		module->state = DRGN_DEBUG_INFO_MODULE_INDEXING;
+		return drgn_dwarf_index_read_module(index, module);
 	}
 	/*
 	 * We checked all of the files and didn't find debugging information.
@@ -2180,36 +2104,68 @@ void drgn_debug_info_destroy(struct drgn_debug_info *dbinfo)
 
 struct drgn_error *
 drgn_module_find_cfi(struct drgn_program *prog, struct drgn_module *module,
-		     uint64_t pc, struct drgn_cfi_row **row_ret,
-		     bool *interrupted_ret,
+		     uint64_t pc, struct drgn_elf_file **file_ret,
+		     struct drgn_cfi_row **row_ret, bool *interrupted_ret,
 		     drgn_register_number *ret_addr_regno_ret)
 {
 	struct drgn_error *err;
 
-	Dwarf_Addr bias;
-	dwfl_module_info(module->dwfl_module, NULL, NULL, NULL, &bias, NULL,
-			 NULL, NULL);
-	uint64_t unbiased_pc = pc - bias;
+	// If the file's platform doesn't match the program's, we can't use its
+	// CFI.
+	const bool can_use_loaded_file =
+		(module->loaded_file &&
+		 drgn_platforms_equal(&module->loaded_file->platform,
+				      &prog->platform));
+	const bool can_use_debug_file =
+		(module->debug_file &&
+		 drgn_platforms_equal(&module->debug_file->platform,
+				      &prog->platform));
 
 	if (prog->prefer_orc_unwinder) {
-		err = drgn_debug_info_find_orc_cfi(module, unbiased_pc, row_ret,
-						   interrupted_ret,
-						   ret_addr_regno_ret);
-		if (err != &drgn_not_found)
-			return err;
-		return drgn_debug_info_find_dwarf_cfi(module, unbiased_pc,
-						      row_ret, interrupted_ret,
-						      ret_addr_regno_ret);
+		if (can_use_debug_file) {
+			*file_ret = module->debug_file;
+			err = drgn_module_find_orc_cfi(module, pc, row_ret,
+						       interrupted_ret,
+						       ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+			err = drgn_module_find_dwarf_cfi(module, pc, row_ret,
+							 interrupted_ret,
+							 ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+		}
+		if (can_use_loaded_file) {
+			*file_ret = module->loaded_file;
+			return drgn_module_find_eh_cfi(module, pc, row_ret,
+						       interrupted_ret,
+						       ret_addr_regno_ret);
+		}
 	} else {
-		err = drgn_debug_info_find_dwarf_cfi(module, unbiased_pc,
-						     row_ret, interrupted_ret,
-						     ret_addr_regno_ret);
-		if (err != &drgn_not_found)
-			return err;
-		return drgn_debug_info_find_orc_cfi(module, unbiased_pc,
-						    row_ret, interrupted_ret,
-						    ret_addr_regno_ret);
+		if (can_use_debug_file) {
+			*file_ret = module->debug_file;
+			err = drgn_module_find_dwarf_cfi(module, pc, row_ret,
+							 interrupted_ret,
+							 ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+		}
+		if (can_use_loaded_file) {
+			*file_ret = module->loaded_file;
+			err = drgn_module_find_eh_cfi(module, pc, row_ret,
+						      interrupted_ret,
+						      ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+		}
+		if (can_use_debug_file) {
+			*file_ret = module->debug_file;
+			return drgn_module_find_orc_cfi(module, pc, row_ret,
+							interrupted_ret,
+							ret_addr_regno_ret);
+		}
 	}
+	return &drgn_not_found;
 }
 
 #if !_ELFUTILS_PREREQ(0, 175)
@@ -2289,21 +2245,6 @@ struct drgn_error *find_elf_file(char **path_ret, int *fd_ret, Elf **elf_ret,
 	*path_ret = NULL;
 	*fd_ret = -1;
 	*elf_ret = NULL;
-	return NULL;
-}
-
-struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret)
-{
-	GElf_Shdr shdr_mem, *shdr;
-	shdr = gelf_getshdr(scn, &shdr_mem);
-	if (!shdr)
-		return drgn_error_libelf();
-	if ((shdr->sh_flags & SHF_COMPRESSED) && elf_compress(scn, 0, 0) < 0)
-		return drgn_error_libelf();
-	Elf_Data *data = elf_rawdata(scn, NULL);
-	if (!data)
-		return drgn_error_libelf();
-	*ret = data;
 	return NULL;
 }
 

@@ -13,6 +13,7 @@
 #include "drgn.h"
 #include "dwarf_constants.h"
 #include "dwarf_info.h"
+#include "elf_file.h"
 #include "error.h"
 #include "helpers.h"
 #include "minmax.h"
@@ -301,18 +302,13 @@ drgn_stack_frame_source(struct drgn_stack_trace *trace, size_t frame,
 		return filename;
 	} else if (trace->frames[frame].num_scopes > 0) {
 		struct drgn_register_state *regs = trace->frames[frame].regs;
-		Dwfl_Module *dwfl_module =
-			regs->module ? regs->module->dwfl_module : NULL;
-		if (!dwfl_module)
+		if (!regs->module)
 			return NULL;
 
 		struct optional_uint64 pc = drgn_register_state_get_pc(regs);
 		if (!pc.has_value)
 			return NULL;
-		Dwarf_Addr bias;
-		if (!dwfl_module_getdwarf(dwfl_module, &bias))
-			return NULL;
-		pc.value = pc.value - bias - !regs->interrupted;
+		pc.value -= !regs->interrupted + regs->module->debug_file_bias;
 
 		Dwarf_Die *scopes = trace->frames[frame].scopes;
 		size_t num_scopes = trace->frames[frame].num_scopes;
@@ -487,12 +483,17 @@ not_found:;
 		}
 	}
 
+	// It doesn't make sense to use the registers if the file has a
+	// different platform than the program.
+	const struct drgn_register_state *regs = frame->regs;
+	struct drgn_elf_file *file = regs->module->debug_file;
+	if (!drgn_platforms_equal(&file->platform, &trace->prog->platform))
+		regs = NULL;
 	Dwarf_Die function_die = frame->scopes[frame->function_scope];
-	return drgn_object_from_dwarf(trace->prog->dbinfo, frame->regs->module,
-				      &die,
+	return drgn_object_from_dwarf(trace->prog->dbinfo, file, &die,
 				      dwarf_tag(&die) == DW_TAG_enumerator ?
 				      &type_die : NULL,
-				      &function_die, frame->regs, ret);
+				      &function_die, regs, ret);
 }
 
 LIBDRGN_PUBLIC bool drgn_stack_frame_register(struct drgn_stack_trace *trace,
@@ -899,7 +900,7 @@ out:
 }
 
 static struct drgn_error *
-drgn_unwind_one_register(struct drgn_program *prog,
+drgn_unwind_one_register(struct drgn_program *prog, struct drgn_elf_file *file,
 			 const struct drgn_cfi_rule *rule,
 			 const struct drgn_register_state *regs, void *buf,
 			 size_t size)
@@ -958,8 +959,8 @@ drgn_unwind_one_register(struct drgn_program *prog,
 	}
 	case DRGN_CFI_RULE_AT_DWARF_EXPRESSION:
 	case DRGN_CFI_RULE_DWARF_EXPRESSION:
-		err = drgn_eval_cfi_dwarf_expression(prog, rule, regs, buf,
-						     size);
+		err = drgn_eval_cfi_dwarf_expression(prog, file, rule, regs,
+						     buf, size);
 		break;
 	case DRGN_CFI_RULE_CONSTANT:
 		copy_lsbytes(buf, size, little_endian, &rule->constant,
@@ -978,6 +979,7 @@ drgn_unwind_one_register(struct drgn_program *prog,
 }
 
 static struct drgn_error *drgn_unwind_cfa(struct drgn_program *prog,
+					  struct drgn_elf_file *file,
 					  const struct drgn_cfi_row *row,
 					  struct drgn_register_state *regs)
 {
@@ -986,7 +988,8 @@ static struct drgn_error *drgn_unwind_cfa(struct drgn_program *prog,
 	drgn_cfi_row_get_cfa(row, &rule);
 	uint8_t address_size = drgn_platform_address_size(&prog->platform);
 	char buf[8];
-	err = drgn_unwind_one_register(prog, &rule, regs, buf, address_size);
+	err = drgn_unwind_one_register(prog, file, &rule, regs, buf,
+				       address_size);
 	if (!err) {
 		uint64_t cfa;
 		copy_lsbytes(&cfa, sizeof(cfa), HOST_LITTLE_ENDIAN, buf,
@@ -1009,16 +1012,17 @@ drgn_unwind_with_cfi(struct drgn_program *prog, struct drgn_cfi_row **row,
 	if (!regs->module)
 		return &drgn_not_found;
 
+	struct drgn_elf_file *file;
 	bool interrupted;
 	drgn_register_number ret_addr_regno;
 	/* If we found the module, then we must have the PC. */
 	err = drgn_module_find_cfi(prog, regs->module,
-				   regs->_pc - !regs->interrupted,
-				   row, &interrupted, &ret_addr_regno);
+				   regs->_pc - !regs->interrupted, &file, row,
+				   &interrupted, &ret_addr_regno);
 	if (err)
 		return err;
 
-	err = drgn_unwind_cfa(prog, *row, regs);
+	err = drgn_unwind_cfa(prog, file, *row, regs);
 	if (err)
 		return err;
 
@@ -1039,7 +1043,7 @@ drgn_unwind_with_cfi(struct drgn_program *prog, struct drgn_cfi_row **row,
 		struct drgn_cfi_rule rule;
 		drgn_cfi_row_get_register(*row, regno, &rule);
 		layout = &prog->platform.arch->register_layout[regno];
-		err = drgn_unwind_one_register(prog, &rule, regs,
+		err = drgn_unwind_one_register(prog, file, &rule, regs,
 					       &unwound->buf[layout->offset],
 					       layout->size);
 		if (!err) {
