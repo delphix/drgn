@@ -30,7 +30,7 @@ class KernelFlavor(NamedTuple):
     config: str
 
     def localversion(self) -> str:
-        localversion = "-vmtest15"
+        localversion = "-vmtest16"
         # The default flavor should be the "latest" version.
         localversion += ".1" if self.name == "default" else ".0"
         localversion += self.name
@@ -62,6 +62,9 @@ CONFIG_SLAB=y
         config="""
 CONFIG_SMP=n
 CONFIG_SLOB=y
+# Linux kernel commit 149b6fa228ed ("mm, slob: rename CONFIG_SLOB to
+# CONFIG_SLOB_DEPRECATED") (in v6.2) renamed to option for SLOB.
+CONFIG_SLOB_DEPRECATED=y
 # CONFIG_PREEMPT_DYNAMIC is not set
 CONFIG_PREEMPT_NONE=y
 # !PREEMPTION && !SMP will also select TINY_RCU.
@@ -175,6 +178,10 @@ CONFIG_NET_SCH_INGRESS=m
 CONFIG_NET_CLS_ACT=y
 CONFIG_NETDEVICES=y
 CONFIG_DUMMY=m
+
+# To enable CONFIG_XARRAY_MULTI for xarray tests.
+CONFIG_TRANSPARENT_HUGEPAGE=y
+CONFIG_READ_ONLY_THP_FOR_FS=y
 """
 
 
