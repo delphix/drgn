@@ -15,6 +15,7 @@ include_HEADERS = drgn.h
 
 ARCH_DEFS_PYS = arch_aarch64_defs.py \
 		arch_ppc64_defs.py \
+		arch_s390x_defs.py \
 		arch_x86_64_defs.py
 
 ARCH_DEFS_INCS = $(ARCH_DEFS_PYS:_defs.py=_defs.inc)
