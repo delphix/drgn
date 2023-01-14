@@ -30,7 +30,7 @@ class KernelFlavor(NamedTuple):
     config: str
 
     def localversion(self) -> str:
-        localversion = "-vmtest16"
+        localversion = "-vmtest17"
         # The default flavor should be the "latest" version.
         localversion += ".1" if self.name == "default" else ".0"
         localversion += self.name
@@ -63,7 +63,7 @@ CONFIG_SLAB=y
 CONFIG_SMP=n
 CONFIG_SLOB=y
 # Linux kernel commit 149b6fa228ed ("mm, slob: rename CONFIG_SLOB to
-# CONFIG_SLOB_DEPRECATED") (in v6.2) renamed to option for SLOB.
+# CONFIG_SLOB_DEPRECATED") (in v6.2) renamed the option for SLOB.
 CONFIG_SLOB_DEPRECATED=y
 # CONFIG_PREEMPT_DYNAMIC is not set
 CONFIG_PREEMPT_NONE=y
@@ -113,6 +113,9 @@ CONFIG_VIRTIO_CONSOLE=y
 CONFIG_VIRTIO_PCI=y
 CONFIG_HW_RANDOM=m
 CONFIG_HW_RANDOM_VIRTIO=m
+
+# Lots of stuff expect Unix sockets.
+CONFIG_UNIX=y
 
 # drgn needs debug info.
 CONFIG_DEBUG_KERNEL=y
