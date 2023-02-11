@@ -25,9 +25,16 @@ import uritemplate
 
 from util import KernelVersion
 from vmtest.asynciosubprocess import check_call, check_output
+from vmtest.config import (
+    ARCHITECTURES,
+    KERNEL_FLAVORS,
+    Architecture,
+    KernelFlavor,
+    kconfig_localversion,
+)
 from vmtest.download import VMTEST_GITHUB_RELEASE, available_kernel_releases
 from vmtest.githubapi import AioGitHubApi
-from vmtest.kbuild import KERNEL_FLAVORS, KBuild, KernelFlavor
+from vmtest.kbuild import KBuild
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +89,7 @@ def kernel_tag_to_release(tag: str, flavor: KernelFlavor) -> str:
             match.group(1),
             match.group(2) or ".0",
             match.group(3) or "",
-            flavor.localversion(),
+            kconfig_localversion(flavor),
         ]
     )
 
@@ -121,7 +128,7 @@ async def fetch_kernel_tags(kernel_dir: Path, kernel_tags: Sequence[str]) -> Non
 async def build_kernels(
     kernel_dir: Path,
     build_dir: Path,
-    arch: str,
+    arch: Architecture,
     kernel_revs: Sequence[Tuple[str, Sequence[KernelFlavor]]],
     keep_builds: bool,
 ) -> AsyncIterator[Path]:
@@ -135,7 +142,7 @@ async def build_kernels(
                 build_dir / f"build-{flavor.name}-{rev}.log", "w"
             ) as build_log_file:
                 kbuild = KBuild(
-                    kernel_dir, flavor_rev_build_dir, flavor, arch, build_log_file
+                    kernel_dir, flavor_rev_build_dir, arch, flavor, build_log_file
                 )
                 await kbuild.build()
                 yield await kbuild.package("tar.zst", build_dir)
@@ -248,7 +255,7 @@ async def main() -> None:
     if not hasattr(args, "keep_builds"):
         args.keep_builds = not args.upload
 
-    arch = "x86_64"
+    arch = ARCHITECTURES["x86_64"]
 
     async with aiohttp.ClientSession(trust_env=True) as session:
         GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -267,7 +274,7 @@ async def main() -> None:
         else:
             github_release = await github_release_coro
 
-        kernel_releases = available_kernel_releases(github_release, arch)
+        kernel_releases = available_kernel_releases(github_release, arch.name)
         logger.info(
             "available %s kernel releases: %s",
             arch,
@@ -280,7 +287,7 @@ async def main() -> None:
             for tag in latest_kernel_tags:
                 flavors = [
                     flavor
-                    for flavor in KERNEL_FLAVORS
+                    for flavor in KERNEL_FLAVORS.values()
                     if kernel_tag_to_release(tag, flavor) not in kernel_releases
                 ]
                 if flavors:

@@ -5,12 +5,13 @@ import argparse
 import asyncio
 import filecmp
 import logging
+import os
 from pathlib import Path
 import shlex
 import shutil
 import sys
 import tempfile
-from typing import IO, Any, NamedTuple, Optional, Tuple, Union
+from typing import IO, Any, Optional, Tuple, Union
 
 from util import nproc
 from vmtest.asynciosubprocess import (
@@ -20,176 +21,19 @@ from vmtest.asynciosubprocess import (
     check_output_shell,
     pipe_context,
 )
+from vmtest.config import (
+    ARCHITECTURES,
+    HOST_ARCHITECTURE,
+    KERNEL_FLAVORS,
+    Architecture,
+    KernelFlavor,
+    kconfig,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class KernelFlavor(NamedTuple):
-    name: str
-    description: str
-    config: str
-
-    def localversion(self) -> str:
-        localversion = "-vmtest18"
-        # The default flavor should be the "latest" version.
-        localversion += ".1" if self.name == "default" else ".0"
-        localversion += self.name
-        return localversion
-
-
-KERNEL_FLAVORS = [
-    KernelFlavor(
-        name="default",
-        description="Default configuration",
-        config="""
-CONFIG_SMP=y
-CONFIG_SLUB=y
-# For slab tests.
-CONFIG_SLUB_DEBUG=y
-""",
-    ),
-    KernelFlavor(
-        name="alternative",
-        description="SLAB allocator",
-        config="""
-CONFIG_SMP=y
-CONFIG_SLAB=y
-""",
-    ),
-    KernelFlavor(
-        name="tiny",
-        description="!SMP, !PREEMPT, and SLOB allocator",
-        config="""
-CONFIG_SMP=n
-CONFIG_SLOB=y
-# Linux kernel commit 149b6fa228ed ("mm, slob: rename CONFIG_SLOB to
-# CONFIG_SLOB_DEPRECATED") (in v6.2) renamed the option for SLOB.
-CONFIG_SLOB_DEPRECATED=y
-# CONFIG_PREEMPT_DYNAMIC is not set
-CONFIG_PREEMPT_NONE=y
-# !PREEMPTION && !SMP will also select TINY_RCU.
-""",
-    ),
-]
-
-
 _PACKAGE_FORMATS = ("tar.zst", "directory")
-
-
-def kconfig(flavor: KernelFlavor) -> str:
-    return rf"""# Minimal Linux kernel configuration for booting into vmtest and running drgn
-# tests ({flavor.name} flavor).
-
-CONFIG_LOCALVERSION="{flavor.localversion()}"
-CONFIG_EXPERT=y
-{flavor.config}
-CONFIG_MODULES=y
-CONFIG_MODULE_UNLOAD=y
-CONFIG_CC_OPTIMIZE_FOR_SIZE=y
-
-# We run the tests in KVM.
-CONFIG_HYPERVISOR_GUEST=y
-CONFIG_KVM_GUEST=y
-CONFIG_PARAVIRT=y
-CONFIG_PARAVIRT_SPINLOCKS=y
-
-# Minimum requirements for vmtest.
-CONFIG_9P_FS=y
-CONFIG_DEVTMPFS=y
-CONFIG_INET=y
-CONFIG_NET=y
-CONFIG_NETWORK_FILESYSTEMS=y
-CONFIG_NET_9P=y
-CONFIG_NET_9P_VIRTIO=y
-CONFIG_OVERLAY_FS=y
-CONFIG_PCI=y
-CONFIG_PROC_FS=y
-CONFIG_SERIAL_8250=y
-CONFIG_SERIAL_8250_CONSOLE=y
-CONFIG_SYSFS=y
-CONFIG_TMPFS=y
-CONFIG_TMPFS_XATTR=y
-CONFIG_VIRTIO_CONSOLE=y
-CONFIG_VIRTIO_PCI=y
-CONFIG_HW_RANDOM=m
-CONFIG_HW_RANDOM_VIRTIO=m
-
-# Lots of stuff expect Unix sockets.
-CONFIG_UNIX=y
-
-# drgn needs debug info.
-CONFIG_DEBUG_KERNEL=y
-CONFIG_DEBUG_INFO=y
-CONFIG_DEBUG_INFO_DWARF4=y
-
-# For testing live kernel debugging with /proc/kcore.
-CONFIG_PROC_KCORE=y
-# drgn needs /proc/kallsyms in some cases. Some test cases also need it.
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-
-# For testing kernel core dumps with /proc/vmcore.
-CONFIG_CRASH_DUMP=y
-CONFIG_PROC_VMCORE=y
-CONFIG_KEXEC=y
-CONFIG_KEXEC_FILE=y
-# Needed for CONFIG_KEXEC_FILE.
-CONFIG_CRYPTO=y
-CONFIG_CRYPTO_SHA256=y
-
-# So that we can trigger a crash with /proc/sysrq-trigger.
-CONFIG_MAGIC_SYSRQ=y
-
-# For block tests.
-CONFIG_BLK_DEV_LOOP=m
-
-# For BPF tests.
-CONFIG_BPF_SYSCALL=y
-CONFIG_BPF_JIT=y
-CONFIG_BPF_JIT_ALWAYS_ON=y
-CONFIG_CGROUP_BPF=y
-CONFIG_DEBUG_INFO_BTF=y
-CONFIG_DEBUG_INFO_BTF_MODULES=y
-
-# For cgroup tests.
-CONFIG_CGROUPS=y
-# To select CONFIG_SOCK_CGROUP_DATA. (CONFIG_CGROUP_BPF also selects
-# CONFIG_SOCK_CGROUP_DATA, but that's only present since Linux kernel commit
-# 3007098494be ("cgroup: add support for eBPF programs") (in v4.10)).
-CONFIG_CGROUP_NET_CLASSID=y
-
-# For kconfig tests.
-CONFIG_IKCONFIG=m
-CONFIG_IKCONFIG_PROC=y
-
-# For filesystem tests.
-CONFIG_BTRFS_FS=m
-CONFIG_EXT4_FS=m
-CONFIG_XFS_FS=m
-
-# For net tests.
-CONFIG_NAMESPACES=y
-
-# For nodemask tests.
-CONFIG_NUMA=y
-
-# For slab allocator tests.
-CONFIG_SLAB_FREELIST_HARDENED=y
-
-# For Traffic Control tests.
-CONFIG_NET_SCHED=y
-CONFIG_NET_SCH_PRIO=m
-CONFIG_NET_SCH_SFQ=m
-CONFIG_NET_SCH_TBF=m
-CONFIG_NET_SCH_INGRESS=m
-CONFIG_NET_CLS_ACT=y
-CONFIG_NETDEVICES=y
-CONFIG_DUMMY=m
-
-# To enable CONFIG_XARRAY_MULTI for xarray tests.
-CONFIG_TRANSPARENT_HUGEPAGE=y
-CONFIG_READ_ONLY_THP_FOR_FS=y
-"""
 
 
 class KBuild:
@@ -197,15 +41,14 @@ class KBuild:
         self,
         kernel_dir: Path,
         build_dir: Path,
+        arch: Architecture,
         flavor: KernelFlavor,
-        arch: str,
         build_log_file: Union[int, IO[Any], None] = None,
     ) -> None:
         self._build_dir = build_dir
         self._kernel_dir = kernel_dir
         self._flavor = flavor
         self._arch = arch
-        self._srcarch = {"x86_64": "x86"}.get(arch, arch)
         self._build_stdout = build_log_file
         self._build_stderr = (
             None if build_log_file is None else asyncio.subprocess.STDOUT
@@ -249,7 +92,7 @@ class KBuild:
             self._cached_make_args = (
                 "-C",
                 str(self._kernel_dir),
-                "ARCH=" + str(self._arch),
+                "ARCH=" + str(self._arch.kernel_arch),
                 "O=" + str(build_dir_real),
                 "KBUILD_ABS_SRCTREE=1",
                 "KBUILD_BUILD_USER=drgn",
@@ -288,7 +131,7 @@ class KBuild:
         config = self._build_dir / ".config"
         tmp_config = self._build_dir / ".config.vmtest.tmp"
 
-        tmp_config.write_text(kconfig(self._flavor))
+        tmp_config.write_text(kconfig(self._arch, self._flavor))
         await check_call(
             "make",
             *make_args,
@@ -339,7 +182,7 @@ class KBuild:
         files = (
             ".config",
             "Module.symvers",
-            f"arch/{self._srcarch}/Makefile",
+            f"arch/{self._arch.kernel_srcarch}/Makefile",
             "scripts/Kbuild.include",
             "scripts/Makefile*",
             "scripts/basic/fixdep",
@@ -356,7 +199,7 @@ class KBuild:
             "tools/objtool/objtool",
         )
         directories = (
-            f"arch/{self._srcarch}/include",
+            f"arch/{self._arch.kernel_srcarch}/include",
             "include",
         )
 
@@ -418,6 +261,7 @@ MODULE_LICENSE("GPL");
             # missing some files.
             cmd = (
                 "make",
+                "ARCH=" + str(self._arch.kernel_arch),
                 "-C",
                 modules_dir / "build",
                 f"M={test_module_dir.resolve()}",
@@ -473,7 +317,7 @@ MODULE_LICENSE("GPL");
         kernel_release = await self._kernel_release()
 
         extension = "" if format == "directory" else ("." + format)
-        package = output_dir / f"kernel-{kernel_release}.{self._arch}{extension}"
+        package = output_dir / f"kernel-{kernel_release}.{self._arch.name}{extension}"
 
         logger.info(
             "packaging kernel %s from %s to %s",
@@ -507,7 +351,7 @@ MODULE_LICENSE("GPL");
             logger.info("copying vmlinux")
             vmlinux = modules_dir / "vmlinux"
             await check_call(
-                "objcopy",
+                os.environ.get("CROSS_COMPILE", "") + "objcopy",
                 "--remove-relocations=*",
                 self._build_dir / "vmlinux",
                 str(vmlinux),
@@ -593,14 +437,25 @@ async def main() -> None:
         default=_PACKAGE_FORMATS[0],
     )
     parser.add_argument(
+        "-a",
+        "--architecture",
+        choices=sorted(ARCHITECTURES),
+        help="architecture to build for",
+        default=None if HOST_ARCHITECTURE is None else HOST_ARCHITECTURE.name,
+        required=HOST_ARCHITECTURE is None,
+    )
+    parser.add_argument(
         "-f",
         "--flavor",
-        choices=[flavor.name for flavor in KERNEL_FLAVORS],
+        choices=KERNEL_FLAVORS,
         help="kernel configuration flavor. "
         + ". ".join(
-            [f"{flavor.name}: {flavor.description}" for flavor in KERNEL_FLAVORS]
+            [
+                f"{flavor.name}: {flavor.description}"
+                for flavor in KERNEL_FLAVORS.values()
+            ]
         ),
-        default=KERNEL_FLAVORS[0].name,
+        default=next(iter(KERNEL_FLAVORS)),
     )
     parser.add_argument(
         "--dump-kconfig",
@@ -609,13 +464,14 @@ async def main() -> None:
     )
     args = parser.parse_args()
 
-    flavor = [flavor for flavor in KERNEL_FLAVORS if flavor.name == args.flavor][0]
+    arch = ARCHITECTURES[args.architecture]
+    flavor = KERNEL_FLAVORS[args.flavor]
 
     if args.dump_kconfig:
-        sys.stdout.write(kconfig(flavor))
+        sys.stdout.write(kconfig(arch, flavor))
         return
 
-    kbuild = KBuild(args.kernel_directory, args.build_directory, flavor, "x86_64")
+    kbuild = KBuild(args.kernel_directory, args.build_directory, arch, flavor)
     await kbuild.build()
     if hasattr(args, "package"):
         await kbuild.package(args.package_format, args.package)
