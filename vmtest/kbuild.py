@@ -11,9 +11,9 @@ import shlex
 import shutil
 import sys
 import tempfile
-from typing import IO, Any, Optional, Tuple, Union
+from typing import IO, Any, Mapping, NamedTuple, Optional, Sequence, Tuple, Union
 
-from util import nproc
+from util import KernelVersion, nproc
 from vmtest.asynciosubprocess import (
     CalledProcessError,
     check_call,
@@ -26,14 +26,122 @@ from vmtest.config import (
     HOST_ARCHITECTURE,
     KERNEL_FLAVORS,
     Architecture,
+    Compiler,
     KernelFlavor,
     kconfig,
+    kconfig_localversion,
 )
+from vmtest.download import COMPILER_URL, DownloadCompiler, download
 
 logger = logging.getLogger(__name__)
 
 
 _PACKAGE_FORMATS = ("tar.zst", "directory")
+
+
+class _Patch(NamedTuple):
+    name: str
+    # [inclusive, exclusive) ranges of kernel versions to apply this patch to.
+    # None means any version.
+    versions: Sequence[Tuple[Optional[KernelVersion], Optional[KernelVersion]]]
+
+
+_PATCHES = (
+    _Patch(
+        name="proc-kcore-allow-enabling-CONFIG_PROC_KCORE-on-ARM.patch",
+        versions=((None, None),),
+    ),
+    _Patch(
+        name="5.15-kbuild-Unify-options-for-BTF-generation-for-vmlinux.patch",
+        versions=((KernelVersion("5.13"), KernelVersion("5.15.66")),),
+    ),
+    _Patch(
+        name="5.12.19-bpf-Generate-BTF_KIND_FLOAT-when-linking-vmlinux.patch",
+        versions=((KernelVersion("5.12.10"), KernelVersion("5.13")),),
+    ),
+    _Patch(
+        name="5.10-bpf-Generate-BTF_KIND_FLOAT-when-linking-vmlinux.patch",
+        versions=((KernelVersion("5.11"), KernelVersion("5.12.10")),),
+    ),
+    _Patch(
+        name="5.10-kbuild-Quote-OBJCOPY-var-to-avoid-a-pahole-call-brea.patch",
+        versions=((KernelVersion("5.11"), KernelVersion("5.12.10")),),
+    ),
+    _Patch(
+        name="5.10-kbuild-skip-per-CPU-BTF-generation-for-pahole-v1.18-.patch",
+        versions=((KernelVersion("5.11"), KernelVersion("5.13")),),
+    ),
+    _Patch(
+        name="5.10-kbuild-Unify-options-for-BTF-generation-for-vmlinux.patch",
+        versions=((KernelVersion("5.11"), KernelVersion("5.13")),),
+    ),
+    _Patch(
+        name="kbuild-Add-skip_encoding_btf_enum64-option-to-pahole.patch",
+        versions=((KernelVersion("5.18"), KernelVersion("5.19.17")),),
+    ),
+    _Patch(
+        name="5.15-kbuild-Add-skip_encoding_btf_enum64-option-to-pahole.patch",
+        versions=(
+            (KernelVersion("5.16"), KernelVersion("5.18")),
+            (KernelVersion("5.13"), KernelVersion("5.15.66")),
+        ),
+    ),
+    _Patch(
+        name="5.10-kbuild-Add-skip_encoding_btf_enum64-option-to-pahole.patch",
+        versions=((KernelVersion("5.11"), KernelVersion("5.13")),),
+    ),
+    _Patch(
+        name="s390-mm-make-memory_block_size_bytes-available-for-M.patch",
+        versions=((KernelVersion("4.3"), KernelVersion("4.11")),),
+    ),
+)
+
+
+async def apply_patches(kernel_dir: Path) -> None:
+    patch_dir = Path(__file__).parent / "patches"
+    version = KernelVersion(
+        (await check_output("make", "-s", "kernelversion", cwd=kernel_dir))
+        .decode()
+        .strip()
+    )
+    logging.info("applying patches for kernel version %s", version)
+    any_applied = False
+    for patch in _PATCHES:
+        for min_version, max_version in patch.versions:
+            if (min_version is None or min_version <= version) and (
+                max_version is None or version < max_version
+            ):
+                break
+        else:
+            continue
+        logging.info("applying %s", patch.name)
+        any_applied = True
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "apply",
+            str(patch_dir / patch.name),
+            cwd=kernel_dir,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stderr = await proc.stderr.read()
+        if await proc.wait() != 0:
+            try:
+                await check_call(
+                    "git",
+                    "apply",
+                    "--reverse",
+                    "--check",
+                    str(patch_dir / patch.name),
+                    cwd=kernel_dir,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+            except CalledProcessError:
+                sys.stderr.buffer.write(stderr)
+                sys.stderr.buffer.flush()
+                raise
+            logging.info("already applied")
+    if not any_applied:
+        logging.info("no patches")
 
 
 class KBuild:
@@ -43,12 +151,14 @@ class KBuild:
         build_dir: Path,
         arch: Architecture,
         flavor: KernelFlavor,
+        env: Optional[Mapping[str, str]] = None,
         build_log_file: Union[int, IO[Any], None] = None,
     ) -> None:
         self._build_dir = build_dir
         self._kernel_dir = kernel_dir
         self._flavor = flavor
         self._arch = arch
+        self._env = env
         self._build_stdout = build_log_file
         self._build_stderr = (
             None if build_log_file is None else asyncio.subprocess.STDOUT
@@ -93,6 +203,7 @@ class KBuild:
                 "-C",
                 str(self._kernel_dir),
                 "ARCH=" + str(self._arch.kernel_arch),
+                "LOCALVERSION=" + kconfig_localversion(self._flavor),
                 "O=" + str(build_dir_real),
                 "KBUILD_ABS_SRCTREE=1",
                 "KBUILD_BUILD_USER=drgn",
@@ -112,7 +223,11 @@ class KBuild:
             self._cached_kernel_release = (
                 (
                     await check_output(
-                        "make", *self._cached_make_args, "-s", "kernelrelease"
+                        "make",
+                        *self._cached_make_args,
+                        "-s",
+                        "kernelrelease",
+                        env=self._env,
                     )
                 )
                 .decode()
@@ -121,7 +236,12 @@ class KBuild:
         return self._cached_kernel_release
 
     async def build(self) -> None:
-        logger.info("building %s kernel in %s", self._flavor.name, self._build_dir)
+        logger.info(
+            "building %s %s kernel in %s",
+            self._arch.name,
+            self._flavor.name,
+            self._build_dir,
+        )
         build_log_file_name = getattr(self._build_stdout, "name", None)
         if build_log_file_name is not None:
             logger.info("build logs in %s", build_log_file_name)
@@ -139,6 +259,7 @@ class KBuild:
             "olddefconfig",
             stdout=self._build_stdout,
             stderr=self._build_stderr,
+            env=self._env,
         )
         try:
             equal = filecmp.cmp(config, tmp_config)
@@ -161,34 +282,32 @@ class KBuild:
             "all",
             stdout=self._build_stdout,
             stderr=self._build_stderr,
+            env=self._env,
         )
-        logger.info("built kernel %s in %s", kernel_release, self._build_dir)
+        logger.info(
+            "built kernel %s for %s in %s",
+            kernel_release,
+            self._arch.name,
+            self._build_dir,
+        )
 
-    def _copy_module_build(self, modules_dir: Path) -> None:
+    def _copy_module_build(self, modules_build_dir: Path) -> None:
         logger.info("copying module build files")
-
-        # `make modules_install` creates these as symlinks to the absolute path
-        # of the source directory. Delete them, populate build, and make source
-        # a symlink to build.
-        modules_build_dir = modules_dir / "build"
-        modules_source_dir = modules_dir / "source"
-        modules_build_dir.unlink()
-        modules_build_dir.mkdir()
-        modules_source_dir.unlink()
-        modules_source_dir.symlink_to("build")
 
         # Files and directories (as glob patterns) required for external module
         # builds. This list was determined through trial and error.
-        files = (
+        files = [
             ".config",
             "Module.symvers",
             f"arch/{self._arch.kernel_srcarch}/Makefile",
+            f"arch/{self._arch.kernel_srcarch}/kernel/module.lds",
             "scripts/Kbuild.include",
             "scripts/Makefile*",
             "scripts/basic/fixdep",
             "scripts/check-local-export",
             "scripts/gcc-goto.sh",
             "scripts/gcc-version.sh",
+            "scripts/ld-version.sh",
             "scripts/mod/modpost",
             "scripts/module-common.lds",
             "scripts/module.lds",
@@ -196,8 +315,19 @@ class KBuild:
             "scripts/pahole-flags.sh",
             "scripts/pahole-version.sh",
             "scripts/subarch.include",
+            "tools/bpf/resolve_btfids/resolve_btfids",
             "tools/objtool/objtool",
-        )
+        ]
+        # Before Linux kernel commit bca8f17f57bd ("arm64: Get rid of
+        # asm/opcodes.h") (in v4.10), AArch64 includes this file from 32-bit
+        # Arm.
+        if self._arch.name == "aarch64":
+            files.append("arch/arm/include/asm/opcodes.h")
+        # Before Linux kernel commit efe0160cfd40 ("powerpc/64: Linker
+        # on-demand sfpr functions for modules") (in v4.13), this must be
+        # available to link into modules.
+        if self._arch.name == "ppc64":
+            files.append("arch/powerpc/lib/crtsavres.o")
         directories = (
             f"arch/{self._arch.kernel_srcarch}/include",
             "include",
@@ -233,7 +363,7 @@ class KBuild:
                         dirs_exist_ok=True,
                     )
 
-    async def _test_external_module_build(self, modules_dir: Path) -> None:
+    async def _test_external_module_build(self, modules_build_dir: Path) -> None:
         logger.info("testing external module build")
 
         with tempfile.TemporaryDirectory(
@@ -263,11 +393,14 @@ MODULE_LICENSE("GPL");
                 "make",
                 "ARCH=" + str(self._arch.kernel_arch),
                 "-C",
-                modules_dir / "build",
+                modules_build_dir,
                 f"M={test_module_dir.resolve()}",
             )
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=self._env,
             )
             try:
                 stdout_task = asyncio.create_task(proc.stdout.readline())
@@ -320,14 +453,15 @@ MODULE_LICENSE("GPL");
         package = output_dir / f"kernel-{kernel_release}.{self._arch.name}{extension}"
 
         logger.info(
-            "packaging kernel %s from %s to %s",
+            "packaging kernel %s for %s from %s to %s",
             kernel_release,
+            self._arch.name,
             self._build_dir,
             package,
         )
 
         image_name = (
-            (await check_output("make", *make_args, "-s", "image_name"))
+            (await check_output("make", *make_args, "-s", "image_name", env=self._env))
             .decode()
             .strip()
         )
@@ -346,25 +480,54 @@ MODULE_LICENSE("GPL");
                 "modules_install",
                 stdout=self._build_stdout,
                 stderr=self._build_stderr,
+                env=self._env,
             )
 
+            # `make modules_install` creates these as symlinks to the absolute
+            # path of the source directory. Delete them, make build a
+            # directory, and make source a symlink to build.
+            modules_build_dir = modules_dir / "build"
+            modules_source_dir = modules_dir / "source"
+            modules_build_dir.unlink()
+            modules_build_dir.mkdir()
+            modules_source_dir.unlink()
+            modules_source_dir.symlink_to("build")
+
             logger.info("copying vmlinux")
-            vmlinux = modules_dir / "vmlinux"
+            vmlinux = modules_build_dir / "vmlinux"
             await check_call(
-                os.environ.get("CROSS_COMPILE", "") + "objcopy",
+                (os.environ if self._env is None else self._env).get(
+                    "CROSS_COMPILE", ""
+                )
+                + "objcopy",
                 "--remove-relocations=*",
                 self._build_dir / "vmlinux",
                 str(vmlinux),
+                env=self._env,
             )
             vmlinux.chmod(0o644)
 
             logger.info("copying vmlinuz")
             vmlinuz = modules_dir / "vmlinuz"
-            shutil.copy(self._build_dir / image_name, vmlinuz)
+            try:
+                shutil.copy(self._build_dir / image_name, vmlinuz)
+            except FileNotFoundError:
+                # Before Linux kernel commits 06995804b576 ("arm64: Use full
+                # path in KBUILD_IMAGE definition") and 152e6744ebfc ("arm: Use
+                # full path in KBUILD_IMAGE definition") (in v4.12), image_name
+                # may be relative to the architecture boot directory.
+                shutil.copy(
+                    self._build_dir
+                    / "arch"
+                    / self._arch.kernel_srcarch
+                    / "boot"
+                    / image_name,
+                    vmlinuz,
+                )
             vmlinuz.chmod(0o644)
 
-            self._copy_module_build(modules_dir)
-            await self._test_external_module_build(modules_dir)
+            self._copy_module_build(modules_build_dir)
+            await self._test_external_module_build(modules_build_dir)
 
             package.parent.mkdir(parents=True, exist_ok=True)
             if format == "directory":
@@ -392,7 +555,11 @@ MODULE_LICENSE("GPL");
                     raise CalledProcessError(zstd_returncode, zstd_cmd)
 
         logger.info(
-            "packaged kernel %s from %s to %s", kernel_release, self._build_dir, package
+            "packaged kernel %s for %s from %s to %s",
+            kernel_release,
+            self._arch.name,
+            self._build_dir,
+            package,
         )
         return package
 
@@ -437,6 +604,11 @@ async def main() -> None:
         default=_PACKAGE_FORMATS[0],
     )
     parser.add_argument(
+        "--patch",
+        action="store_true",
+        help="apply patches to kernel source tree",
+    )
+    parser.add_argument(
         "-a",
         "--architecture",
         choices=sorted(ARCHITECTURES),
@@ -457,6 +629,15 @@ async def main() -> None:
         ),
         default=next(iter(KERNEL_FLAVORS)),
     )
+    default_download_compiler_directory = Path("build/vmtest")
+    parser.add_argument(
+        "--download-compiler",
+        metavar="DIR",
+        nargs="?",
+        default=argparse.SUPPRESS,
+        type=Path,
+        help=f"download a compiler from {COMPILER_URL} to the given directory ({default_download_compiler_directory} by default) and use it to build",
+    )
     parser.add_argument(
         "--dump-kconfig",
         action="store_true",
@@ -471,7 +652,19 @@ async def main() -> None:
         sys.stdout.write(kconfig(arch, flavor))
         return
 
-    kbuild = KBuild(args.kernel_directory, args.build_directory, arch, flavor)
+    if hasattr(args, "download_compiler"):
+        if args.download_compiler is None:
+            args.download_compiler = default_download_compiler_directory
+        downloaded = next(download(args.download_compiler, [DownloadCompiler(arch)]))
+        assert isinstance(downloaded, Compiler)
+        env = {**os.environ, **downloaded.env()}
+    else:
+        env = None
+
+    if args.patch:
+        await apply_patches(args.kernel_directory)
+
+    kbuild = KBuild(args.kernel_directory, args.build_directory, arch, flavor, env)
     await kbuild.build()
     if hasattr(args, "package"):
         await kbuild.package(args.package_format, args.package)

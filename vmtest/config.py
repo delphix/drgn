@@ -4,11 +4,14 @@
 
 from collections import OrderedDict
 import inspect
-from typing import Mapping, NamedTuple
+import os
+from pathlib import Path
+from typing import Dict, Mapping, NamedTuple, Sequence
 
 from util import NORMALIZED_MACHINE_NAME
 
-VMTEST_KERNEL_VERSION = 18
+KERNEL_ORG_COMPILER_VERSION = "12.2.0"
+VMTEST_KERNEL_VERSION = 19
 
 
 BASE_KCONFIG = """
@@ -166,7 +169,8 @@ KERNEL_FLAVORS = OrderedDict(
 
 
 class Architecture(NamedTuple):
-    # Name matching NORMALIZED_MACHINE_NAME.
+    # Architecture name. This matches the names used by
+    # util.NORMALIZED_MACHINE_NAME and qemu-system-$arch_name.
     name: str
     # Value of ARCH variable to build the Linux kernel.
     kernel_arch: str
@@ -176,11 +180,104 @@ class Architecture(NamedTuple):
     kernel_config: str
     # Flavor-specific Linux kernel configuration options.
     kernel_flavor_configs: Mapping[str, str]
+    # Name of compiler target on
+    # https://mirrors.kernel.org/pub/tools/crosstool/.
+    kernel_org_compiler_name: str
+    # Options to pass to QEMU.
+    qemu_options: Sequence[str]
+    # Console device when using QEMU.
+    qemu_console: str
 
 
 ARCHITECTURES = {
     arch.name: arch
     for arch in (
+        Architecture(
+            name="aarch64",
+            kernel_arch="arm64",
+            kernel_srcarch="arm64",
+            kernel_config="""
+                CONFIG_PCI_HOST_GENERIC=y
+                CONFIG_RTC_CLASS=y
+                CONFIG_RTC_DRV_PL031=y
+                CONFIG_SERIAL_AMBA_PL011=y
+                CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+            """,
+            kernel_flavor_configs={
+                "default": """
+                    CONFIG_ARM64_4K_PAGES=y
+                    CONFIG_ARM64_VA_BITS_48=y
+                """,
+                "alternative": """
+                    CONFIG_ARM64_64K_PAGES=y
+                    CONFIG_ARM64_VA_BITS_52=y
+                    CONFIG_ARM64_PA_BITS_52=y
+                """,
+                "tiny": """
+                    CONFIG_ARM64_16K_PAGES=y
+                """,
+            },
+            kernel_org_compiler_name="aarch64-linux",
+            qemu_options=("-M", "virt", "-cpu", "cortex-a57"),
+            qemu_console="ttyAMA0",
+        ),
+        Architecture(
+            name="arm",
+            kernel_arch="arm",
+            kernel_srcarch="arm",
+            kernel_config="""
+                CONFIG_NR_CPUS=8
+                CONFIG_HIGHMEM=y
+                # Debian armhf userspace assumes EABI and VFP.
+                CONFIG_AEABI=y
+                CONFIG_VFP=y
+                CONFIG_ARCH_VIRT=y
+                CONFIG_PCI_HOST_GENERIC=y
+                CONFIG_RTC_CLASS=y
+                CONFIG_RTC_DRV_PL031=y
+                CONFIG_SERIAL_AMBA_PL011=y
+                CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+                # Before Linux kernel commit f05eb1d24eb5 ("ARM:
+                # stackprotector: prefer compiler for TLS based per-task
+                # protector") (in v5.18), this enables the
+                # arm_ssp_per_task_plugin GCC plugin, which fails to build with
+                # the kernel.org cross compiler.
+                CONFIG_STACKPROTECTOR_PER_TASK=n
+            """,
+            kernel_flavor_configs={},
+            kernel_org_compiler_name="arm-linux-gnueabi",
+            qemu_options=("-M", "virt"),
+            qemu_console="ttyAMA0",
+        ),
+        Architecture(
+            name="ppc64",
+            kernel_arch="powerpc",
+            kernel_srcarch="powerpc",
+            kernel_config="""
+                CONFIG_PPC64=y
+                CONFIG_CPU_LITTLE_ENDIAN=y
+                # Debian ppc64el userspace assumes AltiVec and VSX support.
+                CONFIG_ALTIVEC=y
+                CONFIG_VSX=y
+                CONFIG_RTC_CLASS=y
+                CONFIG_RTC_DRV_GENERIC=y
+                CONFIG_HVC_CONSOLE=y
+            """,
+            kernel_flavor_configs={},
+            kernel_org_compiler_name="powerpc64-linux",
+            qemu_options=(),
+            qemu_console="hvc0",
+        ),
+        Architecture(
+            name="s390x",
+            kernel_arch="s390",
+            kernel_srcarch="s390",
+            kernel_config="",
+            kernel_flavor_configs={},
+            kernel_org_compiler_name="s390-linux",
+            qemu_options=(),
+            qemu_console="ttysclp0",
+        ),
         Architecture(
             name="x86_64",
             kernel_arch="x86_64",
@@ -190,12 +287,38 @@ ARCHITECTURES = {
                 CONFIG_SERIAL_8250_CONSOLE=y
             """,
             kernel_flavor_configs={},
+            kernel_org_compiler_name="x86_64-linux",
+            qemu_options=("-nodefaults",),
+            qemu_console="ttyS0",
         ),
     )
 }
 
 
 HOST_ARCHITECTURE = ARCHITECTURES.get(NORMALIZED_MACHINE_NAME)
+
+
+class Kernel(NamedTuple):
+    arch: Architecture
+    release: str
+    path: Path
+
+
+class Compiler(NamedTuple):
+    target: Architecture
+    bin: Path
+    prefix: str
+
+    def env(self) -> Dict[str, str]:
+        path = str(self.bin.resolve())
+        try:
+            path += ":" + os.environ["PATH"]
+        except KeyError:
+            pass
+        return {
+            "PATH": path,
+            "CROSS_COMPILE": self.prefix,
+        }
 
 
 def kconfig_localversion(flavor: KernelFlavor) -> str:
@@ -211,7 +334,8 @@ def kconfig(arch: Architecture, flavor: KernelFlavor) -> str:
 # Minimal Linux kernel configuration for booting into vmtest and running drgn
 # tests ({arch.name} {flavor.name} flavor).
 
-CONFIG_LOCALVERSION="{kconfig_localversion(flavor)}"
+CONFIG_LOCALVERSION=""
+CONFIG_LOCALVERSION_AUTO=n
 
 # base options
 
