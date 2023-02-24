@@ -11,7 +11,7 @@ from typing import Dict, Mapping, NamedTuple, Sequence
 from util import NORMALIZED_MACHINE_NAME
 
 KERNEL_ORG_COMPILER_VERSION = "12.2.0"
-VMTEST_KERNEL_VERSION = 19
+VMTEST_KERNEL_VERSION = 20
 
 
 BASE_KCONFIG = """
@@ -97,6 +97,9 @@ CONFIG_IKCONFIG_PROC=y
 CONFIG_BTRFS_FS=m
 CONFIG_EXT4_FS=m
 CONFIG_XFS_FS=m
+
+# For mm tests.
+CONFIG_HUGETLBFS=y
 
 # For net tests.
 CONFIG_NAMESPACES=y
@@ -228,6 +231,7 @@ ARCHITECTURES = {
             kernel_config="""
                 CONFIG_NR_CPUS=8
                 CONFIG_HIGHMEM=y
+                CONFIG_ARM_LPAE=n
                 # Debian armhf userspace assumes EABI and VFP.
                 CONFIG_AEABI=y
                 CONFIG_VFP=y
@@ -244,7 +248,11 @@ ARCHITECTURES = {
                 # the kernel.org cross compiler.
                 CONFIG_STACKPROTECTOR_PER_TASK=n
             """,
-            kernel_flavor_configs={},
+            kernel_flavor_configs={
+                "alternative": """
+                    CONFIG_ARM_LPAE=y
+                """,
+            },
             kernel_org_compiler_name="arm-linux-gnueabi",
             qemu_options=("-M", "virt"),
             qemu_console="ttyAMA0",
@@ -272,7 +280,10 @@ ARCHITECTURES = {
             name="s390x",
             kernel_arch="s390",
             kernel_srcarch="s390",
-            kernel_config="",
+            kernel_config="""
+                # Needed for CONFIG_KEXEC_FILE.
+                CONFIG_CRYPTO_SHA256_S390=y
+            """,
             kernel_flavor_configs={},
             kernel_org_compiler_name="s390-linux",
             qemu_options=(),
@@ -283,6 +294,8 @@ ARCHITECTURES = {
             kernel_arch="x86_64",
             kernel_srcarch="x86",
             kernel_config="""
+                CONFIG_RTC_CLASS=y
+                CONFIG_RTC_DRV_CMOS=y
                 CONFIG_SERIAL_8250=y
                 CONFIG_SERIAL_8250_CONSOLE=y
             """,

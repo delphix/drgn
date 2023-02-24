@@ -6,6 +6,7 @@ import ctypes
 import mmap
 import os
 import struct
+import sys
 import tempfile
 import unittest
 
@@ -43,6 +44,7 @@ from drgn.helpers.linux.pid import find_task
 from tests.linux_kernel import (
     LinuxKernelTestCase,
     mlock,
+    prng32,
     skip_unless_have_full_mm_support,
     skip_unless_have_test_kmod,
 )
@@ -143,28 +145,24 @@ class TestMm(LinuxKernelTestCase):
             page = pfn_to_page(self.prog, pfns[0])
             self.assertIn("PG_swapbacked", decode_page_flags(page))
 
-    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_PFN_PHYS(self):
         self.assertEqual(
             PFN_PHYS(self.prog["drgn_test_pfn"]), self.prog["drgn_test_pa"]
         )
 
-    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_PHYS_PFN(self):
         self.assertEqual(
             PHYS_PFN(self.prog["drgn_test_pa"]), self.prog["drgn_test_pfn"]
         )
 
-    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_page_to_pfn(self):
         self.assertEqual(
             page_to_pfn(self.prog["drgn_test_page"]), self.prog["drgn_test_pfn"]
         )
 
-    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_page_to_phys(self):
         self.assertEqual(
@@ -178,7 +176,6 @@ class TestMm(LinuxKernelTestCase):
             page_to_virt(self.prog["drgn_test_page"]), self.prog["drgn_test_va"]
         )
 
-    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_pfn_to_page(self):
         self.assertEqual(
@@ -192,7 +189,6 @@ class TestMm(LinuxKernelTestCase):
             pfn_to_virt(self.prog["drgn_test_pfn"]), self.prog["drgn_test_va"]
         )
 
-    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_phys_to_page(self):
         self.assertEqual(
@@ -227,13 +223,16 @@ class TestMm(LinuxKernelTestCase):
             virt_to_phys(self.prog["drgn_test_va"]), self.prog["drgn_test_pa"]
         )
 
+    @skip_unless_have_test_kmod
     def test_read_physical(self):
-        with self._pages() as (map, _, pfns):
-            for i, pfn in enumerate(pfns):
-                self.assertEqual(
-                    self.prog.read(pfn * mmap.PAGESIZE, mmap.PAGESIZE, True),
-                    map[i * mmap.PAGESIZE : (i + 1) * mmap.PAGESIZE],
-                )
+        expected = bytearray()
+        for x in prng32("PAGE"):
+            expected.extend(x.to_bytes(4, sys.byteorder))
+            if len(expected) >= mmap.PAGESIZE:
+                break
+        self.assertEqual(
+            self.prog.read(self.prog["drgn_test_pa"], mmap.PAGESIZE, True), expected
+        )
 
     @skip_unless_have_full_mm_support
     def test_access_process_vm(self):
