@@ -56,23 +56,19 @@ _PATCHES = (
         versions=((KernelVersion("5.13"), KernelVersion("5.15.66")),),
     ),
     _Patch(
-        name="5.12.19-bpf-Generate-BTF_KIND_FLOAT-when-linking-vmlinux.patch",
-        versions=((KernelVersion("5.12.10"), KernelVersion("5.13")),),
-    ),
-    _Patch(
-        name="5.10-bpf-Generate-BTF_KIND_FLOAT-when-linking-vmlinux.patch",
+        name="5.12-kbuild-Quote-OBJCOPY-var-to-avoid-a-pahole-call-brea.patch",
         versions=((KernelVersion("5.11"), KernelVersion("5.12.10")),),
     ),
     _Patch(
-        name="5.10-kbuild-Quote-OBJCOPY-var-to-avoid-a-pahole-call-brea.patch",
-        versions=((KernelVersion("5.11"), KernelVersion("5.12.10")),),
+        name="5.11-bpf-Generate-BTF_KIND_FLOAT-when-linking-vmlinux.patch",
+        versions=((KernelVersion("5.11"), KernelVersion("5.13")),),
     ),
     _Patch(
         name="5.10-kbuild-skip-per-CPU-BTF-generation-for-pahole-v1.18-.patch",
         versions=((KernelVersion("5.11"), KernelVersion("5.13")),),
     ),
     _Patch(
-        name="5.10-kbuild-Unify-options-for-BTF-generation-for-vmlinux.patch",
+        name="5.11-kbuild-Unify-options-for-BTF-generation-for-vmlinux.patch",
         versions=((KernelVersion("5.11"), KernelVersion("5.13")),),
     ),
     _Patch(
@@ -93,6 +89,18 @@ _PATCHES = (
     _Patch(
         name="s390-mm-make-memory_block_size_bytes-available-for-M.patch",
         versions=((KernelVersion("4.3"), KernelVersion("4.11")),),
+    ),
+    _Patch(
+        name="libsubcmd-Fix-use-after-free-for-realloc-.-0.patch",
+        versions=(
+            (KernelVersion("5.16"), KernelVersion("5.16.11")),
+            (KernelVersion("5.11"), KernelVersion("5.15.25")),
+            (KernelVersion("5.5"), KernelVersion("5.10.102")),
+            (KernelVersion("4.20"), KernelVersion("5.4.181")),
+            (KernelVersion("4.15"), KernelVersion("4.19.231")),
+            (KernelVersion("4.10"), KernelVersion("4.14.268")),
+            (KernelVersion("4.5"), KernelVersion("4.9.303")),
+        ),
     ),
 )
 
