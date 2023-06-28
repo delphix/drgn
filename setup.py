@@ -2,15 +2,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-# setuptools must be imported before distutils (see pypa/setuptools#2230).
-import setuptools  # isort: skip  # noqa: F401
-
 import contextlib
-from distutils import log
-from distutils.command.build import build as _build
-from distutils.dir_util import mkpath
-from distutils.errors import DistutilsError
-from distutils.file_util import copy_file
+import logging
 import os
 import os.path
 from pathlib import Path
@@ -25,7 +18,23 @@ from setuptools.command.egg_info import egg_info as _egg_info
 from setuptools.command.sdist import sdist as _sdist
 from setuptools.extension import Extension
 
+# setuptools must be imported before distutils (see pypa/setuptools#2230), so
+# make sure to keep these fallbacks after the other setuptools imports.
+try:
+    # This was added in setuptools 62.4.0 (released June 13th, 2022).
+    from setuptools.command.build import build as _build
+except ImportError:
+    from distutils.command.build import build as _build
+try:
+    # This was added in setuptools 59.0.0 (released November 12th, 2021).
+    from setuptools.errors import BaseError
+except ImportError:
+    from distutils.errors import DistutilsError as BaseError
+
 from util import nproc, out_of_date
+from vmtest.config import KERNEL_FLAVORS, SUPPORTED_KERNEL_VERSIONS
+
+logger = logging.getLogger(__name__)
 
 
 class build(_build):
@@ -59,7 +68,7 @@ class build_ext(_build_ext):
                 raise
 
     def _run_configure(self):
-        mkpath(self.build_temp)
+        self.mkpath(self.build_temp)
         makefile = os.path.join(self.build_temp, "Makefile")
         if not os.path.exists(makefile):
             args = [
@@ -98,11 +107,11 @@ class build_ext(_build_ext):
         self.make()
         so = os.path.join(self.build_temp, ".libs/_drgn.so")
         if self.inplace:
-            copy_file(so, self.get_ext_fullpath("_drgn"), update=True)
+            self.copy_file(so, self.get_ext_fullpath("_drgn"))
         old_inplace, self.inplace = self.inplace, 0
         build_path = self.get_ext_fullpath("_drgn")
-        mkpath(os.path.dirname(build_path))
-        copy_file(so, build_path, update=True)
+        self.mkpath(os.path.dirname(build_path))
+        self.copy_file(so, build_path)
         self.inplace = old_inplace
 
 
@@ -130,36 +139,12 @@ class sdist(_sdist):
 class test(Command):
     description = "run unit tests after in-place build"
 
-    KERNELS = [
-        "6.4",
-        "6.3",
-        "6.2",
-        "6.1",
-        "6.0",
-        "5.19",
-        "5.18",
-        "5.17",
-        "5.16",
-        "5.15",
-        "5.14",
-        "5.13",
-        "5.12",
-        "5.11",
-        "5.10",
-        "5.4",
-        "4.19",
-        "4.14",
-        "4.9",
-    ]
-
-    KERNEL_FLAVORS = ["default", "alternative", "tiny"]
-
     user_options = [
         (
             "kernel",
             "K",
             "run Linux kernel tests in a virtual machine on all supported kernels "
-            f"({', '.join(KERNELS)})",
+            f"({', '.join(SUPPORTED_KERNEL_VERSIONS)})",
         ),
         (
             "all-kernel-flavors",
@@ -189,9 +174,11 @@ class test(Command):
     def finalize_options(self):
         self.kernels = [kernel for kernel in self.extra_kernels.split(",") if kernel]
         if self.kernel:
-            flavors = test.KERNEL_FLAVORS if self.all_kernel_flavors else [""]
+            flavors = KERNEL_FLAVORS if self.all_kernel_flavors else [""]
             self.kernels.extend(
-                kernel + ".*" + flavor for kernel in test.KERNELS for flavor in flavors
+                kernel + ".*" + flavor
+                for kernel in SUPPORTED_KERNEL_VERSIONS
+                for flavor in flavors
             )
         if self.vmtest_dir is None:
             build_base = self.get_finalized_command("build").build_base
@@ -210,7 +197,7 @@ class test(Command):
         from vmtest.kmod import build_kmod
         import vmtest.vm
 
-        self.announce(f"running tests in VM on Linux {kernel.release}", log.INFO)
+        logger.info("running tests in VM on Linux %s", kernel.release)
 
         kmod = kernel.path.parent / f"drgn_test-{kernel.release}.ko"
         try:
@@ -238,12 +225,10 @@ fi
             returncode = vmtest.vm.run_in_vm(
                 command, kernel, Path("/"), Path(self.vmtest_dir)
             )
-        except vmtest.vm.LostVMError as e:
-            self.announce(f"error on Linux {kernel.release}: {e}", log.ERROR)
+        except vmtest.vm.LostVMError:
+            logger.exception("error on Linux %s", kernel.release)
             return False
-        self.announce(
-            f"Tests in VM on Linux {kernel.release} returned {returncode}", log.INFO
-        )
+        logger.info("Tests in VM on Linux %s returned %d", kernel.release, returncode)
         return returncode == 0
 
     def run(self):
@@ -278,7 +263,7 @@ fi
                     to_downlad.append(DownloadKernel(ARCHITECTURES["x86_64"], pattern))
             with download_in_thread(Path(self.vmtest_dir), to_downlad) as downloads:
                 if self.kernels:
-                    self.announce("downloading kernels in the background", log.INFO)
+                    logger.info("downloading kernels in the background")
 
                 with github_workflow_group("Build extension"):
                     self.run_command("egg_info")
@@ -290,7 +275,7 @@ fi
 
                 with github_workflow_group("Run unit tests"):
                     if self.kernels:
-                        self.announce("running tests locally", log.INFO)
+                        logger.info("running tests locally")
                     if self._run_local():
                         passed.append("local")
                     else:
@@ -308,9 +293,9 @@ fi
                             failed.append(kernel.release)
 
                     if passed:
-                        self.announce(f'Passed: {", ".join(passed)}', log.INFO)
+                        logger.info("Passed: %s", ", ".join(passed))
                     if failed:
-                        self.announce(f'Failed: {", ".join(failed)}', log.ERROR)
+                        logger.error("Failed: %s", ", ".join(failed))
         except urllib.error.HTTPError as e:
             if e.code == 403:
                 print(e, file=sys.stderr)
@@ -319,9 +304,9 @@ fi
             raise
 
         if failed:
-            raise DistutilsError("some tests failed")
+            raise BaseError("some tests failed")
         else:
-            self.announce("all tests passed", log.INFO)
+            logger.info("all tests passed")
 
 
 def get_version():
@@ -368,7 +353,7 @@ def get_version():
                 )
             )
         except subprocess.CalledProcessError:
-            log.warn("warning: v%s tag not found", public_version)
+            logger.warning("warning: v%s tag not found", public_version)
         else:
             if count == 0:
                 local_version = "+dirty" if dirty else ""
@@ -382,7 +367,7 @@ def get_version():
     else:
         if version_py is None:
             # This isn't a proper sdist (maybe a git archive).
-            log.warn("warning: drgn/internal/version.py not found")
+            logger.warning("warning: drgn/internal/version.py not found")
         else:
             # The saved version must start with the public version.
             match = re.search(
@@ -393,7 +378,7 @@ def get_version():
             if match:
                 local_version = match.group(1)
             else:
-                log.warn("warning: drgn/internal/version.py is invalid")
+                logger.warning("warning: drgn/internal/version.py is invalid")
 
     version = public_version + local_version
     # Update version.py if necessary.
