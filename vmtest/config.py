@@ -16,6 +16,7 @@ from util import NORMALIZED_MACHINE_NAME
 # keep support for EOL versions until it becomes too difficult to do so.
 # Anything else is not tested and therefore best-effort.
 SUPPORTED_KERNEL_VERSIONS = (
+    "6.5",
     "6.4",
     "6.3",
     "6.2",
@@ -281,7 +282,7 @@ ARCHITECTURES = {
                 """,
             },
             kernel_org_compiler_name="arm-linux-gnueabi",
-            qemu_options=("-M", "virt"),
+            qemu_options=("-M", "virt,highmem=off"),
             qemu_console="ttyAMA0",
         ),
         Architecture(
@@ -297,6 +298,9 @@ ARCHITECTURES = {
                 CONFIG_RTC_CLASS=y
                 CONFIG_RTC_DRV_GENERIC=y
                 CONFIG_HVC_CONSOLE=y
+                # This has a missing dependency in v6.5-rc1 that causes a build
+                # failure, and we don't need it.
+                CONFIG_CRYPTO_AES_GCM_P10=n
             """,
             kernel_flavor_configs={},
             kernel_org_compiler_name="powerpc64-linux",
