@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 import functools
+import logging
 import operator
 import os.path
 import re
@@ -29,8 +30,14 @@ from tests import (
     identical,
 )
 import tests.assembler as assembler
-from tests.dwarf import DW_AT, DW_ATE, DW_END, DW_FORM, DW_LANG, DW_OP, DW_TAG
-from tests.dwarfwriter import DwarfAttrib, DwarfDie, DwarfLabel, compile_dwarf
+from tests.dwarf import DW_AT, DW_ATE, DW_END, DW_FORM, DW_LANG, DW_OP, DW_TAG, DW_UT
+from tests.dwarfwriter import (
+    DwarfAttrib,
+    DwarfDie,
+    DwarfLabel,
+    DwarfUnit,
+    compile_dwarf,
+)
 
 bool_die = DwarfDie(
     DW_TAG.base_type,
@@ -725,84 +732,19 @@ class TestTypes(TestCase):
         )
 
     def test_incomplete_to_complete(self):
-        prog = dwarf_program(
-            wrap_test_type_dies(
-                DwarfDie(
-                    DW_TAG.pointer_type,
-                    (
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"),
-                    ),
-                ),
-                DwarfLabel("incomplete_struct_die"),
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.declaration, DW_FORM.flag_present, True),
-                    ),
-                ),
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "foo.c"),
-                    ),
-                    (
+        for version in (4, 5):
+            with self.subTest(version=version):
+                prog = dwarf_program(
+                    wrap_test_type_dies(
                         DwarfDie(
-                            DW_TAG.member,
+                            DW_TAG.pointer_type,
                             (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
                                 DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 0
+                                    DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"
                                 ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
                             ),
                         ),
-                        DwarfDie(
-                            DW_TAG.member,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
-                                DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 4
-                                ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
-                            ),
-                        ),
-                    ),
-                ),
-                *labeled_int_die,
-            )
-        )
-        self.assertIdentical(
-            prog.type("TEST").type,
-            prog.pointer_type(
-                prog.struct_type(
-                    "point",
-                    8,
-                    (
-                        TypeMember(prog.int_type("int", 4, True), "x"),
-                        TypeMember(prog.int_type("int", 4, True), "y", 32),
-                    ),
-                )
-            ),
-        )
-
-    def test_incomplete_to_complete_namespace(self):
-        prog = dwarf_program(
-            wrap_test_type_dies(
-                DwarfDie(
-                    DW_TAG.pointer_type,
-                    (
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"),
-                    ),
-                ),
-                DwarfDie(
-                    DW_TAG.namespace,
-                    (DwarfAttrib(DW_AT.name, DW_FORM.string, "Math"),),
-                    (
                         DwarfLabel("incomplete_struct_die"),
                         DwarfDie(
                             DW_TAG.structure_type,
@@ -813,12 +755,6 @@ class TestTypes(TestCase):
                                 ),
                             ),
                         ),
-                    ),
-                ),
-                DwarfDie(
-                    DW_TAG.namespace,
-                    (DwarfAttrib(DW_AT.name, DW_FORM.string, "Math"),),
-                    (
                         DwarfDie(
                             DW_TAG.structure_type,
                             (
@@ -832,9 +768,7 @@ class TestTypes(TestCase):
                                     (
                                         DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
                                         DwarfAttrib(
-                                            DW_AT.data_member_location,
-                                            DW_FORM.data1,
-                                            0,
+                                            DW_AT.data_member_location, DW_FORM.data1, 0
                                         ),
                                         DwarfAttrib(
                                             DW_AT.type, DW_FORM.ref4, "int_die"
@@ -846,9 +780,245 @@ class TestTypes(TestCase):
                                     (
                                         DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
                                         DwarfAttrib(
-                                            DW_AT.data_member_location,
-                                            DW_FORM.data1,
-                                            4,
+                                            DW_AT.data_member_location, DW_FORM.data1, 4
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                        *labeled_int_die,
+                    ),
+                    version=version,
+                )
+                self.assertIdentical(
+                    prog.type("TEST").type,
+                    prog.pointer_type(
+                        prog.struct_type(
+                            "point",
+                            8,
+                            (
+                                TypeMember(prog.int_type("int", 4, True), "x"),
+                                TypeMember(prog.int_type("int", 4, True), "y", 32),
+                            ),
+                        )
+                    ),
+                )
+
+    def test_incomplete_to_complete_namespace(self):
+        for version in (4, 5):
+            with self.subTest(version=version):
+                prog = dwarf_program(
+                    wrap_test_type_dies(
+                        DwarfDie(
+                            DW_TAG.pointer_type,
+                            (
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                                DwarfAttrib(
+                                    DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"
+                                ),
+                            ),
+                        ),
+                        DwarfDie(
+                            DW_TAG.namespace,
+                            (DwarfAttrib(DW_AT.name, DW_FORM.string, "Math"),),
+                            (
+                                DwarfLabel("incomplete_struct_die"),
+                                DwarfDie(
+                                    DW_TAG.structure_type,
+                                    (
+                                        DwarfAttrib(
+                                            DW_AT.name, DW_FORM.string, "point"
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.declaration,
+                                            DW_FORM.flag_present,
+                                            True,
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                        DwarfDie(
+                            DW_TAG.namespace,
+                            (DwarfAttrib(DW_AT.name, DW_FORM.string, "Math"),),
+                            (
+                                DwarfDie(
+                                    DW_TAG.structure_type,
+                                    (
+                                        DwarfAttrib(
+                                            DW_AT.name, DW_FORM.string, "point"
+                                        ),
+                                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                                        DwarfAttrib(
+                                            DW_AT.decl_file, DW_FORM.udata, "foo.c"
+                                        ),
+                                    ),
+                                    (
+                                        DwarfDie(
+                                            DW_TAG.member,
+                                            (
+                                                DwarfAttrib(
+                                                    DW_AT.name, DW_FORM.string, "x"
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.data_member_location,
+                                                    DW_FORM.data1,
+                                                    0,
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.type, DW_FORM.ref4, "int_die"
+                                                ),
+                                            ),
+                                        ),
+                                        DwarfDie(
+                                            DW_TAG.member,
+                                            (
+                                                DwarfAttrib(
+                                                    DW_AT.name, DW_FORM.string, "y"
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.data_member_location,
+                                                    DW_FORM.data1,
+                                                    4,
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.type, DW_FORM.ref4, "int_die"
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                        *labeled_int_die,
+                        # Incorrect structure we should not access
+                        DwarfDie(
+                            DW_TAG.structure_type,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                                DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "wrong.c"),
+                            ),
+                        ),
+                    ),
+                    lang=DW_LANG.C_plus_plus,
+                    version=version,
+                )
+                self.assertIdentical(
+                    prog.type("TEST").type,
+                    prog.pointer_type(
+                        prog.struct_type(
+                            "point",
+                            8,
+                            (
+                                TypeMember(
+                                    prog.int_type(
+                                        "int", 4, True, language=Language.CPP
+                                    ),
+                                    "x",
+                                ),
+                                TypeMember(
+                                    prog.int_type(
+                                        "int", 4, True, language=Language.CPP
+                                    ),
+                                    "y",
+                                    32,
+                                ),
+                            ),
+                            language=Language.CPP,
+                        ),
+                        language=Language.CPP,
+                    ),
+                )
+
+    def test_incomplete_to_complete_ambiguous(self):
+        for version in (4, 5):
+            with self.subTest(version=version):
+                prog = dwarf_program(
+                    wrap_test_type_dies(
+                        DwarfDie(
+                            DW_TAG.pointer_type,
+                            (
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                                DwarfAttrib(
+                                    DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"
+                                ),
+                            ),
+                        ),
+                        DwarfLabel("incomplete_struct_die"),
+                        DwarfDie(
+                            DW_TAG.structure_type,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
+                                DwarfAttrib(
+                                    DW_AT.declaration, DW_FORM.flag_present, True
+                                ),
+                            ),
+                        ),
+                        DwarfDie(
+                            DW_TAG.structure_type,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                                DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "foo.c"),
+                            ),
+                            (
+                                DwarfDie(
+                                    DW_TAG.member,
+                                    (
+                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                        DwarfAttrib(
+                                            DW_AT.data_member_location, DW_FORM.data1, 0
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                        ),
+                                    ),
+                                ),
+                                DwarfDie(
+                                    DW_TAG.member,
+                                    (
+                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
+                                        DwarfAttrib(
+                                            DW_AT.data_member_location, DW_FORM.data1, 4
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                        *labeled_int_die,
+                        DwarfDie(
+                            DW_TAG.structure_type,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                                DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "bar.c"),
+                            ),
+                            (
+                                DwarfDie(
+                                    DW_TAG.member,
+                                    (
+                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "a"),
+                                        DwarfAttrib(
+                                            DW_AT.data_member_location, DW_FORM.data1, 0
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                        ),
+                                    ),
+                                ),
+                                DwarfDie(
+                                    DW_TAG.member,
+                                    (
+                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "b"),
+                                        DwarfAttrib(
+                                            DW_AT.data_member_location, DW_FORM.data1, 4
                                         ),
                                         DwarfAttrib(
                                             DW_AT.type, DW_FORM.ref4, "int_die"
@@ -858,192 +1028,90 @@ class TestTypes(TestCase):
                             ),
                         ),
                     ),
-                ),
-                *labeled_int_die,
-                # Incorrect structure we should not access
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "wrong.c"),
-                    ),
-                ),
-            ),
-            lang=DW_LANG.C_plus_plus,
-        )
-        self.assertIdentical(
-            prog.type("TEST").type,
-            prog.pointer_type(
-                prog.struct_type(
-                    "point",
-                    8,
-                    (
-                        TypeMember(
-                            prog.int_type("int", 4, True, language=Language.CPP), "x"
-                        ),
-                        TypeMember(
-                            prog.int_type("int", 4, True, language=Language.CPP),
-                            "y",
-                            32,
-                        ),
-                    ),
-                    language=Language.CPP,
-                ),
-                language=Language.CPP,
-            ),
-        )
-
-    def test_incomplete_to_complete_ambiguous(self):
-        prog = dwarf_program(
-            wrap_test_type_dies(
-                DwarfDie(
-                    DW_TAG.pointer_type,
-                    (
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"),
-                    ),
-                ),
-                DwarfLabel("incomplete_struct_die"),
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.declaration, DW_FORM.flag_present, True),
-                    ),
-                ),
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "foo.c"),
-                    ),
-                    (
-                        DwarfDie(
-                            DW_TAG.member,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
-                                DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 0
-                                ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
-                            ),
-                        ),
-                        DwarfDie(
-                            DW_TAG.member,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
-                                DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 4
-                                ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
-                            ),
-                        ),
-                    ),
-                ),
-                *labeled_int_die,
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.decl_file, DW_FORM.udata, "bar.c"),
-                    ),
-                    (
-                        DwarfDie(
-                            DW_TAG.member,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "a"),
-                                DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 0
-                                ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
-                            ),
-                        ),
-                        DwarfDie(
-                            DW_TAG.member,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "b"),
-                                DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 4
-                                ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        )
-        self.assertIdentical(
-            prog.type("TEST").type, prog.pointer_type(prog.struct_type("point"))
-        )
+                    version=version,
+                )
+                self.assertIdentical(
+                    prog.type("TEST").type, prog.pointer_type(prog.struct_type("point"))
+                )
 
     def test_incomplete_to_complete_specification(self):
-        prog = dwarf_program(
-            wrap_test_type_dies(
-                DwarfDie(
-                    DW_TAG.pointer_type,
-                    (
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"),
-                    ),
-                ),
-                DwarfLabel("incomplete_struct_die"),
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                        DwarfAttrib(DW_AT.declaration, DW_FORM.flag_present, True),
-                    ),
-                ),
-                DwarfDie(
-                    DW_TAG.structure_type,
-                    (
-                        DwarfAttrib(
-                            DW_AT.specification, DW_FORM.ref4, "incomplete_struct_die"
-                        ),
-                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                    ),
-                    (
+        for version in (4, 5):
+            with self.subTest(version=version):
+                prog = dwarf_program(
+                    wrap_test_type_dies(
                         DwarfDie(
-                            DW_TAG.member,
+                            DW_TAG.pointer_type,
                             (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
                                 DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 0
+                                    DW_AT.type, DW_FORM.ref4, "incomplete_struct_die"
                                 ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                            ),
+                        ),
+                        DwarfLabel("incomplete_struct_die"),
+                        DwarfDie(
+                            DW_TAG.structure_type,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
+                                DwarfAttrib(
+                                    DW_AT.declaration, DW_FORM.flag_present, True
+                                ),
                             ),
                         ),
                         DwarfDie(
-                            DW_TAG.member,
+                            DW_TAG.structure_type,
                             (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
                                 DwarfAttrib(
-                                    DW_AT.data_member_location, DW_FORM.data1, 4
+                                    DW_AT.specification,
+                                    DW_FORM.ref4,
+                                    "incomplete_struct_die",
                                 ),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
+                            ),
+                            (
+                                DwarfDie(
+                                    DW_TAG.member,
+                                    (
+                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
+                                        DwarfAttrib(
+                                            DW_AT.data_member_location, DW_FORM.data1, 0
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                        ),
+                                    ),
+                                ),
+                                DwarfDie(
+                                    DW_TAG.member,
+                                    (
+                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
+                                        DwarfAttrib(
+                                            DW_AT.data_member_location, DW_FORM.data1, 4
+                                        ),
+                                        DwarfAttrib(
+                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                        ),
+                                    ),
+                                ),
                             ),
                         ),
+                        *labeled_int_die,
                     ),
-                ),
-                *labeled_int_die,
-            )
-        )
-        self.assertIdentical(
-            prog.type("TEST").type,
-            prog.pointer_type(
-                prog.struct_type(
-                    "point",
-                    8,
-                    (
-                        TypeMember(prog.int_type("int", 4, True), "x"),
-                        TypeMember(prog.int_type("int", 4, True), "y", 32),
+                    version=version,
+                )
+                self.assertIdentical(
+                    prog.type("TEST").type,
+                    prog.pointer_type(
+                        prog.struct_type(
+                            "point",
+                            8,
+                            (
+                                TypeMember(prog.int_type("int", 4, True), "x"),
+                                TypeMember(prog.int_type("int", 4, True), "y", 32),
+                            ),
+                        )
                     ),
                 )
-            ),
-        )
 
     def test_filename(self):
         dies = (
@@ -3718,125 +3786,177 @@ class TestTypes(TestCase):
         )
 
     def test_base_type_unit(self):
-        prog = dwarf_program(
-            (
-                DwarfDie(
-                    DW_TAG.compile_unit,
-                    (),
+        for version in (4, 5):
+            with self.subTest(version=version):
+                prog = dwarf_program(
                     (
-                        DwarfLabel("signature_die"),
-                        DwarfDie(
-                            DW_TAG.base_type,
-                            (
-                                DwarfAttrib(
-                                    DW_AT.signature, DW_FORM.ref_sig8, 0xDEADBEEF
+                        DwarfUnit(
+                            DW_UT.compile,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (),
+                                (
+                                    DwarfLabel("signature_die"),
+                                    DwarfDie(
+                                        DW_TAG.base_type,
+                                        (
+                                            DwarfAttrib(
+                                                DW_AT.signature,
+                                                DW_FORM.ref_sig8,
+                                                0xDEADBEEF,
+                                            ),
+                                        ),
+                                    ),
+                                    DwarfDie(
+                                        DW_TAG.typedef,
+                                        (
+                                            DwarfAttrib(
+                                                DW_AT.name, DW_FORM.string, "TEST"
+                                            ),
+                                            DwarfAttrib(
+                                                DW_AT.type,
+                                                DW_FORM.ref4,
+                                                "signature_die",
+                                            ),
+                                        ),
+                                    ),
                                 ),
                             ),
                         ),
-                        DwarfDie(
-                            DW_TAG.typedef,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "TEST"),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "signature_die"),
+                        DwarfUnit(
+                            DW_UT.type,
+                            DwarfDie(
+                                DW_TAG.type_unit,
+                                (),
+                                labeled_int_die,
                             ),
+                            type_signature=0xDEADBEEF,
+                            type_offset="int_die",
                         ),
                     ),
-                ),
-                DwarfDie(
-                    DW_TAG.type_unit,
-                    (),
-                    labeled_int_die,
-                    type_signature=0xDEADBEEF,
-                    type_offset="int_die",
-                ),
-            )
-        )
-        self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
-        self.assertIdentical(prog.type("int"), prog.type("TEST").type)
+                    version=version,
+                )
+                self.assertIdentical(
+                    prog.type("TEST").type, prog.int_type("int", 4, True)
+                )
+                self.assertIdentical(prog.type("int"), prog.type("TEST").type)
 
     def test_struct_type_unit(self):
-        prog = dwarf_program(
-            (
-                DwarfDie(
-                    DW_TAG.compile_unit,
-                    (),
+        for version in (4, 5):
+            with self.subTest(version=version):
+                prog = dwarf_program(
                     (
-                        DwarfLabel("signature_die"),
-                        DwarfDie(
-                            DW_TAG.structure_type,
-                            (
-                                DwarfAttrib(
-                                    DW_AT.signature, DW_FORM.ref_sig8, 0xDEADBEEF
-                                ),
-                            ),
-                        ),
-                        DwarfDie(
-                            DW_TAG.typedef,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "TEST"),
-                                DwarfAttrib(DW_AT.type, DW_FORM.ref4, "signature_die"),
-                            ),
-                        ),
-                    ),
-                ),
-                DwarfDie(
-                    DW_TAG.type_unit,
-                    (),
-                    (
-                        DwarfLabel("struct_die"),
-                        DwarfDie(
-                            DW_TAG.structure_type,
-                            (
-                                DwarfAttrib(DW_AT.name, DW_FORM.string, "point"),
-                                DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 8),
-                            ),
-                            (
-                                DwarfDie(
-                                    DW_TAG.member,
-                                    (
-                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "x"),
-                                        DwarfAttrib(
-                                            DW_AT.data_member_location, DW_FORM.data1, 0
-                                        ),
-                                        DwarfAttrib(
-                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                        DwarfUnit(
+                            DW_UT.compile,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (),
+                                (
+                                    DwarfLabel("signature_die"),
+                                    DwarfDie(
+                                        DW_TAG.structure_type,
+                                        (
+                                            DwarfAttrib(
+                                                DW_AT.signature,
+                                                DW_FORM.ref_sig8,
+                                                0xDEADBEEF,
+                                            ),
                                         ),
                                     ),
-                                ),
-                                DwarfDie(
-                                    DW_TAG.member,
-                                    (
-                                        DwarfAttrib(DW_AT.name, DW_FORM.string, "y"),
-                                        DwarfAttrib(
-                                            DW_AT.data_member_location, DW_FORM.data1, 4
-                                        ),
-                                        DwarfAttrib(
-                                            DW_AT.type, DW_FORM.ref4, "int_die"
+                                    DwarfDie(
+                                        DW_TAG.typedef,
+                                        (
+                                            DwarfAttrib(
+                                                DW_AT.name, DW_FORM.string, "TEST"
+                                            ),
+                                            DwarfAttrib(
+                                                DW_AT.type,
+                                                DW_FORM.ref4,
+                                                "signature_die",
+                                            ),
                                         ),
                                     ),
                                 ),
                             ),
                         ),
-                        *labeled_int_die,
+                        DwarfUnit(
+                            DW_UT.type,
+                            DwarfDie(
+                                DW_TAG.type_unit,
+                                (),
+                                (
+                                    DwarfLabel("struct_die"),
+                                    DwarfDie(
+                                        DW_TAG.structure_type,
+                                        (
+                                            DwarfAttrib(
+                                                DW_AT.name, DW_FORM.string, "point"
+                                            ),
+                                            DwarfAttrib(
+                                                DW_AT.byte_size, DW_FORM.data1, 8
+                                            ),
+                                        ),
+                                        (
+                                            DwarfDie(
+                                                DW_TAG.member,
+                                                (
+                                                    DwarfAttrib(
+                                                        DW_AT.name, DW_FORM.string, "x"
+                                                    ),
+                                                    DwarfAttrib(
+                                                        DW_AT.data_member_location,
+                                                        DW_FORM.data1,
+                                                        0,
+                                                    ),
+                                                    DwarfAttrib(
+                                                        DW_AT.type,
+                                                        DW_FORM.ref4,
+                                                        "int_die",
+                                                    ),
+                                                ),
+                                            ),
+                                            DwarfDie(
+                                                DW_TAG.member,
+                                                (
+                                                    DwarfAttrib(
+                                                        DW_AT.name, DW_FORM.string, "y"
+                                                    ),
+                                                    DwarfAttrib(
+                                                        DW_AT.data_member_location,
+                                                        DW_FORM.data1,
+                                                        4,
+                                                    ),
+                                                    DwarfAttrib(
+                                                        DW_AT.type,
+                                                        DW_FORM.ref4,
+                                                        "int_die",
+                                                    ),
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                    *labeled_int_die,
+                                ),
+                            ),
+                            type_signature=0xDEADBEEF,
+                            type_offset="struct_die",
+                        ),
                     ),
-                    type_signature=0xDEADBEEF,
-                    type_offset="struct_die",
-                ),
-            )
-        )
+                    version=version,
+                )
 
-        self.assertIdentical(
-            prog.type("TEST").type,
-            prog.struct_type(
-                "point",
-                8,
-                (
-                    TypeMember(prog.int_type("int", 4, True), "x", 0),
-                    TypeMember(prog.int_type("int", 4, True), "y", 32),
-                ),
-            ),
-        )
-        self.assertIdentical(prog.type("struct point"), prog.type("TEST").type)
+                self.assertIdentical(
+                    prog.type("TEST").type,
+                    prog.struct_type(
+                        "point",
+                        8,
+                        (
+                            TypeMember(prog.int_type("int", 4, True), "x", 0),
+                            TypeMember(prog.int_type("int", 4, True), "y", 32),
+                        ),
+                    ),
+                )
+                self.assertIdentical(prog.type("struct point"), prog.type("TEST").type)
 
     def test_namespaces(self):
         def make_composite_die(tag: DW_TAG, name: str) -> DwarfDie:
@@ -6500,3 +6620,253 @@ class TestCompressedDebugSections(TestCase):
     def test_zlib_gabi(self):
         prog = dwarf_program(wrap_test_type_dies(int_die), compress="zlib-gabi")
         self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
+
+
+class TestSplitDwarf(TestCase):
+    def test_dwo4(self):
+        prog = Program()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "split.dwo"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.split_compile,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_id,
+                                        DW_FORM.data8,
+                                        0xDDEEAADDBBEEFFFF,
+                                    ),
+                                ),
+                                wrap_test_type_dies(int_die),
+                            ),
+                        ),
+                        split="dwo",
+                    )
+                )
+            with open(os.path.join(temp_dir, "skeleton"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.skeleton,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_name, DW_FORM.string, "split.dwo"
+                                    ),
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_id,
+                                        DW_FORM.data8,
+                                        0xDDEEAADDBBEEFFFF,
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                )
+            prog.load_debug_info([f.name])
+            self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
+
+    def test_dwo4_not_found(self):
+        prog = Program()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "skeleton"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.skeleton,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_name, DW_FORM.string, "split.dwo"
+                                    ),
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_id,
+                                        DW_FORM.data8,
+                                        0xDDEEAADDBBEEFFFF,
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                )
+            with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
+                prog.load_debug_info([f.name])
+            self.assertTrue(
+                any(
+                    "split DWARF file split.dwo not found" in output
+                    for output in log.output
+                )
+            )
+
+    def test_dwo4_id_mismatch(self):
+        prog = Program()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "split.dwo"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.split_compile,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_id,
+                                        DW_FORM.data8,
+                                        0xBBBBBBBB00000000,
+                                    ),
+                                ),
+                            ),
+                        ),
+                        split="dwo",
+                    )
+                )
+            with open(os.path.join(temp_dir, "skeleton"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.skeleton,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_name, DW_FORM.string, "split.dwo"
+                                    ),
+                                    DwarfAttrib(
+                                        DW_AT.GNU_dwo_id,
+                                        DW_FORM.data8,
+                                        0xDDEEAADDBBEEFFFF,
+                                    ),
+                                ),
+                            ),
+                        )
+                    )
+                )
+            with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
+                prog.load_debug_info([f.name])
+            self.assertTrue(
+                any(
+                    "split DWARF file split.dwo not found" in output
+                    for output in log.output
+                )
+            )
+
+    def test_dwo5(self):
+        prog = Program()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "split.dwo"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.split_compile,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (),
+                                wrap_test_type_dies(int_die),
+                            ),
+                            dwo_id=0xDDEEAADDBBEEFFFF,
+                        ),
+                        version=5,
+                        split="dwo",
+                    )
+                )
+            with open(os.path.join(temp_dir, "skeleton"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.skeleton,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.dwo_name, DW_FORM.string, "split.dwo"
+                                    ),
+                                ),
+                            ),
+                            dwo_id=0xDDEEAADDBBEEFFFF,
+                        ),
+                        version=5,
+                    )
+                )
+            prog.load_debug_info([f.name])
+            self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
+
+    def test_dwo5_not_found(self):
+        prog = Program()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "skeleton"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.skeleton,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.dwo_name, DW_FORM.string, "split.dwo"
+                                    ),
+                                ),
+                            ),
+                            dwo_id=0xDDEEAADDBBEEFFFF,
+                        ),
+                        version=5,
+                    )
+                )
+            with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
+                prog.load_debug_info([f.name])
+            self.assertTrue(
+                any(
+                    "split DWARF file split.dwo not found" in output
+                    for output in log.output
+                )
+            )
+
+    def test_dwo5_id_mismatch(self):
+        prog = Program()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with open(os.path.join(temp_dir, "split.dwo"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.split_compile,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (),
+                                wrap_test_type_dies(int_die),
+                            ),
+                            dwo_id=0xBBBBBBBB00000000,
+                        ),
+                        version=5,
+                        split="dwo",
+                    )
+                )
+            with open(os.path.join(temp_dir, "skeleton"), "wb") as f:
+                f.write(
+                    compile_dwarf(
+                        DwarfUnit(
+                            DW_UT.skeleton,
+                            DwarfDie(
+                                DW_TAG.compile_unit,
+                                (
+                                    DwarfAttrib(
+                                        DW_AT.dwo_name, DW_FORM.string, "split.dwo"
+                                    ),
+                                ),
+                            ),
+                            dwo_id=0xDDEEAADDBBEEFFFF,
+                        ),
+                        version=5,
+                    )
+                )
+            with self.assertLogs(logging.getLogger("drgn"), "WARNING") as log:
+                prog.load_debug_info([f.name])
+            self.assertTrue(
+                any(
+                    "split DWARF file split.dwo not found" in output
+                    for output in log.output
+                )
+            )
