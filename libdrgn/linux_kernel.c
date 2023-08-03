@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "binary_buffer.h"
+#include "cleanup.h"
 #include "debug_info.h"
 #include "drgn.h"
 #include "error.h"
@@ -107,7 +108,6 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	FILE *file;
 	uint64_t address;
 	size_t size;
-	char *buf;
 	Elf64_Nhdr *nhdr;
 
 	file = fopen("/sys/kernel/vmcoreinfo", "r");
@@ -122,13 +122,13 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	}
 	fclose(file);
 
-	buf = malloc(size);
+	_cleanup_free_ char *buf = malloc(size);
 	if (!buf)
 		return &drgn_enomem;
 
 	err = drgn_program_read_memory(prog, buf, address, size, true);
 	if (err)
-		goto out;
+		return err;
 
 	/*
 	 * The first 12 bytes are the Elf{32,64}_Nhdr (it's the same in both
@@ -141,13 +141,10 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	    nhdr->n_descsz > size - 24) {
 		err = drgn_error_create(DRGN_ERROR_OTHER,
 					"VMCOREINFO is invalid");
-		goto out;
+		return err;
 	}
 
-	err = drgn_program_parse_vmcoreinfo(prog, buf + 24, nhdr->n_descsz);
-out:
-	free(buf);
-	return err;
+	return drgn_program_parse_vmcoreinfo(prog, buf + 24, nhdr->n_descsz);
 }
 
 static struct drgn_error *linux_kernel_get_page_shift(struct drgn_program *prog,
@@ -1252,7 +1249,7 @@ static struct drgn_error *identify_kernel_elf(Elf *elf,
 }
 
 DEFINE_HASH_MAP(elf_scn_name_map, const char *, Elf_Scn *,
-		c_string_key_hash_pair, c_string_key_eq)
+		c_string_key_hash_pair, c_string_key_eq);
 
 static struct drgn_error *
 cache_kernel_module_sections(struct kernel_module_iterator *kmod_it, Elf *elf)
@@ -1351,7 +1348,7 @@ kernel_module_table_key(struct kernel_module_file * const *entry)
 }
 
 DEFINE_HASH_TABLE(kernel_module_table, struct kernel_module_file *,
-		  kernel_module_table_key, nstring_hash_pair, nstring_eq)
+		  kernel_module_table_key, nstring_hash_pair, nstring_eq);
 
 static struct drgn_error *
 report_loaded_kernel_module(struct drgn_debug_info_load_state *load,
