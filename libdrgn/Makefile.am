@@ -59,6 +59,7 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 elf_sections.h \
 			 error.c \
 			 error.h \
+			 generics.h \
 			 hash_table.c \
 			 hash_table.h \
 			 helpers.h \
@@ -84,6 +85,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 object.h \
 			 object_index.c \
 			 object_index.h \
+			 openmp.c \
+			 openmp.h \
 			 orc.h \
 			 orc_info.c \
 			 orc_info.h \
@@ -108,7 +111,6 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 type.c \
 			 type.h \
 			 util.h \
-			 vector.c \
 			 vector.h
 
 libdrgnimpl_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden $(OPENMP_CFLAGS) \
