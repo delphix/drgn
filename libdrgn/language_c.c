@@ -2273,16 +2273,15 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 	}
 
 	if (specifier == SPECIFIER_NONE) {
-		enum drgn_type_kind kind;
-
+		uint64_t kinds;
 		if (tag_token == C_TOKEN_STRUCT) {
-			kind = DRGN_TYPE_STRUCT;
+			kinds = 1 << DRGN_TYPE_STRUCT;
 		} else if (tag_token == C_TOKEN_UNION) {
-			kind = DRGN_TYPE_UNION;
+			kinds = 1 << DRGN_TYPE_UNION;
 		} else if (tag_token == C_TOKEN_CLASS) {
-			kind = DRGN_TYPE_CLASS;
+			kinds = 1 << DRGN_TYPE_CLASS;
 		} else if (tag_token == C_TOKEN_ENUM) {
-			kind = DRGN_TYPE_ENUM;
+			kinds = 1 << DRGN_TYPE_ENUM;
 		} else if (identifier) {
 			if (identifier_len == sizeof("size_t") - 1 &&
 			    memcmp(identifier, "size_t",
@@ -2304,15 +2303,21 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 					return err;
 				ret->qualifiers = 0;
 				goto out;
+			} else if (((struct drgn_c_family_lexer *)lexer)->cpp) {
+				kinds = ((1 << DRGN_TYPE_STRUCT)
+					 | (1 << DRGN_TYPE_UNION)
+					 | (1 << DRGN_TYPE_CLASS)
+					 | (1 << DRGN_TYPE_ENUM)
+					 | (1 << DRGN_TYPE_TYPEDEF));
 			} else {
-				kind = DRGN_TYPE_TYPEDEF;
+				kinds = 1 << DRGN_TYPE_TYPEDEF;
 			}
 		} else {
 			return drgn_error_create(DRGN_ERROR_SYNTAX,
 						 "expected type specifier");
 		}
 
-		err = drgn_program_find_type_impl(prog, kind, identifier,
+		err = drgn_program_find_type_impl(prog, kinds, identifier,
 						  identifier_len, filename,
 						  ret);
 		if (err)
