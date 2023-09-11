@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <byteswap.h>
 #include <elf.h>
@@ -57,13 +57,13 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 	if (!drgn_cfi_row_copy(row_ret, drgn_empty_cfi_row))
 		return &drgn_enomem;
 
+	if (drgn_orc_type(orc) == DRGN_ORC_TYPE_UNDEFINED)
+		return &drgn_not_found;
+	else if (drgn_orc_type(orc) == DRGN_ORC_TYPE_END_OF_STACK)
+		return NULL;
+
 	struct drgn_cfi_rule rule;
 	switch (drgn_orc_sp_reg(orc)) {
-	case ORC_REG_UNDEFINED:
-		if (drgn_orc_is_end(orc))
-			return NULL;
-		else
-			return &drgn_not_found;
 	case ORC_REG_SP:
 		rule.kind = DRGN_CFI_RULE_REGISTER_PLUS_OFFSET;
 		rule.regno = DRGN_REGISTER_NUMBER(rsp);
@@ -76,7 +76,7 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 		break;
 	case ORC_REG_SP_INDIRECT:
 		rule.kind = DRGN_CFI_RULE_AT_REGISTER_ADD_OFFSET;
-		rule.regno = DRGN_REGISTER_NUMBER(rbp);
+		rule.regno = DRGN_REGISTER_NUMBER(rsp);
 		rule.offset = orc->sp_offset;
 		break;
 	case ORC_REG_BP_INDIRECT:
@@ -126,7 +126,6 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 					       DRGN_REGISTER_NUMBER(rsp),
 					       &rule))
 			return &drgn_enomem;
-		*interrupted_ret = false;
 		break;
 #define SET_AT_CFA_RULE(reg, cfa_offset) do {					\
 	rule.kind = DRGN_CFI_RULE_AT_CFA_PLUS_OFFSET;				\
@@ -156,7 +155,6 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 		SET_AT_CFA_RULE(cs, 136);
 		SET_AT_CFA_RULE(rflags, 144);
 		SET_AT_CFA_RULE(ss, 160);
-		*interrupted_ret = true;
 		break;
 	case DRGN_ORC_TYPE_REGS_PARTIAL:
 		SET_AT_CFA_RULE(rip, 0);
@@ -185,7 +183,6 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 		SET_SAME_VALUE_RULE(rdi);
 		SET_SAME_VALUE_RULE(rdx);
 #undef SET_SAME_VALUE_RULE
-		*interrupted_ret = true;
 		break;
 	default:
 		return drgn_error_format(DRGN_ERROR_OTHER,
@@ -216,6 +213,7 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 	if (!drgn_cfi_row_set_register(row_ret, DRGN_REGISTER_NUMBER(rbp),
 				       &rule))
 		return &drgn_enomem;
+	*interrupted_ret = drgn_orc_signal(orc);
 	*ret_addr_regno_ret = DRGN_REGISTER_NUMBER(rip);
 	return NULL;
 }
@@ -232,16 +230,6 @@ get_registers_from_frame_pointer(struct drgn_program *prog,
 	if (err)
 		return err;
 
-	uint64_t unwound_frame_pointer =
-		drgn_platform_bswap(&prog->platform) ? bswap_64(frame[0]) : frame[0];
-	if (unwound_frame_pointer <= frame_pointer) {
-		/*
-		 * The next frame pointer isn't valid. Maybe frame pointers are
-		 * not enabled or we're in the middle of a prologue or epilogue.
-		 */
-		return &drgn_stop;
-	}
-
 	struct drgn_register_state *regs =
 		drgn_register_state_create(rbp, false);
 	if (!regs)
@@ -255,12 +243,57 @@ get_registers_from_frame_pointer(struct drgn_program *prog,
 	return NULL;
 }
 
+// Unwind from a call instruction, assuming that nothing else has been changed
+// since.
+static struct drgn_error *unwind_call(struct drgn_program *prog,
+				      struct drgn_register_state *regs,
+				      struct drgn_register_state **ret)
+{
+	struct drgn_error *err;
+
+	struct optional_uint64 rsp =
+		drgn_register_state_get_u64(prog, regs, rsp);
+	if (!rsp.has_value)
+		return &drgn_stop;
+
+	// Read the return address from the top of the stack.
+	uint64_t ret_addr;
+	err = drgn_program_read_u64(prog, rsp.value, false, &ret_addr);
+	if (err) {
+		if (err->code == DRGN_ERROR_FAULT) {
+			drgn_error_destroy(err);
+			err = &drgn_stop;
+		}
+		return err;
+	}
+
+	// Most of the registers are unchanged.
+	struct drgn_register_state *tmp = drgn_register_state_dup(regs);
+	if (!tmp)
+		return &drgn_enomem;
+
+	// The PC and rip are the return address we just read.
+	drgn_register_state_set_pc(prog, tmp, ret_addr);
+	drgn_register_state_set_from_u64(prog, tmp, rip, ret_addr);
+	// rsp is after the saved return address.
+	drgn_register_state_set_from_u64(prog, tmp, rsp, rsp.value + 8);
+	*ret = tmp;
+	return NULL;
+}
+
 static struct drgn_error *
 fallback_unwind_x86_64(struct drgn_program *prog,
 		       struct drgn_register_state *regs,
 		       struct drgn_register_state **ret)
 {
 	struct drgn_error *err;
+
+	// If the program counter is 0, it's likely that a NULL function pointer
+	// was called. Assume that the only thing we need to unwind is a single
+	// call instruction.
+	struct optional_uint64 pc = drgn_register_state_get_pc(regs);
+	if (pc.has_value && pc.value == 0)
+		return unwind_call(prog, regs, ret);
 
 	struct optional_uint64 rbp =
 		drgn_register_state_get_u64(prog, regs, rbp);

@@ -1,21 +1,23 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import contextlib
 import ctypes
 import errno
 import os
 from pathlib import Path
-import platform
 import re
 import signal
 import socket
+import sys
 import time
+import traceback
 from typing import NamedTuple
 import unittest
 
 import drgn
 from tests import TestCase
+from util import NORMALIZED_MACHINE_NAME, SYS
 
 
 class LinuxKernelTestCase(TestCase):
@@ -89,10 +91,29 @@ skip_unless_have_test_kmod = unittest.skipUnless(
     "DRGN_TEST_KMOD" in os.environ, "test requires drgn_test Linux kernel module"
 )
 
+HAVE_FULL_MM_SUPPORT = NORMALIZED_MACHINE_NAME in ("aarch64", "s390x", "x86_64")
+
 skip_unless_have_full_mm_support = unittest.skipUnless(
-    platform.machine() == "x86_64",
-    f"mm support is not implemented for {platform.machine()}",
+    HAVE_FULL_MM_SUPPORT,
+    f"mm support is not implemented for {NORMALIZED_MACHINE_NAME}",
 )
+
+skip_unless_have_stack_tracing = unittest.skipUnless(
+    NORMALIZED_MACHINE_NAME in {"aarch64", "ppc64", "s390x", "x86_64"},
+    f"stack tracing is not implemented for {NORMALIZED_MACHINE_NAME}",
+)
+
+
+# PRNG used by the test kernel module.
+def prng32(seed):
+    seed = seed.encode("ascii")
+    assert len(seed) == 4
+    x = int.from_bytes(seed, "big")
+    while True:
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= x >> 17
+        x ^= (x << 5) & 0xFFFFFFFF
+        yield x
 
 
 def wait_until(fn, *args, **kwds):
@@ -109,31 +130,51 @@ def wait_until(fn, *args, **kwds):
         sleep *= 2
 
 
-def fork_and_pause(fn=None):
-    pid = os.fork()
-    if pid == 0:
-        if fn:
-            fn()
-        try:
-            while True:
-                signal.pause()
-        finally:
-            os._exit(1)
-    return pid
-
-
 def proc_state(pid):
     with open(f"/proc/{pid}/status", "r") as f:
         return re.search(r"State:\s*(\S)", f.read(), re.M).group(1)
 
 
-# Return whether a process is blocked and fully scheduled out. The process
-# state is updated while the process is still running, so use this instead of
-# proc_state(pid) != "R" to avoid races. This is not accurate if pid is the
-# calling thread.
-def proc_blocked(pid):
+_sigwait_syscall_number_strs = {
+    str(SYS[name])
+    for name in ("rt_sigtimedwait", "rt_sigtimedwait_time64")
+    if name in SYS
+}
+
+
+# Return whether a process is blocked in sigwait().
+def proc_in_sigwait(pid):
+    if proc_state(pid) != "S":
+        return False
     with open(f"/proc/{pid}/syscall", "r") as f:
-        return f.read() != "running\n"
+        return f.read().partition(" ")[0] in _sigwait_syscall_number_strs
+
+
+# Context manager that:
+# 1. Forks a process that blocks in sigwait() forever, optionally calling a
+#    function beforehand.
+# 2. Waits for the process to be in sigwait().
+# 3. Returns the PID from __enter__().
+# 4. Kills the process in __exit__().
+@contextlib.contextmanager
+def fork_and_sigwait(fn=None):
+    pid = os.fork()
+    try:
+        if pid == 0:
+            try:
+                if fn:
+                    fn()
+                while True:
+                    signal.sigwait(())
+            finally:
+                traceback.print_exc()
+                sys.stderr.flush()
+                os._exit(1)
+        wait_until(proc_in_sigwait, pid)
+        yield pid
+    finally:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
 
 
 def smp_enabled():

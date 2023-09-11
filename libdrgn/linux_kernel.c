@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <byteswap.h>
 #include <dirent.h>
@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "binary_buffer.h"
+#include "cleanup.h"
 #include "debug_info.h"
 #include "drgn.h"
 #include "error.h"
@@ -25,6 +26,7 @@
 #include "helpers.h"
 #include "io.h"
 #include "linux_kernel.h"
+#include "platform.h"
 #include "program.h"
 #include "type.h"
 #include "util.h"
@@ -106,7 +108,6 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	FILE *file;
 	uint64_t address;
 	size_t size;
-	char *buf;
 	Elf64_Nhdr *nhdr;
 
 	file = fopen("/sys/kernel/vmcoreinfo", "r");
@@ -121,13 +122,13 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	}
 	fclose(file);
 
-	buf = malloc(size);
+	_cleanup_free_ char *buf = malloc(size);
 	if (!buf)
 		return &drgn_enomem;
 
 	err = drgn_program_read_memory(prog, buf, address, size, true);
 	if (err)
-		goto out;
+		return err;
 
 	/*
 	 * The first 12 bytes are the Elf{32,64}_Nhdr (it's the same in both
@@ -140,13 +141,10 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	    nhdr->n_descsz > size - 24) {
 		err = drgn_error_create(DRGN_ERROR_OTHER,
 					"VMCOREINFO is invalid");
-		goto out;
+		return err;
 	}
 
-	err = drgn_program_parse_vmcoreinfo(prog, buf + 24, nhdr->n_descsz);
-out:
-	free(buf);
-	return err;
+	return drgn_program_parse_vmcoreinfo(prog, buf + 24, nhdr->n_descsz);
 }
 
 static struct drgn_error *linux_kernel_get_page_shift(struct drgn_program *prog,
@@ -211,6 +209,63 @@ linux_kernel_get_uts_release(struct drgn_program *prog, struct drgn_object *ret)
 	return drgn_object_set_from_buffer(ret, qualified_type,
 					   prog->vmcoreinfo.osrelease, len + 1,
 					   0, 0);
+}
+
+// jiffies is defined as an alias of jiffies_64 via the Linux kernel linker
+// script, so it is not included in debug info.
+static struct drgn_error *linux_kernel_get_jiffies(struct drgn_program *prog,
+						   struct drgn_object *ret)
+{
+	struct drgn_error *err;
+	struct drgn_object jiffies_64;
+	drgn_object_init(&jiffies_64, prog);
+	err = drgn_program_find_object(prog, "jiffies_64", NULL,
+				       DRGN_FIND_OBJECT_VARIABLE, &jiffies_64);
+	if (err) {
+		if (err->code == DRGN_ERROR_LOOKUP) {
+			drgn_error_destroy(err);
+			err = &drgn_not_found;
+		}
+		goto out;
+	}
+	if (jiffies_64.kind != DRGN_OBJECT_REFERENCE) {
+		err = &drgn_not_found;
+		goto out;
+	}
+	uint64_t address = jiffies_64.address;
+	struct drgn_qualified_type qualified_type;
+	err = drgn_program_find_primitive_type(prog, DRGN_C_TYPE_UNSIGNED_LONG,
+					       &qualified_type.type);
+	if (err)
+		return err;
+	qualified_type.qualifiers = DRGN_QUALIFIER_VOLATILE;
+	if (drgn_type_size(qualified_type.type) == 4 &&
+	    !drgn_type_little_endian(qualified_type.type))
+		address += 4;
+	err = drgn_object_set_reference(ret, qualified_type, address, 0, 0);
+out:
+	drgn_object_deinit(&jiffies_64);
+	return err;
+}
+
+static struct drgn_error *
+linux_kernel_get_vmcoreinfo(struct drgn_program *prog, struct drgn_object *ret)
+{
+	struct drgn_error *err;
+	struct drgn_qualified_type qualified_type;
+	err = drgn_program_find_primitive_type(prog,
+					       DRGN_C_TYPE_CHAR,
+					       &qualified_type.type);
+	if (err)
+		return err;
+	qualified_type.qualifiers = DRGN_QUALIFIER_CONST;
+	err = drgn_array_type_create(prog, qualified_type, prog->vmcoreinfo.raw_size,
+				     &drgn_language_c, &qualified_type.type);
+	if (err)
+		return err;
+	qualified_type.qualifiers = 0;
+	return drgn_object_set_from_buffer(ret, qualified_type, prog->vmcoreinfo.raw,
+					   prog->vmcoreinfo.raw_size, 0, 0);
 }
 
 // The vmemmap address can vary depending on architecture, kernel version,
@@ -320,7 +375,9 @@ static struct drgn_error *linux_kernel_get_vmemmap(struct drgn_program *prog,
 {
 	struct drgn_error *err;
 	if (prog->vmemmap.kind == DRGN_OBJECT_ABSENT) {
-		uint64_t address;
+		// Silence -Wmaybe-uninitialized false positive last seen with
+		// GCC 13 by initializing to zero.
+		uint64_t address = 0;
 		err = linux_kernel_get_vmemmap_address(prog, &address);
 		if (err)
 			return err;
@@ -458,12 +515,28 @@ kernel_module_iterator_next(struct kernel_module_iterator *it)
 		return err;
 
 	// Set tmp1 to the module base address and tmp2 to the size.
-	err = drgn_object_member(&it->tmp1, &it->mod, "core_layout");
+	err = drgn_object_member(&it->tmp1, &it->mod, "mem");
 	if (!err) {
-		// Since Linux kernel commit 7523e4dc5057 ("module: use a
-		// structure to encapsulate layout.") (in v4.5), the base and
-		// size are in the `struct module_layout core_layout` member of
-		// `struct module`.
+		union drgn_value mod_mem_type;
+
+		// Since Linux kernel commit ac3b43283923 ("module: replace
+		// module_layout with module_memory") (in v6.4), the base and
+		// size are in the `struct module_memory mem[MOD_TEXT]` member
+		// of `struct module`.
+		err = drgn_program_find_object(drgn_object_program(&it->mod),
+					       "MOD_TEXT", NULL,
+					       DRGN_FIND_OBJECT_CONSTANT,
+					       &it->tmp2);
+		if (err)
+			return err;
+		err = drgn_object_read_integer(&it->tmp2, &mod_mem_type);
+		if (err)
+			return err;
+
+		err = drgn_object_subscript(&it->tmp1, &it->tmp1,
+					    mod_mem_type.uvalue);
+		if (err)
+			return err;
 		err = drgn_object_member(&it->tmp2, &it->tmp1, "size");
 		if (err)
 			return err;
@@ -471,15 +544,36 @@ kernel_module_iterator_next(struct kernel_module_iterator *it)
 		if (err)
 			return err;
 	} else if (err->code == DRGN_ERROR_LOOKUP) {
-		// Before that, they are directly in the `struct module`.
+		// Since Linux kernel commit 7523e4dc5057 ("module: use a
+		// structure to encapsulate layout.") (in v4.5), the base and
+		// size are in the `struct module_layout core_layout` member of
+		// `struct module`.
 		drgn_error_destroy(err);
 
-		err = drgn_object_member(&it->tmp2, &it->mod, "core_size");
-		if (err)
+		err = drgn_object_member(&it->tmp1, &it->mod, "core_layout");
+		if (!err) {
+			err = drgn_object_member(&it->tmp2, &it->tmp1, "size");
+			if (err)
+				return err;
+			err = drgn_object_member(&it->tmp1, &it->tmp1, "base");
+			if (err)
+				return err;
+		} else if (err->code == DRGN_ERROR_LOOKUP) {
+			// Before that, they are directly in the `struct
+			// module`.
+			drgn_error_destroy(err);
+
+			err = drgn_object_member(&it->tmp2, &it->mod,
+						 "core_size");
+			if (err)
+				return err;
+			err = drgn_object_member(&it->tmp1, &it->mod,
+						 "module_core");
+			if (err)
+				return err;
+		} else {
 			return err;
-		err = drgn_object_member(&it->tmp1, &it->mod, "module_core");
-		if (err)
-			return err;
+		}
 	} else {
 		return err;
 	}
@@ -1175,7 +1269,7 @@ static struct drgn_error *identify_kernel_elf(Elf *elf,
 }
 
 DEFINE_HASH_MAP(elf_scn_name_map, const char *, Elf_Scn *,
-		c_string_key_hash_pair, c_string_key_eq)
+		c_string_key_hash_pair, c_string_key_eq);
 
 static struct drgn_error *
 cache_kernel_module_sections(struct kernel_module_iterator *kmod_it, Elf *elf)
@@ -1274,7 +1368,7 @@ kernel_module_table_key(struct kernel_module_file * const *entry)
 }
 
 DEFINE_HASH_TABLE(kernel_module_table, struct kernel_module_file *,
-		  kernel_module_table_key, nstring_hash_pair, nstring_eq)
+		  kernel_module_table_key, nstring_hash_pair, nstring_eq);
 
 static struct drgn_error *
 report_loaded_kernel_module(struct drgn_debug_info_load_state *load,

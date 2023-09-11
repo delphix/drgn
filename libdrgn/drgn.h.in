@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -18,6 +18,7 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
@@ -25,11 +26,18 @@
 /**
  * @mainpage
  *
- * libdrgn provides the functionality of the <a
- * href="https://github.com/osandov/drgn">drgn</a> programmable debugger as a
- * library. It implements the main drgn abstractions: @ref Programs, @ref Types,
- * and @ref Objects. See <a href="modules.html">Modules</a> for detailed
+ * libdrgn provides the functionality of the
+ * [drgn](https://github.com/osandov/drgn) programmable debugger as a library.
+ * It implements the main drgn abstractions: @ref Programs, @ref Types, @ref
+ * Objects, and @ref StackTraces. See [Modules](modules.html) for detailed
  * documentation.
+ *
+ * @subsection ThreadSafety Thread Safety
+ *
+ * Only one thread at a time should access the same @ref drgn_program (including
+ * @ref drgn_object, @ref drgn_type, @ref drgn_stack_trace, etc. from that
+ * program). It is safe to use different @ref drgn_program%s from concurrent
+ * threads.
  */
 
 /** Major version of drgn. */
@@ -231,6 +239,15 @@ struct drgn_error *drgn_error_copy(struct drgn_error *src)
 	__attribute__((__returns_nonnull__));
 
 /**
+ * Return a string representation of a @ref drgn_error.
+ *
+ * @param[in] err Error to write.
+ * @return Returned string, or @c NULL if memory could not be allocated. On
+ * success, must be freed with @c free().
+ */
+char *drgn_error_string(struct drgn_error *err);
+
+/**
  * Write a @ref drgn_error followed by a newline to a @c stdio stream.
  *
  * @param[in] file File to write to (usually @c stderr).
@@ -268,6 +285,8 @@ void drgn_error_destroy(struct drgn_error *err);
  *
  * @{
  */
+
+struct drgn_language; // IWYU pragma: export
 
 /** C */
 extern const struct drgn_language drgn_language_c;
@@ -375,6 +394,8 @@ enum drgn_architecture {
 	DRGN_ARCH_PPC64,
 	DRGN_ARCH_RISCV64,
 	DRGN_ARCH_RISCV32,
+	DRGN_ARCH_S390X,
+	DRGN_ARCH_S390,
 };
 
 /** Flags describing a @ref drgn_platform. */
@@ -394,14 +415,14 @@ enum drgn_platform_flags {
  *
  * The environment that a program runs on.
  */
-struct drgn_platform;
+struct drgn_platform; // IWYU pragma: export
 
 /**
  * @struct drgn_register
  *
  * A processor register.
  */
-struct drgn_register;
+struct drgn_register; // IWYU pragma: export
 
 /**
  * Create a @ref drgn_platform.
@@ -478,7 +499,7 @@ struct drgn_thread;
  * drgn_program_from_kernel(), or @ref drgn_program_from_pid(). It must be freed
  * with @ref drgn_program_destroy().
  */
-struct drgn_program;
+struct drgn_program; // IWYU pragma: export
 
 /** Flags which apply to a @ref drgn_program. */
 enum drgn_program_flags {
@@ -560,7 +581,9 @@ bool drgn_filename_matches(const char *haystack, const char *needle);
 /**
  * Callback for finding a type.
  *
- * @param[in] kind Kind of type.
+ * @param[in] kinds Kinds of types to find, as a bitmask of bits shifted by @ref
+ * drgn_type_kind. E.g., `(1 << DRGN_TYPE_STRUCT) | (1 << DRGN_TYPE_CLASS)`
+ * means to find a structure or class type.
  * @param[in] name Name of type (or tag, for structs, unions, and enums). This
  * is @em not null-terminated.
  * @param[in] name_len Length of @p name.
@@ -573,8 +596,8 @@ bool drgn_filename_matches(const char *haystack, const char *needle);
  * considered fatal.
  */
 typedef struct drgn_error *
-(*drgn_type_find_fn)(enum drgn_type_kind kind, const char *name,
-		     size_t name_len, const char *filename, void *arg,
+(*drgn_type_find_fn)(uint64_t kinds, const char *name, size_t name_len,
+		     const char *filename, void *arg,
 		     struct drgn_qualified_type *ret);
 
 /**
@@ -830,7 +853,7 @@ struct drgn_error *drgn_program_find_object(struct drgn_program *prog,
  *
  * A @ref drgn_symbol represents an entry in a program's symbol table.
  */
-struct drgn_symbol;
+struct drgn_symbol; // IWYU pragma: export
 
 /**
  * Get the symbol containing the given address.
@@ -912,6 +935,155 @@ struct drgn_error *drgn_program_element_info(struct drgn_program *prog,
 /** @} */
 
 /**
+ * @defgroup Logging Logging
+ *
+ * Logging configuration.
+ *
+ * drgn can log to a file (@ref drgn_program_set_log_file()) or an arbitrary
+ * callback (@ref drgn_program_set_log_callback()). Messages can be filtered
+ * based on the log level (@ref drgn_program_set_log_level()).
+ *
+ * By default, the log file is set to `stderr` and the log level is @ref
+ * DRGN_LOG_NONE, so logging is disabled.
+ *
+ * @{
+ */
+
+/** Log levels. */
+enum drgn_log_level {
+	DRGN_LOG_DEBUG = 0,
+	DRGN_LOG_INFO = 1,
+	DRGN_LOG_WARNING = 2,
+	DRGN_LOG_ERROR = 3,
+	DRGN_LOG_CRITICAL = 4,
+};
+/** Don't log anything. */
+#define DRGN_LOG_NONE (DRGN_LOG_CRITICAL + 1)
+
+/**
+ * Set the minimum log level.
+ *
+ * Messages below this level will not be logged.
+ *
+ * @param[in] level Minimum @ref drgn_log_level to log, or @ref DRGN_LOG_NONE to
+ * disable logging.
+ */
+void drgn_program_set_log_level(struct drgn_program *prog, int level);
+
+/**
+ * Get the minimum log level.
+ *
+ * @return Minimum @ref drgn_log_level being logged, or @ref DRGN_LOG_NONE if
+ * logging is disabled.
+ */
+int drgn_program_get_log_level(struct drgn_program *prog);
+
+/** Write logs to the given file. */
+void drgn_program_set_log_file(struct drgn_program *prog, FILE *file);
+
+/**
+ * Log callback.
+ *
+ * @param[in] prog Program message was logged to.
+ * @param[in] arg `callback_arg` passed to @ref drgn_program_set_log_callback().
+ * @param[in] level Message level.
+ * @param[in] format printf-style format of message.
+ * @param[in] ap Arguments for @p format.
+ * @param[in] err Error to append after formatted message if non-@c NULL. This
+ * can be formatted with @ref drgn_error_string(), @ref drgn_error_fwrite(), or
+ * @ref drgn_error_dwrite().
+ */
+typedef void drgn_log_fn(struct drgn_program *prog, void *arg,
+			 enum drgn_log_level level, const char *format,
+			 va_list ap, struct drgn_error *err);
+
+/**
+ * Set a callback to log to.
+ *
+ * @param[in] callback Callback to call for each log message. This is only
+ * called if the message's level is at least the current log level.
+ * @param[in] callback_arg Argument to pass to callback.
+ */
+void drgn_program_set_log_callback(struct drgn_program *prog,
+				   drgn_log_fn *callback, void *callback_arg);
+
+/**
+ * Get the current log callback.
+ *
+ * @param[out] callback_ret Returned callback.
+ * @param[out] callback_arg_ret Returned callback argument.
+ */
+void drgn_program_get_log_callback(struct drgn_program *prog,
+				   drgn_log_fn **callback_ret,
+				   void **callback_arg_ret);
+
+/** @} */
+
+/**
+ * @defgroup Embedding Embedding
+ *
+ * Embedding drgn in another runtime.
+ *
+ * @{
+ */
+
+/**
+ * Callback before a blocking operation.
+ *
+ * @param[in] arg @c callback_arg passed to @ref
+ * drgn_program_set_blocking_callback().
+ * @return Opaque pointer to pass to @ref drgn_program_end_blocking_fn().
+ */
+typedef void *drgn_program_begin_blocking_fn(struct drgn_program *prog,
+					     void *arg);
+
+/**
+ * Callback after a blocking operation.
+ *
+ * @param[in] arg @c callback_arg passed to @ref
+ * drgn_program_set_blocking_callback().
+ * @param[in] state Return value of @ref drgn_program_begin_blocking_fn().
+ */
+typedef void drgn_program_end_blocking_fn(struct drgn_program *prog,
+					  void *arg, void *state);
+
+/**
+ * Set callbacks around blocking operations.
+ *
+ * These callbacks will be called around blocking I/O operations and
+ * long-running computations. They are intended for things like releasing the
+ * [global interpreter
+ * lock](https://docs.python.org/3/glossary.html#term-global-interpreter-lock).
+ *
+ * @param[in] begin_callback Callback called before a blocking operation. Can be
+ * @c NULL to unset.
+ * @param[in] end_callback Callback called after a blocking operation. Can be @c
+ * NULL to unset.
+ * @param[in] callback_arg Argument passed to @p begin_callback and @p
+ * end_callback.
+ */
+void
+drgn_program_set_blocking_callback(struct drgn_program *prog,
+				   drgn_program_begin_blocking_fn *begin_callback,
+				   drgn_program_end_blocking_fn *end_callback,
+				   void *callback_arg);
+
+/**
+ * Get callbacks set by @ref drgn_program_set_blocking_callback().
+ *
+ * @param[out] begin_callback_ret Returned @c begin_callback.
+ * @param[out] end_callback_ret Returned @c end_callback.
+ * @param[out] callback_arg_ret Returned @c callback_arg.
+ */
+void
+drgn_program_get_blocking_callback(struct drgn_program *prog,
+				   drgn_program_begin_blocking_fn **begin_callback_ret,
+				   drgn_program_end_blocking_fn **end_callback_ret,
+				   void **callback_arg_ret);
+
+/** @} */
+
+/**
  * @defgroup Objects Objects
  *
  * Objects in a program.
@@ -968,24 +1140,37 @@ enum drgn_object_encoding {
 	 * Memory buffer.
 	 *
 	 * This is used for objects with a structure, union, class, or array
-	 * type. The value is a buffer of the contents of that object's memory
-	 * in the program.
+	 * type.
 	 */
 	DRGN_OBJECT_ENCODING_BUFFER,
 	/**
 	 * Signed integer.
 	 *
 	 * This is used for objects with a signed integer or signed enumerated
-	 * type.
+	 * type no larger than 64 bits.
 	 */
 	DRGN_OBJECT_ENCODING_SIGNED,
 	/**
 	 * Unsigned integer.
 	 *
 	 * This is used for objects with a unsigned integer, boolean, or pointer
-	 * type.
+	 * type no larger than 64 bits.
 	 */
 	DRGN_OBJECT_ENCODING_UNSIGNED,
+	/**
+	 * Big signed integer.
+	 *
+	 * This is used for objects with a signed integer or signed enumerated
+	 * type larger than 64 bits.
+	 */
+	DRGN_OBJECT_ENCODING_SIGNED_BIG,
+	/**
+	 * Big unsigned integer.
+	 *
+	 * This is used for objects with a unsigned integer, boolean, or pointer
+	 * type larger than 64 bits.
+	 */
+	DRGN_OBJECT_ENCODING_UNSIGNED_BIG,
 	/**
 	 * Floating-point value.
 	 *
@@ -1028,23 +1213,30 @@ drgn_object_encoding_is_complete(enum drgn_object_encoding encoding)
 /** Value of a @ref drgn_object. */
 union drgn_value {
 	/**
-	 * Pointer to an external buffer for a @ref
-	 * drgn_object_encoding::DRGN_OBJECT_ENCODING_BUFFER value.
+	 * Pointer to an external buffer for a @ref DRGN_OBJECT_ENCODING_BUFFER,
+	 * @ref DRGN_OBJECT_ENCODING_SIGNED_BIG, or @ref
+	 * DRGN_OBJECT_ENCODING_UNSIGNED_BIG value.
+	 *
+	 * For @ref DRGN_OBJECT_ENCODING_BUFFER, this contains the object's
+	 * representation in the memory of the program.
+	 *
+	 * For @ref DRGN_OBJECT_ENCODING_SIGNED_BIG and @ref
+	 * DRGN_OBJECT_ENCODING_UNSIGNED_BIG, the representation of the value is
+	 * an implementation detail which may change.
 	 */
 	char *bufp;
 	/**
-	 * Inline buffer for a @ref
-	 * drgn_object_encoding::DRGN_OBJECT_ENCODING_BUFFER value.
+	 * Inline buffer for a @ref DRGN_OBJECT_ENCODING_BUFFER value.
 	 *
 	 * Tiny buffers (see @ref drgn_value_is_inline()) are stored inline here
 	 * instead of in a separate allocation.
 	 */
 	char ibuf[8];
-	/** @ref drgn_object_encoding::DRGN_OBJECT_ENCODING_SIGNED value. */
+	/** @ref DRGN_OBJECT_ENCODING_SIGNED value. */
 	int64_t svalue;
-	/** @ref drgn_object_encoding::DRGN_OBJECT_ENCODING_UNSIGNED value. */
+	/** @ref DRGN_OBJECT_ENCODING_UNSIGNED value. */
 	uint64_t uvalue;
-	/** @ref drgn_object_encoding::DRGN_OBJECT_ENCODING_FLOAT value. */
+	/** @ref DRGN_OBJECT_ENCODING_FLOAT value. */
 	double fvalue;
 };
 
@@ -1107,11 +1299,11 @@ struct drgn_object {
 	/**
 	 * Whether this object is little-endian.
 	 *
-	 * Valid only for scalars (i.e., @ref
-	 * drgn_object_encoding::DRGN_OBJECT_ENCODING_SIGNED, @ref
-	 * drgn_object_encoding::DRGN_OBJECT_ENCODING_UNSIGNED, @ref
-	 * drgn_object_encoding::DRGN_OBJECT_ENCODING_FLOAT, or @ref
-	 * drgn_object_encoding::DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER).
+	 * Valid only for scalars (i.e., @ref DRGN_OBJECT_ENCODING_SIGNED, @ref
+	 * DRGN_OBJECT_ENCODING_UNSIGNED, @ref DRGN_OBJECT_ENCODING_SIGNED_BIG,
+	 * @ref DRGN_OBJECT_ENCODING_UNSIGNED_BIG, @ref
+	 * DRGN_OBJECT_ENCODING_FLOAT, or @ref
+	 * DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER).
 	 */
 	bool little_endian;
 	/**
@@ -2709,7 +2901,7 @@ bool drgn_symbol_eq(struct drgn_symbol *a, struct drgn_symbol *b);
  * @{
  */
 
-struct drgn_stack_trace;
+struct drgn_stack_trace; // IWYU pragma: export
 
 /** Destroy a @ref drgn_stack_trace. */
 void drgn_stack_trace_destroy(struct drgn_stack_trace *trace);
@@ -2779,6 +2971,15 @@ bool drgn_stack_frame_pc(struct drgn_stack_trace *trace, size_t frame,
 			 uint64_t *ret);
 
 /**
+ * Get the stack pointer at a stack frame.
+ *
+ * @param[out] ret Returned stack pointer.
+ * @return @c true if the stack pointer is known, @c false if it is not.
+ */
+bool drgn_stack_frame_sp(struct drgn_stack_trace *trace, size_t frame,
+			 uint64_t *ret);
+
+/**
  * Get the function symbol at a stack frame.
  *
  * @param[out] ret Returned symbol. On success, it should be freed with @ref
@@ -2788,6 +2989,31 @@ bool drgn_stack_frame_pc(struct drgn_stack_trace *trace, size_t frame,
 struct drgn_error *drgn_stack_frame_symbol(struct drgn_stack_trace *trace,
 					   size_t frame,
 					   struct drgn_symbol **ret);
+
+/**
+ * Get the names of local objects in the scope of this frame.
+ *
+ * The array of names must be freed with @ref drgn_stack_frame_locals_destroy().
+ *
+ * @param[out] names_ret Returned array of names. On success, must be freed with
+ * @ref drgn_stack_frame_locals_destroy().
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ * @return @c NULL on success, non-@c NULL on error
+ */
+struct drgn_error *
+drgn_stack_frame_locals(struct drgn_stack_trace *trace, size_t frame,
+			const char ***names_ret, size_t *count_ret);
+
+/**
+ * Free an array of names returned by @ref drgn_stack_frame_locals().
+ *
+ * The individual names from this array are invalid once this function is
+ * called. Any string which will be used later should be copied.
+ *
+ * @param names Array of names returned by @ref drgn_stack_frame_locals().
+ * @param count Count returned by @ref drgn_stack_frame_locals().
+ */
+void drgn_stack_frame_locals_destroy(const char **names, size_t count);
 
 /**
  * Find an object in the scope of a stack frame.

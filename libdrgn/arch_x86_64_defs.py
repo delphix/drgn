@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 REGISTERS = [
     DrgnRegister("rax"),
@@ -65,3 +65,5 @@ REGISTER_LAYOUT = [
     DrgnRegisterLayout("fs", size=8, dwarf_number=54),
     DrgnRegisterLayout("gs", size=8, dwarf_number=55),
 ]
+
+STACK_POINTER_REGISTER = "rsp"

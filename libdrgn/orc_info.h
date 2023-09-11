@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -18,7 +18,7 @@
 
 #include "cfi.h"
 
-struct drgn_debug_info_module;
+struct drgn_module;
 
 /**
  * @ingroup DebugInfo
@@ -26,15 +26,15 @@ struct drgn_debug_info_module;
  * @{
  */
 
-/** ORC unwinder data for a @ref drgn_debug_info_module. */
-struct drgn_orc_module_info {
+/** ORC unwinder data for a @ref drgn_module. */
+struct drgn_module_orc_info {
 	/**
 	 * Base for calculating program counter corresponding to an ORC unwinder
 	 * entry.
 	 *
 	 * This is the address of the `.orc_unwind_ip` ELF section.
 	 *
-	 * @sa drgn_orc_module_info::entries
+	 * @sa drgn_module_orc_info::entries
 	 */
 	uint64_t pc_base;
 	/**
@@ -44,14 +44,15 @@ struct drgn_orc_module_info {
 	 * This is the contents of the `.orc_unwind_ip` ELF section, byte
 	 * swapped to the host's byte order if necessary.
 	 *
-	 * @sa drgn_orc_module_info::entries
+	 * @sa drgn_module_orc_info::entries
 	 */
 	int32_t *pc_offsets;
 	/**
 	 * ORC unwinder entries.
 	 *
 	 * This is the contents of the `.orc_unwind` ELF section, byte swapped
-	 * to the host's byte order if necessary.
+	 * to the host's byte order and normalized to the latest version of the
+	 * format if necessary.
 	 *
 	 * Entry `i` specifies how to unwind the stack if
 	 * `orc_pc(i) <= PC < orc_pc(i + 1)`, where
@@ -59,17 +60,17 @@ struct drgn_orc_module_info {
 	 */
 	struct drgn_orc_entry *entries;
 	/** Number of ORC unwinder entries. */
-	size_t num_entries;
+	unsigned int num_entries;
+	/** Version of the ORC format. See @ref orc.h. */
+	int version;
 };
 
-void drgn_orc_module_info_deinit(struct drgn_debug_info_module *module);
+void drgn_module_orc_info_deinit(struct drgn_module *module);
 
 struct drgn_error *
-drgn_debug_info_find_orc_cfi(struct drgn_debug_info_module *module,
-			     uint64_t unbiased_pc,
-			     struct drgn_cfi_row **row_ret,
-			     bool *interrupted_ret,
-			     drgn_register_number *ret_addr_regno_ret);
+drgn_module_find_orc_cfi(struct drgn_module *module, uint64_t pc,
+			 struct drgn_cfi_row **row_ret, bool *interrupted_ret,
+			 drgn_register_number *ret_addr_regno_ret);
 
 /** @} */
 

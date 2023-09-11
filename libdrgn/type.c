@@ -1,11 +1,12 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "array.h"
+#include "cleanup.h"
 #include "error.h"
 #include "hash_table.h"
 #include "language.h"
@@ -171,9 +172,9 @@ static bool drgn_member_key_eq(const struct drgn_member_key *a,
 }
 
 DEFINE_HASH_MAP_FUNCTIONS(drgn_member_map, drgn_member_key_hash_pair,
-			  drgn_member_key_eq)
+			  drgn_member_key_eq);
 
-DEFINE_HASH_SET_FUNCTIONS(drgn_type_set, ptr_key_hash_pair, scalar_key_eq)
+DEFINE_HASH_SET_FUNCTIONS(drgn_type_set, ptr_key_hash_pair, scalar_key_eq);
 
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_member_object(struct drgn_type_member *member,
@@ -330,9 +331,9 @@ static bool drgn_type_dedupe_eq(struct drgn_type * const *entry_a,
  * enumerators, so the hash and comparison functions ignore those.
  */
 DEFINE_HASH_SET_FUNCTIONS(drgn_dedupe_type_set, drgn_type_dedupe_hash_pair,
-			  drgn_type_dedupe_eq)
+			  drgn_type_dedupe_eq);
 
-DEFINE_VECTOR_FUNCTIONS(drgn_typep_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_typep_vector);
 
 static struct drgn_error *find_or_create_type(struct drgn_type *key,
 					      struct drgn_type **ret)
@@ -347,17 +348,15 @@ static struct drgn_error *find_or_create_type(struct drgn_type *key,
 		return NULL;
 	}
 
-	struct drgn_type *type = malloc(sizeof(*type));
+	_cleanup_free_ struct drgn_type *type = malloc(sizeof(*type));
 	if (!type)
 		return &drgn_enomem;
 
 	*type = *key;
 	if (drgn_dedupe_type_set_insert_searched(&prog->dedupe_types, &type, hp,
-						 NULL) < 0) {
-		free(type);
+						 NULL) < 0)
 		return &drgn_enomem;
-	}
-	*ret = type;
+	*ret = no_cleanup_ptr(type);
 	return NULL;
 }
 
@@ -488,7 +487,7 @@ struct drgn_error *drgn_float_type_create(struct drgn_program *prog,
 	return find_or_create_type(&key, ret);
 }
 
-DEFINE_VECTOR_FUNCTIONS(drgn_type_template_parameter_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_type_template_parameter_vector);
 
 static void
 drgn_template_parameters_builder_init(struct drgn_template_parameters_builder *builder,
@@ -501,8 +500,9 @@ drgn_template_parameters_builder_init(struct drgn_template_parameters_builder *b
 static void
 drgn_template_parameters_builder_deinit(struct drgn_template_parameters_builder *builder)
 {
-	for (size_t i = 0; i < builder->parameters.size; i++)
-		drgn_lazy_object_deinit(&builder->parameters.data[i].argument);
+	vector_for_each(drgn_type_template_parameter_vector, parameter,
+			&builder->parameters)
+		drgn_lazy_object_deinit(&parameter->argument);
 	drgn_type_template_parameter_vector_deinit(&builder->parameters);
 }
 
@@ -525,7 +525,7 @@ drgn_template_parameters_builder_add(struct drgn_template_parameters_builder *bu
 	return NULL;
 }
 
-DEFINE_VECTOR_FUNCTIONS(drgn_type_member_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_type_member_vector);
 
 void drgn_compound_type_builder_init(struct drgn_compound_type_builder *builder,
 				     struct drgn_program *prog,
@@ -542,8 +542,8 @@ void drgn_compound_type_builder_init(struct drgn_compound_type_builder *builder,
 void
 drgn_compound_type_builder_deinit(struct drgn_compound_type_builder *builder)
 {
-	for (size_t i = 0; i < builder->members.size; i++)
-		drgn_lazy_object_deinit(&builder->members.data[i].object);
+	vector_for_each(drgn_type_member_vector, member, &builder->members)
+		drgn_lazy_object_deinit(&member->object);
 	drgn_type_member_vector_deinit(&builder->members);
 	drgn_template_parameters_builder_deinit(&builder->template_builder);
 }
@@ -578,7 +578,7 @@ drgn_compound_type_create(struct drgn_compound_type_builder *builder,
 	struct drgn_program *prog = builder->template_builder.prog;
 
 	if (!is_complete) {
-		if (builder->members.size) {
+		if (!drgn_type_member_vector_empty(&builder->members)) {
 			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 						 "incomplete type must not have members");
 		}
@@ -588,8 +588,8 @@ drgn_compound_type_create(struct drgn_compound_type_builder *builder,
 		}
 	}
 
-	if (!builder->members.size &&
-	    !builder->template_builder.parameters.size) {
+	if (drgn_type_member_vector_empty(&builder->members)
+	    && drgn_type_template_parameter_vector_empty(&builder->template_builder.parameters)) {
 		struct drgn_type key = {
 			{
 				.kind = builder->kind,
@@ -608,13 +608,9 @@ drgn_compound_type_create(struct drgn_compound_type_builder *builder,
 		return err;
 	}
 
-	struct drgn_type *type = malloc(sizeof(*type));
-	if (!type)
+	_cleanup_free_ struct drgn_type *type = malloc(sizeof(*type));
+	if (!type || !drgn_typep_vector_append(&prog->created_types, &type))
 		return &drgn_enomem;
-	if (!drgn_typep_vector_append(&prog->created_types, &type)) {
-		free(type);
-		return &drgn_enomem;
-	}
 
 	drgn_type_member_vector_shrink_to_fit(&builder->members);
 	drgn_type_template_parameter_vector_shrink_to_fit(&builder->template_builder.parameters);
@@ -624,19 +620,19 @@ drgn_compound_type_create(struct drgn_compound_type_builder *builder,
 	type->_private.primitive = DRGN_NOT_PRIMITIVE_TYPE;
 	type->_private.tag = tag;
 	type->_private.size = size;
-	type->_private.members = builder->members.data;
-	type->_private.num_members = builder->members.size;
-	type->_private.template_parameters =
-		builder->template_builder.parameters.data;
-	type->_private.num_template_parameters =
-		builder->template_builder.parameters.size;
+	drgn_type_member_vector_steal(&builder->members,
+				      &type->_private.members,
+				      &type->_private.num_members);
+	drgn_type_template_parameter_vector_steal(&builder->template_builder.parameters,
+						  &type->_private.template_parameters,
+						  &type->_private.num_template_parameters);
 	type->_private.program = prog;
 	type->_private.language = lang ? lang : drgn_program_language(prog);
-	*ret = type;
+	*ret = no_cleanup_ptr(type);
 	return NULL;
 }
 
-DEFINE_VECTOR_FUNCTIONS(drgn_type_enumerator_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_type_enumerator_vector);
 
 void drgn_enum_type_builder_init(struct drgn_enum_type_builder *builder,
 				 struct drgn_program *prog)
@@ -693,7 +689,7 @@ struct drgn_error *drgn_enum_type_create(struct drgn_enum_type_builder *builder,
 					 "compatible type of enum type must be integer type");
 	}
 
-	if (!builder->enumerators.size) {
+	if (drgn_type_enumerator_vector_empty(&builder->enumerators)) {
 		struct drgn_type key = {
 			{
 				.kind = DRGN_TYPE_ENUM,
@@ -712,13 +708,10 @@ struct drgn_error *drgn_enum_type_create(struct drgn_enum_type_builder *builder,
 		return err;
 	}
 
-	struct drgn_type *type = malloc(sizeof(*type));
-	if (!type)
+	_cleanup_free_ struct drgn_type *type = malloc(sizeof(*type));
+	if (!type ||
+	    !drgn_typep_vector_append(&builder->prog->created_types, &type))
 		return &drgn_enomem;
-	if (!drgn_typep_vector_append(&builder->prog->created_types, &type)) {
-		free(type);
-		return &drgn_enomem;
-	}
 
 	drgn_type_enumerator_vector_shrink_to_fit(&builder->enumerators);
 
@@ -728,12 +721,13 @@ struct drgn_error *drgn_enum_type_create(struct drgn_enum_type_builder *builder,
 	type->_private.tag = tag;
 	type->_private.type = compatible_type;
 	type->_private.qualifiers = 0;
-	type->_private.enumerators = builder->enumerators.data;
-	type->_private.num_enumerators = builder->enumerators.size;
+	drgn_type_enumerator_vector_steal(&builder->enumerators,
+					  &type->_private.enumerators,
+					  &type->_private.num_enumerators);
 	type->_private.program = builder->prog;
 	type->_private.language =
 		lang ? lang : drgn_program_language(builder->prog);
-	*ret = type;
+	*ret = no_cleanup_ptr(type);
 	return NULL;
 }
 
@@ -873,7 +867,7 @@ drgn_incomplete_array_type_create(struct drgn_program *prog,
 	return find_or_create_type(&key, ret);
 }
 
-DEFINE_VECTOR_FUNCTIONS(drgn_type_parameter_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_type_parameter_vector);
 
 void drgn_function_type_builder_init(struct drgn_function_type_builder *builder,
 				     struct drgn_program *prog)
@@ -885,8 +879,9 @@ void drgn_function_type_builder_init(struct drgn_function_type_builder *builder,
 void
 drgn_function_type_builder_deinit(struct drgn_function_type_builder *builder)
 {
-	for (size_t i = 0; i < builder->parameters.size; i++)
-		drgn_lazy_object_deinit(&builder->parameters.data[i].default_argument);
+	vector_for_each(drgn_type_parameter_vector, parameter,
+			&builder->parameters)
+		drgn_lazy_object_deinit(&parameter->default_argument);
 	drgn_type_parameter_vector_deinit(&builder->parameters);
 	drgn_template_parameters_builder_deinit(&builder->template_builder);
 }
@@ -924,8 +919,8 @@ drgn_function_type_create(struct drgn_function_type_builder *builder,
 					 "type is from different program");
 	}
 
-	if (!builder->parameters.size &&
-	    !builder->template_builder.parameters.size) {
+	if (drgn_type_parameter_vector_empty(&builder->parameters)
+	    && drgn_type_template_parameter_vector_empty(&builder->template_builder.parameters)) {
 		struct drgn_type key = {
 			{
 				.kind = DRGN_TYPE_FUNCTION,
@@ -945,13 +940,9 @@ drgn_function_type_create(struct drgn_function_type_builder *builder,
 		return err;
 	}
 
-	struct drgn_type *type = malloc(sizeof(*type));
-	if (!type)
+	_cleanup_free_ struct drgn_type *type = malloc(sizeof(*type));
+	if (!type ||!drgn_typep_vector_append(&prog->created_types, &type))
 		return &drgn_enomem;
-	if (!drgn_typep_vector_append(&prog->created_types, &type)) {
-		free(type);
-		return &drgn_enomem;
-	}
 
 	drgn_type_parameter_vector_shrink_to_fit(&builder->parameters);
 	drgn_type_template_parameter_vector_shrink_to_fit(&builder->template_builder.parameters);
@@ -961,16 +952,16 @@ drgn_function_type_create(struct drgn_function_type_builder *builder,
 	type->_private.primitive = DRGN_NOT_PRIMITIVE_TYPE;
 	type->_private.type = return_type.type;
 	type->_private.qualifiers = return_type.qualifiers;
-	type->_private.parameters = builder->parameters.data;
-	type->_private.num_parameters = builder->parameters.size;
+	drgn_type_parameter_vector_steal(&builder->parameters,
+					 &type->_private.parameters,
+					 &type->_private.num_parameters);
 	type->_private.is_variadic = is_variadic;
-	type->_private.template_parameters =
-		builder->template_builder.parameters.data;
-	type->_private.num_template_parameters =
-		builder->template_builder.parameters.size;
+	drgn_type_template_parameter_vector_steal(&builder->template_builder.parameters,
+						  &type->_private.template_parameters,
+						  &type->_private.num_template_parameters);
 	type->_private.program = prog;
 	type->_private.language = lang ? lang : drgn_program_language(prog);
-	*ret = type;
+	*ret = no_cleanup_ptr(type);
 	return NULL;
 }
 
@@ -1043,12 +1034,12 @@ drgn_type_with_byte_order_impl(struct drgn_type **type,
 		size_t num_enumerators =
 			drgn_type_num_enumerators(*type);
 		if (num_enumerators) {
-			if (!drgn_type_enumerator_vector_reserve(&builder.enumerators,
-								 num_enumerators)) {
+			if (!drgn_type_enumerator_vector_resize(&builder.enumerators,
+								num_enumerators)) {
 				drgn_enum_type_builder_deinit(&builder);
 				return &drgn_enomem;
 			}
-			memcpy(&builder.enumerators.data,
+			memcpy(drgn_type_enumerator_vector_begin(&builder.enumerators),
 			       drgn_type_enumerators(*type),
 			       num_enumerators * sizeof(struct drgn_type_enumerator));
 		}
@@ -1212,37 +1203,6 @@ struct drgn_error *drgn_type_bit_size(struct drgn_type *type, uint64_t *ret)
 	return NULL;
 }
 
-enum drgn_object_encoding drgn_type_object_encoding(struct drgn_type *type)
-{
-	SWITCH_ENUM(drgn_type_kind(type),
-	case DRGN_TYPE_INT:
-		return (drgn_type_is_signed(type) ?
-			DRGN_OBJECT_ENCODING_SIGNED :
-			DRGN_OBJECT_ENCODING_UNSIGNED);
-	case DRGN_TYPE_BOOL:
-	case DRGN_TYPE_POINTER:
-		return DRGN_OBJECT_ENCODING_UNSIGNED;
-	case DRGN_TYPE_FLOAT:
-		return DRGN_OBJECT_ENCODING_FLOAT;
-	case DRGN_TYPE_STRUCT:
-	case DRGN_TYPE_UNION:
-	case DRGN_TYPE_CLASS:
-	case DRGN_TYPE_ARRAY:
-		return (drgn_type_is_complete(type) ?
-			DRGN_OBJECT_ENCODING_BUFFER :
-			DRGN_OBJECT_ENCODING_INCOMPLETE_BUFFER);
-	case DRGN_TYPE_ENUM:
-		if (!drgn_type_is_complete(type))
-			return DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER;
-		/* fallthrough */
-	case DRGN_TYPE_TYPEDEF:
-		return drgn_type_object_encoding(drgn_type_type(type).type);
-	case DRGN_TYPE_VOID:
-	case DRGN_TYPE_FUNCTION:
-		return DRGN_OBJECT_ENCODING_NONE;
-	)
-}
-
 struct drgn_error *drgn_type_error(const char *format, struct drgn_type *type)
 {
 	struct drgn_qualified_type qualified_type = { type };
@@ -1314,8 +1274,8 @@ void drgn_program_deinit_types(struct drgn_program *prog)
 	drgn_member_map_deinit(&prog->members);
 	drgn_type_set_deinit(&prog->members_cached);
 
-	for (size_t i = 0; i < prog->created_types.size; i++) {
-		struct drgn_type *type = prog->created_types.data[i];
+	vector_for_each(drgn_typep_vector, typep, &prog->created_types) {
+		struct drgn_type *type = *typep;
 		if (drgn_type_has_members(type)) {
 			struct drgn_type_member *members =
 				drgn_type_members(type);
@@ -1366,23 +1326,23 @@ drgn_program_add_type_finder(struct drgn_program *prog, drgn_type_find_fn fn,
 	return NULL;
 }
 
-struct drgn_error *
-drgn_program_find_type_impl(struct drgn_program *prog,
-			    enum drgn_type_kind kind, const char *name,
-			    size_t name_len, const char *filename,
-			    struct drgn_qualified_type *ret)
+struct drgn_error *drgn_program_find_type_impl(struct drgn_program *prog,
+					       uint64_t kinds, const char *name,
+					       size_t name_len,
+					       const char *filename,
+					       struct drgn_qualified_type *ret)
 {
 	struct drgn_type_finder *finder = prog->type_finders;
 	while (finder) {
 		struct drgn_error *err =
-			finder->fn(kind, name, name_len, filename, finder->arg,
+			finder->fn(kinds, name, name_len, filename, finder->arg,
 				   ret);
 		if (!err) {
 			if (drgn_type_program(ret->type) != prog) {
 				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 							 "type find callback returned type from wrong program");
 			}
-			if (drgn_type_kind(ret->type) != kind) {
+			if (!(kinds & (UINT64_C(1) << drgn_type_kind(ret->type)))) {
 				return drgn_error_create(DRGN_ERROR_TYPE,
 							 "type find callback returned wrong kind of type");
 			}
@@ -1485,7 +1445,8 @@ drgn_program_find_primitive_type(struct drgn_program *prog,
 
 	spellings = drgn_primitive_type_spellings[type];
 	for (i = 0; spellings[i]; i++) {
-		err = drgn_program_find_type_impl(prog, kind, spellings[i],
+		err = drgn_program_find_type_impl(prog, UINT64_C(1) << kind,
+						  spellings[i],
 						  strlen(spellings[i]), NULL,
 						  &qualified_type);
 		if (!err && drgn_type_primitive(qualified_type.type) == type) {

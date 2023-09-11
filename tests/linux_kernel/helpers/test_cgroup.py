@@ -1,14 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import contextlib
 import os
 from pathlib import Path
-import signal
 import tempfile
 import unittest
 
-from drgn import NULL
+from drgn import NULL, cast
 from drgn.helpers.linux.cgroup import (
     cgroup_get_from_path,
     cgroup_name,
@@ -16,9 +15,16 @@ from drgn.helpers.linux.cgroup import (
     cgroup_path,
     css_for_each_child,
     css_for_each_descendant_pre,
+    sock_cgroup_ptr,
 )
+from drgn.helpers.linux.fs import fget
 from drgn.helpers.linux.pid import find_task
-from tests.linux_kernel import LinuxKernelTestCase, fork_and_pause, iter_mounts
+from tests.linux_kernel import (
+    LinuxKernelTestCase,
+    create_socket,
+    fork_and_sigwait,
+    iter_mounts,
+)
 
 
 @contextlib.contextmanager
@@ -56,8 +62,7 @@ class TestCgroup(LinuxKernelTestCase):
 
             cls.root_cgroup = cls.prog["cgrp_dfl_root"].cgrp.address_of_()
 
-            pid = fork_and_pause()
-            try:
+            with fork_and_sigwait() as pid:
                 task = find_task(cls.prog, pid)
 
                 cls.parent_cgroup_name = os.fsencode(parent_cgroup_dir.name)
@@ -73,9 +78,6 @@ class TestCgroup(LinuxKernelTestCase):
 
                 (child_cgroup_dir / "cgroup.procs").write_text(str(pid))
                 cls.child_cgroup = task.cgroups.dfl_cgrp.read_()
-            finally:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
         except BaseException:
             for cleanup in reversed(cls.__cleanups):
                 cleanup[0](*cleanup[1:])
@@ -116,6 +118,13 @@ class TestCgroup(LinuxKernelTestCase):
             cgroup_get_from_path(self.prog, self.parent_cgroup_path + b"/foo"),
             NULL(self.prog, "struct cgroup *"),
         )
+
+    def test_cgroup_socket(self):
+        with create_socket() as sock:
+            task = find_task(self.prog, os.getpid())
+            file = fget(task, sock.fileno())
+            sk = cast("struct socket *", file.private_data).sk
+            self.assertEqual(sock_cgroup_ptr(sk.sk_cgrp_data), task.cgroups.dfl_cgrp)
 
     @staticmethod
     def _cgroup_iter_paths(fn, cgroup):

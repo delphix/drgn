@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import argparse
 import asyncio
@@ -13,11 +13,13 @@ from typing import (
     AsyncIterator,
     Dict,
     List,
+    Mapping,
     NamedTuple,
     Optional,
     Sequence,
     Tuple,
     Union,
+    cast,
 )
 
 import aiohttp
@@ -25,17 +27,29 @@ import uritemplate
 
 from util import KernelVersion
 from vmtest.asynciosubprocess import check_call, check_output
-from vmtest.download import VMTEST_GITHUB_RELEASE, available_kernel_releases
+from vmtest.config import (
+    ARCHITECTURES,
+    KERNEL_FLAVORS,
+    Architecture,
+    Compiler,
+    KernelFlavor,
+    kconfig_localversion,
+)
+from vmtest.download import (
+    VMTEST_GITHUB_RELEASE,
+    DownloadCompiler,
+    available_kernel_releases,
+    download,
+)
 from vmtest.githubapi import AioGitHubApi
-from vmtest.kbuild import KERNEL_FLAVORS, KBuild, KernelFlavor
+from vmtest.kbuild import KBuild, apply_patches
 
 logger = logging.getLogger(__name__)
 
 # [inclusive, exclusive) ranges of kernel versions to ignore when building
 # latest releases of each version.
 IGNORE_KERNEL_RANGES = (
-    (KernelVersion("~"), KernelVersion("4.4")),
-    (KernelVersion("4.5~"), KernelVersion("4.9")),
+    (KernelVersion("~"), KernelVersion("4.9")),
     (KernelVersion("4.10~"), KernelVersion("4.14")),
     (KernelVersion("4.15~"), KernelVersion("4.19")),
     (KernelVersion("4.20~"), KernelVersion("5.4")),
@@ -83,7 +97,7 @@ def kernel_tag_to_release(tag: str, flavor: KernelFlavor) -> str:
             match.group(1),
             match.group(2) or ".0",
             match.group(3) or "",
-            flavor.localversion(),
+            kconfig_localversion(flavor),
         ]
     )
 
@@ -101,7 +115,7 @@ async def fetch_kernel_tags(kernel_dir: Path, kernel_tags: Sequence[str]) -> Non
         else:
             mainline_tags.append(tag)
 
-    for (name, url, tags) in (
+    for name, url, tags in (
         ("mainline", LINUX_GIT_URL, mainline_tags),
         ("stable", STABLE_LINUX_GIT_URL, stable_tags),
     ):
@@ -122,29 +136,44 @@ async def fetch_kernel_tags(kernel_dir: Path, kernel_tags: Sequence[str]) -> Non
 async def build_kernels(
     kernel_dir: Path,
     build_dir: Path,
-    arch: str,
-    kernel_revs: Sequence[Tuple[str, Sequence[KernelFlavor]]],
+    kernel_revs: Sequence[
+        Tuple[str, Sequence[Tuple[Architecture, Sequence[KernelFlavor]]]]
+    ],
+    compilers: Mapping[str, Compiler],
     keep_builds: bool,
 ) -> AsyncIterator[Path]:
     build_dir.mkdir(parents=True, exist_ok=True)
-    for rev, flavors in kernel_revs:
+    for rev, arches in kernel_revs:
         logger.info("checking out %s in %s", rev, kernel_dir)
-        await check_call("git", "-C", str(kernel_dir), "checkout", "-q", rev)
-        for flavor in flavors:
-            flavor_rev_build_dir = build_dir / f"build-{flavor.name}-{rev}"
-            with open(
-                build_dir / f"build-{flavor.name}-{rev}.log", "w"
-            ) as build_log_file:
-                kbuild = KBuild(
-                    kernel_dir, flavor_rev_build_dir, flavor, arch, build_log_file
+        await check_call(
+            "git", "-C", str(kernel_dir), "checkout", "--force", "--quiet", rev
+        )
+        await check_call("git", "-C", str(kernel_dir), "clean", "-dqf")
+        await apply_patches(kernel_dir)
+        for arch, flavors in arches:
+            env = {**os.environ, **compilers[arch.name].env()}
+            for flavor in flavors:
+                flavor_rev_build_dir = (
+                    build_dir / f"build-{arch.name}-{flavor.name}-{rev}"
                 )
-                await kbuild.build()
-                yield await kbuild.package("tar.zst", build_dir)
-                if not keep_builds:
-                    logger.info("deleting %s", flavor_rev_build_dir)
-                    # Shell out instead of using, e.g., shutil.rmtree(), to
-                    # avoid blocking the main thread and the GIL.
-                    await check_call("rm", "-rf", str(flavor_rev_build_dir))
+                with open(
+                    build_dir / f"build-{arch.name}-{flavor.name}-{rev}.log", "w"
+                ) as build_log_file:
+                    kbuild = KBuild(
+                        kernel_dir,
+                        flavor_rev_build_dir,
+                        arch,
+                        flavor,
+                        env=env,
+                        build_log_file=build_log_file,
+                    )
+                    await kbuild.build()
+                    yield await kbuild.package("tar.zst", build_dir)
+                    if not keep_builds:
+                        logger.info("deleting %s", flavor_rev_build_dir)
+                        # Shell out instead of using, e.g., shutil.rmtree(), to
+                        # avoid blocking the main thread and the GIL.
+                        await check_call("rm", "-rf", str(flavor_rev_build_dir))
 
 
 class AssetUploadWork(NamedTuple):
@@ -197,6 +226,24 @@ async def main() -> None:
         help="build and upload latest supported kernel releases",
     )
     parser.add_argument(
+        "-a",
+        "--architecture",
+        dest="architectures",
+        choices=["all", *sorted(ARCHITECTURES)],
+        action="append",
+        help="build architecture; may be given multiple times (default: all)",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "-f",
+        "--flavor",
+        dest="flavors",
+        choices=["all", *KERNEL_FLAVORS],
+        action="append",
+        help="build flavor; may be given multiple times (default: all)",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--no-build",
         dest="build",
         action="store_false",
@@ -236,20 +283,31 @@ async def main() -> None:
         default=argparse.SUPPRESS,
     )
     parser.add_argument(
-        "--cache-directory",
+        "--download-directory",
         metavar="DIR",
         type=Path,
         default="build/vmtest",
-        help="directory to cache API calls in",
+        help="directory to download assets to",
     )
     args = parser.parse_args()
+
+    if not hasattr(args, "architectures") or "all" in args.architectures:
+        args.architectures = list(ARCHITECTURES.values())
+    else:
+        args.architectures = [
+            arch for arch in ARCHITECTURES.values() if arch.name in args.architectures
+        ]
+    if not hasattr(args, "flavors") or "all" in args.flavors:
+        args.flavors = list(KERNEL_FLAVORS.values())
+    else:
+        args.flavors = [
+            flavor for flavor in KERNEL_FLAVORS.values() if flavor.name in args.flavors
+        ]
 
     if not args.build:
         args.upload = False
     if not hasattr(args, "keep_builds"):
         args.keep_builds = not args.upload
-
-    arch = "x86_64"
 
     async with aiohttp.ClientSession(trust_env=True) as session:
         GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -257,9 +315,10 @@ async def main() -> None:
             sys.exit("GITHUB_TOKEN environment variable is not set")
         gh = AioGitHubApi(session, GITHUB_TOKEN)
 
-        args.cache_directory.mkdir(parents=True, exist_ok=True)
+        args.download_directory.mkdir(parents=True, exist_ok=True)
         github_release_coro = gh.get_release_by_tag(
-            *VMTEST_GITHUB_RELEASE, cache=args.cache_directory / "github_release.json"
+            *VMTEST_GITHUB_RELEASE,
+            cache=args.download_directory / "github_release.json",
         )
         if args.latest_kernels:
             github_release, latest_kernel_tags = await asyncio.gather(
@@ -268,34 +327,63 @@ async def main() -> None:
         else:
             github_release = await github_release_coro
 
-        kernel_releases = available_kernel_releases(github_release, arch)
-        logger.info(
-            "available %s kernel releases: %s",
-            arch,
-            ", ".join(sorted(kernel_releases, key=KernelVersion, reverse=True)),
-        )
+        kernel_releases = available_kernel_releases(github_release)
+        logger.info("available kernel releases:")
+        for arch in args.architectures:
+            arch_kernel_releases = kernel_releases.get(arch.name, {})
+            logger.info(
+                "  %s: %s",
+                arch.name,
+                ", ".join(
+                    sorted(arch_kernel_releases, key=KernelVersion, reverse=True)
+                ),
+            )
 
         to_build = []
         if args.latest_kernels:
             logger.info("latest kernel versions: %s", ", ".join(latest_kernel_tags))
             for tag in latest_kernel_tags:
-                flavors = [
-                    flavor
-                    for flavor in KERNEL_FLAVORS
-                    if kernel_tag_to_release(tag, flavor) not in kernel_releases
-                ]
-                if flavors:
-                    to_build.append((tag, flavors))
+                tag_arches_to_build = []
+                for arch in args.architectures:
+                    arch_kernel_releases = kernel_releases.get(arch.name, {})
+                    tag_arch_flavors_to_build = [
+                        flavor
+                        for flavor in args.flavors
+                        if kernel_tag_to_release(tag, flavor)
+                        not in arch_kernel_releases
+                    ]
+                    if tag_arch_flavors_to_build:
+                        tag_arches_to_build.append((arch, tag_arch_flavors_to_build))
+                if tag_arches_to_build:
+                    to_build.append((tag, tag_arches_to_build))
 
         if to_build:
-            logger.info(
-                "kernel versions to build: %s",
-                ", ".join(
-                    f"{tag} ({', '.join([flavor.name for flavor in flavors])})"
-                    for tag, flavors in to_build
-                ),
-            )
+            logger.info("kernel versions to build:")
+            for tag, tag_arches_to_build in to_build:
+                logger.info(
+                    "  %s (%s)",
+                    tag,
+                    ", ".join(
+                        [
+                            f"{arch.name} [{', '.join([flavor.name for flavor in tag_arch_flavors_to_build])}]"
+                            for arch, tag_arch_flavors_to_build in tag_arches_to_build
+                        ]
+                    ),
+                )
+
             if args.build:
+                compilers = {
+                    cast(Compiler, downloaded).target.name: cast(Compiler, downloaded)
+                    for downloaded in download(
+                        args.download_directory,
+                        {
+                            arch.name: DownloadCompiler(arch)
+                            for _, tag_arches_to_build in to_build
+                            for arch, _ in tag_arches_to_build
+                        }.values(),
+                    )
+                }
+
                 if args.upload:
                     upload_queue: "asyncio.Queue[Optional[AssetUploadWork]]" = (
                         asyncio.Queue()
@@ -309,8 +397,8 @@ async def main() -> None:
                 async for kernel_package in build_kernels(
                     args.kernel_directory,
                     args.build_directory,
-                    arch,
                     to_build,
+                    compilers,
                     args.keep_builds,
                 ):
                     if args.upload:

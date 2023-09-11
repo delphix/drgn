@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 CPU Scheduler
@@ -9,11 +9,20 @@ The ``drgn.helpers.linux.sched`` module provides helpers for working with the
 Linux CPU scheduler.
 """
 
-from _drgn import _linux_helper_idle_task as idle_task
-from drgn import Object
+from typing import Tuple
+
+from _drgn import (
+    _linux_helper_cpu_curr as cpu_curr,
+    _linux_helper_idle_task as idle_task,
+    _linux_helper_task_cpu as task_cpu,
+)
+from drgn import Object, Program
 
 __all__ = (
+    "cpu_curr",
     "idle_task",
+    "loadavg",
+    "task_cpu",
     "task_state_to_char",
 )
 
@@ -79,3 +88,17 @@ def task_state_to_char(task: Object) -> str:
         return "I"
     else:
         return char
+
+
+def loadavg(prog: Program) -> Tuple[float, float, float]:
+    """
+    Return system load averaged over 1, 5 and 15 minutes as
+    tuple of three float values.
+
+    >>> loadavg(prog)
+    (2.34, 0.442, 1.33)
+    """
+
+    avenrun = prog["avenrun"]
+    vals = [avenrun[i].value_() / (1 << 11) for i in range(3)]
+    return (vals[0], vals[1], vals[2])

@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -60,7 +60,7 @@
  * key_type entry_to_key(const entry_type *entry);
  * struct hash_pair hash_func(const key_type *key);
  * bool eq_func(const key_type *a, const key_type *b);
- * DEFINE_HASH_TABLE(hash_table, entry_type, entry_to_key, hash_func, eq_func)
+ * DEFINE_HASH_TABLE(hash_table, entry_type, entry_to_key, hash_func, eq_func);
  * @endcode
  *
  * @sa BinarySearchTrees
@@ -301,10 +301,7 @@ struct hash_table_iterator hash_table_first(struct hash_table *table);
 struct hash_table_iterator hash_table_next(struct hash_table_iterator it);
 #endif
 
-enum {
-	hash_table_chunk_alignment = max_iconst(alignof(max_align_t),
-						(size_t)16),
-};
+enum { hash_table_chunk_alignment = max_iconst(alignof(max_align_t), 16) };
 
 static inline size_t hash_table_probe_delta(struct hash_pair hp)
 {
@@ -406,7 +403,8 @@ struct table {									\
 		size_t size;							\
 		uintptr_t first_packed;						\
 	} basic[!table##_vector_policy];					\
-};
+};										\
+struct DEFINE_HASH_TABLE_needs_semicolon
 
 /*
  * Common search function implementation returning an item iterator. This is
@@ -1406,7 +1404,8 @@ static struct table##_iterator table##_next(struct table##_iterator it)		\
 	} else {								\
 		return table##_next_impl(it, false);				\
 	}									\
-}
+}										\
+struct DEFINE_HASH_TABLE_needs_semicolon
 
 /**
  * Define a hash table interface.
@@ -1425,7 +1424,7 @@ static struct table##_iterator table##_next(struct table##_iterator it)		\
  * *</tt> and returns a @c bool.
  */
 #define DEFINE_HASH_TABLE(table, entry_type, entry_to_key, hash_func, eq_func)	\
-DEFINE_HASH_TABLE_TYPE(table, entry_type)					\
+DEFINE_HASH_TABLE_TYPE(table, entry_type);					\
 DEFINE_HASH_TABLE_FUNCTIONS(table, entry_to_key, hash_func, eq_func)
 
 /**
@@ -1479,7 +1478,7 @@ DEFINE_HASH_TABLE_FUNCTIONS(table, HASH_MAP_ENTRY_TO_KEY, hash_func, eq_func)
  * @param[in] eq_func See @ref DEFINE_HASH_TABLE().
  */
 #define DEFINE_HASH_MAP(table, key_type, value_type, hash_func, eq_func)	\
-DEFINE_HASH_MAP_TYPE(table, key_type, value_type)				\
+DEFINE_HASH_MAP_TYPE(table, key_type, value_type);				\
 DEFINE_HASH_MAP_FUNCTIONS(table, hash_func, eq_func)
 
 /**
@@ -1520,7 +1519,7 @@ DEFINE_HASH_TABLE_FUNCTIONS(table, HASH_SET_ENTRY_TO_KEY, hash_func, eq_func)
  * @param[in] eq_func See @ref DEFINE_HASH_TABLE().
  */
 #define DEFINE_HASH_SET(table, key_type, hash_func, eq_func)	\
-DEFINE_HASH_SET_TYPE(table, key_type)				\
+DEFINE_HASH_SET_TYPE(table, key_type);				\
 DEFINE_HASH_SET_FUNCTIONS(table, hash_func, eq_func)
 
 /**

@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #ifndef DRGN_LINUX_KERNEL_H
 #define DRGN_LINUX_KERNEL_H
@@ -31,6 +31,9 @@ linux_kernel_report_debug_info(struct drgn_debug_info_load_state *load);
 
 #define KDUMP_SIGNATURE "KDUMP   "
 #define KDUMP_SIG_LEN (sizeof(KDUMP_SIGNATURE) - 1)
+
+#define FLATTENED_SIGNATURE "makedumpfile"
+#define FLATTENED_SIG_LEN (sizeof(FLATTENED_SIGNATURE) - 1)
 
 #ifdef WITH_LIBKDUMPFILE
 struct drgn_error *drgn_program_cache_kdump_notes(struct drgn_program *prog);

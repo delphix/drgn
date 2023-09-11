@@ -1,4 +1,6 @@
 #!/bin/sh
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 set -eux
 
@@ -19,9 +21,15 @@ yum install -y \
 # https://github.com/pypa/manylinux/issues/731.
 ln -s /usr/share/aclocal/pkg.m4 /usr/local/share/aclocal/
 
+BUILD_ONLY_PYTHON=""
+if [ -n "${1:-}" ]; then
+	# Translate, e.g. 3.10 -> (3, 10)
+	BUILD_ONLY_PYTHON="$(echo "$1" | perl -pe 's/(\d+)\.(\d+)/(\1, \2)/')"
+fi
+
 # Install a recent version of elfutils instead of whatever is in the manylinux
 # image.
-elfutils_version=0.187
+elfutils_version=0.189
 elfutils_url=https://sourceware.org/elfutils/ftp/$elfutils_version/elfutils-$elfutils_version.tar.bz2
 mkdir /tmp/elfutils
 cd /tmp/elfutils
@@ -36,29 +44,12 @@ curl -L "$elfutils_url" | tar -xj --strip-components=1
 make -j$(($(nproc) + 1))
 make install
 
-libkdumpfile_version=0.4.1
+libkdumpfile_version=0.5.2
 libkdumpfile_url=https://github.com/ptesarik/libkdumpfile/releases/download/v$libkdumpfile_version/libkdumpfile-$libkdumpfile_version.tar.gz
 mkdir /tmp/libkdumpfile
 cd /tmp/libkdumpfile
 curl -L "$libkdumpfile_url" | tar -xz --strip-components=1
-# This file is missing an include of limits.h which it accidentally gets from
-# zlib.h via zconf.h, but only since zlib 1.2.7. CentOS 6 has 1.2.3.
-patch -p1 << "EOF"
-diff --git a/src/kdumpfile/util.c b/src/kdumpfile/util.c
-index 4fb2960..14e1ce3 100644
---- a/src/kdumpfile/util.c
-+++ b/src/kdumpfile/util.c
-@@ -38,6 +38,7 @@
- #include <stdio.h>
- #include <stdarg.h>
- #include <errno.h>
-+#include <limits.h>
- 
- #if USE_ZLIB
- # include <zlib.h>
-EOF
-# z_const was added in zlib 1.2.5.2.
-CPPFLAGS="-Dz_const=const" ./configure --with-lzo --with-snappy --with-zlib --without-python
+./configure --with-libzstd --with-lzo2 --with-snappy --with-zlib --without-python
 make -j$(($(nproc) + 1))
 make install
 
@@ -68,15 +59,19 @@ mkdir /tmp/drgn
 cd /tmp/drgn
 tar -xf "/io/$SDIST" --strip-components=1
 
-python_supported() {
-	"$1" -c 'import sys; sys.exit(sys.version_info < (3, 6))'
+build_for_python() {
+	if [ -n "$BUILD_ONLY_PYTHON" ]; then
+		# Build for selected Python release only
+		"$1" -c "import sys; sys.exit(sys.version_info[:2] != $BUILD_ONLY_PYTHON)"
+	else
+		# Build for all supported Pythons
+		"$1" -c 'import sys; sys.exit(sys.version_info < (3, 6))'
+	fi
 }
 
 for pybin in /opt/python/cp*/bin; do
-	if python_supported "$pybin/python"; then
-		# static_assert was added to assert.h in glibc 2.16, but CentOS
-		# 6 has 2.12.
-		CPPFLAGS="-Dstatic_assert=_Static_assert" "$pybin/pip" wheel . --no-deps -w /tmp/wheels/
+	if build_for_python "$pybin/python"; then
+		"$pybin/pip" wheel . --no-deps -w /tmp/wheels/
 	fi
 done
 
@@ -89,7 +84,7 @@ for wheel in /tmp/wheels/*.whl; do
 done
 
 for pybin in /opt/python/cp*/bin; do
-	if python_supported "$pybin/python"; then
+	if build_for_python "$pybin/python"; then
 		"$pybin/pip" install drgn --no-index -f /tmp/manylinux_wheels/
 		"$pybin/drgn" --version
 		"$pybin/python" setup.py test

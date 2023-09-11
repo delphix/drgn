@@ -1,13 +1,176 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "drgnpy.h"
+#include "../bitops.h"
+#include "../error.h"
 #include "../hash_table.h"
+#include "../log.h"
 #include "../program.h"
+#include "../string_builder.h"
 #include "../util.h"
 #include "../vector.h"
 
-DEFINE_HASH_SET_FUNCTIONS(pyobjectp_set, ptr_key_hash_pair, scalar_key_eq)
+DEFINE_HASH_SET_FUNCTIONS(pyobjectp_set, ptr_key_hash_pair, scalar_key_eq);
+
+static PyObject *percent_s;
+static PyObject *logger;
+static PyObject *logger_log;
+
+static void drgnpy_log_fn(struct drgn_program *prog, void *arg,
+			  enum drgn_log_level level, const char *format,
+			  va_list ap, struct drgn_error *err)
+{
+	struct string_builder sb = STRING_BUILDER_INIT;
+	if (!string_builder_vappendf(&sb, format, ap))
+		goto out;
+	if (err && !string_builder_append_error(&sb, err))
+		goto out;
+
+	PyGILState_STATE gstate = PyGILState_Ensure();
+	PyObject *ret = PyObject_CallFunction(logger_log, "iOs#",
+					      (level + 1) * 10, percent_s,
+					      sb.str ? sb.str : "",
+					      (Py_ssize_t)sb.len);
+	if (ret)
+		Py_DECREF(ret);
+	else
+		PyErr_WriteUnraisable(logger_log);
+	PyGILState_Release(gstate);
+
+out:
+	free(sb.str);
+}
+
+static int get_log_level(void)
+{
+	// We don't use getEffectiveLevel() because that doesn't take
+	// logging.disable() into account.
+	int level;
+	for (level = 0; level < DRGN_LOG_NONE; level++) {
+		_cleanup_pydecref_ PyObject *enabled =
+			PyObject_CallMethod(logger, "isEnabledFor", "i",
+					    (level + 1) * 10);
+		if (!enabled)
+			return -1;
+		int ret = PyObject_IsTrue(enabled);
+		if (ret < 0)
+			return -1;
+		if (ret)
+			break;
+	}
+	return level;
+}
+
+// This is slightly heinous. We need to sync the Python log level with the
+// libdrgn log level, but the Python log level can change at any time, and there
+// is no API to be notified of this. So, we monkey patch logger._cache.clear()
+// to update the log level on every live program. This only works since CPython
+// commit 78c18a9b9a14 ("bpo-30962: Added caching to Logger.isEnabledFor()
+// (GH-2752)") (in v3.7), though. Before that, the best we can do is sync the
+// level at the time that the program is created.
+#if PY_VERSION_HEX >= 0x030700a1
+static int cached_log_level;
+static struct pyobjectp_set programs = HASH_TABLE_INIT;
+
+static int cache_log_level(void)
+{
+	int level = get_log_level();
+	if (level < 0)
+		return level;
+	cached_log_level = level;
+	return 0;
+}
+
+static PyObject *LoggerCacheWrapper_clear(PyObject *self)
+{
+	PyDict_Clear(self);
+	if (cache_log_level())
+		return NULL;
+	for (struct pyobjectp_set_iterator it = pyobjectp_set_first(&programs);
+	     it.entry; it = pyobjectp_set_next(it)) {
+		Program *prog = (Program *)*it.entry;
+		drgn_program_set_log_level(&prog->prog, cached_log_level);
+	}
+	Py_RETURN_NONE;
+}
+
+static PyMethodDef LoggerCacheWrapper_methods[] = {
+	{"clear", (PyCFunction)LoggerCacheWrapper_clear, METH_NOARGS},
+	{},
+};
+
+static PyTypeObject LoggerCacheWrapper_type = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+	.tp_name = "_drgn._LoggerCacheWrapper",
+	.tp_methods = LoggerCacheWrapper_methods,
+};
+
+static int init_logger_cache_wrapper(void)
+{
+	LoggerCacheWrapper_type.tp_base = &PyDict_Type;
+	if (PyType_Ready(&LoggerCacheWrapper_type))
+		return -1;
+	_cleanup_pydecref_ PyObject *cache_wrapper =
+		PyObject_CallFunction((PyObject *)&LoggerCacheWrapper_type,
+				      NULL);
+	if (!cache_wrapper)
+		return -1;
+	if (PyObject_SetAttrString(logger, "_cache", cache_wrapper))
+		return -1;
+
+	return cache_log_level();
+}
+
+static int Program_init_logging(Program *prog)
+{
+	PyObject *obj = (PyObject *)prog;
+	if (pyobjectp_set_insert(&programs, &obj, NULL) < 0)
+		return -1;
+	drgn_program_set_log_callback(&prog->prog, drgnpy_log_fn, NULL);
+	drgn_program_set_log_level(&prog->prog, cached_log_level);
+	return 0;
+}
+
+static void Program_deinit_logging(Program *prog)
+{
+	PyObject *obj = (PyObject *)prog;
+	pyobjectp_set_delete(&programs, &obj);
+}
+#else
+static int init_logger_cache_wrapper(void) { return 0; }
+
+static int Program_init_logging(Program *prog)
+{
+	int level = get_log_level();
+	if (level < 0)
+		return level;
+	drgn_program_set_log_callback(&prog->prog, drgnpy_log_fn, NULL);
+	drgn_program_set_log_level(&prog->prog, level);
+	return 0;
+}
+
+static void Program_deinit_logging(Program *prog) {}
+#endif
+
+int init_logging(void)
+{
+	percent_s = PyUnicode_InternFromString("%s");
+	if (!percent_s)
+		return -1;
+
+	_cleanup_pydecref_ PyObject *logging = PyImport_ImportModule("logging");
+	if (!logging)
+		return -1;
+	logger = PyObject_CallMethod(logging, "getLogger", "s", "drgn");
+	if (!logger)
+		return -1;
+	logger_log = PyObject_GetAttrString(logger, "log");
+	if (!logger_log)
+		return -1;
+
+	return init_logger_cache_wrapper();
+}
 
 int Program_hold_object(Program *prog, PyObject *obj)
 {
@@ -62,6 +225,16 @@ int Program_type_arg(Program *prog, PyObject *type_obj, bool can_be_none,
 	return 0;
 }
 
+static void *drgnpy_begin_blocking(struct drgn_program *prog, void *arg)
+{
+	return PyEval_SaveThread();
+}
+
+static void drgnpy_end_blocking(struct drgn_program *prog, void *arg, void *state)
+{
+	PyEval_RestoreThread(state);
+}
+
 static Program *Program_new(PyTypeObject *subtype, PyObject *args,
 			    PyObject *kwds)
 {
@@ -82,23 +255,26 @@ static Program *Program_new(PyTypeObject *subtype, PyObject *args,
 		return NULL;
 	}
 
-	PyObject *cache = PyDict_New();
+	_cleanup_pydecref_ PyObject *cache = PyDict_New();
 	if (!cache)
 		return NULL;
 
-	Program *prog = (Program *)Program_type.tp_alloc(&Program_type, 0);
-	if (!prog) {
-		Py_DECREF(cache);
+	_cleanup_pydecref_ Program *prog = call_tp_alloc(Program);
+	if (!prog)
 		return NULL;
-	}
-	prog->cache = cache;
+	prog->cache = no_cleanup_ptr(cache);
 	pyobjectp_set_init(&prog->objects);
 	drgn_program_init(&prog->prog, platform);
-	return prog;
+	drgn_program_set_blocking_callback(&prog->prog, drgnpy_begin_blocking,
+					   drgnpy_end_blocking, NULL);
+	if (Program_init_logging(prog))
+		return NULL;
+	return_ptr(prog);
 }
 
 static void Program_dealloc(Program *self)
 {
+	Program_deinit_logging(self);
 	drgn_program_deinit(&self->prog);
 	for (struct pyobjectp_set_iterator it =
 	     pyobjectp_set_first(&self->objects); it.entry;
@@ -136,39 +312,30 @@ static struct drgn_error *py_memory_read_fn(void *buf, uint64_t address,
 					    void *arg, bool physical)
 {
 	struct drgn_error *err;
-	PyGILState_STATE gstate;
-	PyObject *ret;
-	Py_buffer view;
 
-	gstate = PyGILState_Ensure();
-	ret = PyObject_CallFunction(arg, "KKKO", (unsigned long long)address,
-				    (unsigned long long)count,
-				    (unsigned long long)offset,
-				    physical ? Py_True : Py_False);
-	if (!ret) {
-		err = drgn_error_from_python();
-		goto out;
-	}
-	if (PyObject_GetBuffer(ret, &view, PyBUF_SIMPLE) == -1) {
-		err = drgn_error_from_python();
-		goto out_ret;
-	}
+	PyGILState_guard();
+
+	_cleanup_pydecref_ PyObject *ret =
+		PyObject_CallFunction(arg, "KKKO", (unsigned long long)address,
+				      (unsigned long long)count,
+				      (unsigned long long)offset,
+				      physical ? Py_True : Py_False);
+	if (!ret)
+		return drgn_error_from_python();
+	Py_buffer view;
+	if (PyObject_GetBuffer(ret, &view, PyBUF_SIMPLE) == -1)
+		return drgn_error_from_python();
 	if (view.len != count) {
 		PyErr_Format(PyExc_ValueError,
 			     "memory read callback returned buffer of length %zd (expected %zu)",
 			     view.len, count);
 		err = drgn_error_from_python();
-		goto out_view;
+		goto out;
 	}
 	memcpy(buf, view.buf, count);
-
 	err = NULL;
-out_view:
-	PyBuffer_Release(&view);
-out_ret:
-	Py_DECREF(ret);
 out:
-	PyGILState_Release(gstate);
+	PyBuffer_Release(&view);
 	return err;
 }
 
@@ -206,79 +373,61 @@ static PyObject *Program_add_memory_segment(Program *self, PyObject *args,
 	Py_RETURN_NONE;
 }
 
-static struct drgn_error *py_type_find_fn(enum drgn_type_kind kind,
-					  const char *name, size_t name_len,
-					  const char *filename, void *arg,
+static struct drgn_error *py_type_find_fn(uint64_t kinds, const char *name,
+					  size_t name_len, const char *filename,
+					  void *arg,
 					  struct drgn_qualified_type *ret)
 {
-	struct drgn_error *err;
-	PyGILState_STATE gstate;
-	PyObject *kind_obj, *name_obj;
-	PyObject *type_obj;
+	PyGILState_guard();
 
-	gstate = PyGILState_Ensure();
-	kind_obj = PyObject_CallFunction(TypeKind_class, "k",
-					 (unsigned long)kind);
-	if (!kind_obj) {
-		err = drgn_error_from_python();
-		goto out_gstate;
-	}
-	name_obj = PyUnicode_FromStringAndSize(name, name_len);
-	if (!name_obj) {
-		err = drgn_error_from_python();
-		goto out_kind_obj;
-	}
-	type_obj = PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOs",
-					 kind_obj, name_obj, filename);
-	if (!type_obj) {
-		err = drgn_error_from_python();
-		goto out_name_obj;
-	}
-	if (type_obj == Py_None) {
-		err = &drgn_not_found;
-		goto out_type_obj;
-	}
-	if (!PyObject_TypeCheck(type_obj, &DrgnType_type)) {
-		PyErr_SetString(PyExc_TypeError,
-				"type find callback must return Type or None");
-		err = drgn_error_from_python();
-		goto out_type_obj;
-	}
-	/*
-	 * This check is also done in libdrgn, but we need it here because if
-	 * the type isn't from this program, then there's no guarantee that it
-	 * will remain valid after we decrement its reference count.
-	 */
-	if (DrgnType_prog((DrgnType *)type_obj) !=
-	    (Program *)PyTuple_GET_ITEM(arg, 0)) {
-		PyErr_SetString(PyExc_ValueError,
-				"type find callback returned type from wrong program");
-		err = drgn_error_from_python();
-		goto out_type_obj;
-	}
+	_cleanup_pydecref_ PyObject *name_obj =
+		PyUnicode_FromStringAndSize(name, name_len);
+	if (!name_obj)
+		return drgn_error_from_python();
 
-	ret->type = ((DrgnType *)type_obj)->type;
-	ret->qualifiers = ((DrgnType *)type_obj)->qualifiers;
-	err = NULL;
-out_type_obj:
-	Py_DECREF(type_obj);
-out_name_obj:
-	Py_DECREF(name_obj);
-out_kind_obj:
-	Py_DECREF(kind_obj);
-out_gstate:
-	PyGILState_Release(gstate);
-	return err;
+	int kind;
+	for_each_bit(kind, kinds) {
+		_cleanup_pydecref_ PyObject *
+			kind_obj = PyObject_CallFunction(TypeKind_class, "i",
+							 kind);
+		if (!kind_obj)
+			return drgn_error_from_python();
+		_cleanup_pydecref_ PyObject *type_obj =
+			PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOs",
+					      kind_obj, name_obj, filename);
+		if (!type_obj)
+			return drgn_error_from_python();
+		if (type_obj == Py_None)
+			continue;
+		if (!PyObject_TypeCheck(type_obj, &DrgnType_type)) {
+			PyErr_SetString(PyExc_TypeError,
+					"type find callback must return Type or None");
+			return drgn_error_from_python();
+		}
+		// This check is also done in libdrgn, but we need it here
+		// because if the type isn't from this program, then there's no
+		// guarantee that it will remain valid after we decrement its
+		// reference count.
+		if (DrgnType_prog((DrgnType *)type_obj)
+		    != (Program *)PyTuple_GET_ITEM(arg, 0)) {
+			PyErr_SetString(PyExc_ValueError,
+					"type find callback returned type from wrong program");
+			return drgn_error_from_python();
+		}
+		ret->type = ((DrgnType *)type_obj)->type;
+		ret->qualifiers = ((DrgnType *)type_obj)->qualifiers;
+		return NULL;
+	}
+	return &drgn_not_found;
 }
 
 static PyObject *Program_add_type_finder(Program *self, PyObject *args,
 					 PyObject *kwds)
 {
-	static char *keywords[] = {"fn", NULL};
 	struct drgn_error *err;
-	PyObject *fn, *arg;
-	int ret;
 
+	static char *keywords[] = {"fn", NULL};
+	PyObject *fn;
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_type_finder",
 					 keywords, &fn))
 	    return NULL;
@@ -288,12 +437,10 @@ static PyObject *Program_add_type_finder(Program *self, PyObject *args,
 		return NULL;
 	}
 
-	arg = Py_BuildValue("OO", self, fn);
+	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
 	if (!arg)
 		return NULL;
-	ret = Program_hold_object(self, arg);
-	Py_DECREF(arg);
-	if (ret == -1)
+	if (Program_hold_object(self, arg))
 		return NULL;
 
 	err = drgn_program_add_type_finder(&self->prog, py_type_find_fn, arg);
@@ -307,61 +454,40 @@ static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
 					    enum drgn_find_object_flags flags,
 					    void *arg, struct drgn_object *ret)
 {
-	struct drgn_error *err;
-	PyGILState_STATE gstate;
-	PyObject *name_obj, *flags_obj;
-	PyObject *obj;
+	PyGILState_guard();
 
-	gstate = PyGILState_Ensure();
-	name_obj = PyUnicode_FromStringAndSize(name, name_len);
-	if (!name_obj) {
-		err = drgn_error_from_python();
-		goto out_gstate;
-	}
-	flags_obj = PyObject_CallFunction(FindObjectFlags_class, "i",
-					  (int)flags);
-	if (!flags_obj) {
-		err = drgn_error_from_python();
-		goto out_name_obj;
-	}
-	obj = PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOs",
-				    PyTuple_GET_ITEM(arg, 0), name_obj,
-				    flags_obj, filename);
-	if (!obj) {
-		err = drgn_error_from_python();
-		goto out_flags_obj;
-	}
-	if (obj == Py_None) {
-		err = &drgn_not_found;
-		goto out_obj;
-	}
+	_cleanup_pydecref_ PyObject *name_obj =
+		PyUnicode_FromStringAndSize(name, name_len);
+	if (!name_obj)
+		return drgn_error_from_python();
+	_cleanup_pydecref_ PyObject *flags_obj =
+		PyObject_CallFunction(FindObjectFlags_class, "i", (int)flags);
+	if (!flags_obj)
+		return drgn_error_from_python();
+	_cleanup_pydecref_ PyObject *obj =
+		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOs",
+				      PyTuple_GET_ITEM(arg, 0), name_obj,
+				      flags_obj, filename);
+	if (!obj)
+		return drgn_error_from_python();
+	if (obj == Py_None)
+		return &drgn_not_found;
 	if (!PyObject_TypeCheck(obj, &DrgnObject_type)) {
 		PyErr_SetString(PyExc_TypeError,
 				"object find callback must return Object or None");
-		err = drgn_error_from_python();
-		goto out_obj;
+		return drgn_error_from_python();
 	}
 
-	err = drgn_object_copy(ret, &((DrgnObject *)obj)->obj);
-out_obj:
-	Py_DECREF(obj);
-out_flags_obj:
-	Py_DECREF(flags_obj);
-out_name_obj:
-	Py_DECREF(name_obj);
-out_gstate:
-	PyGILState_Release(gstate);
-	return err;
+	return drgn_object_copy(ret, &((DrgnObject *)obj)->obj);
 }
 
 static PyObject *Program_add_object_finder(Program *self, PyObject *args,
 					   PyObject *kwds)
 {
-	static char *keywords[] = {"fn", NULL};
 	struct drgn_error *err;
-	PyObject *fn, *arg;
-	int ret;
 
+	static char *keywords[] = {"fn", NULL};
+	PyObject *fn;
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_object_finder",
 					 keywords, &fn))
 	    return NULL;
@@ -371,12 +497,10 @@ static PyObject *Program_add_object_finder(Program *self, PyObject *args,
 		return NULL;
 	}
 
-	arg = Py_BuildValue("OO", self, fn);
+	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
 	if (!arg)
 		return NULL;
-	ret = Program_hold_object(self, arg);
-	Py_DECREF(arg);
-	if (ret == -1)
+	if (Program_hold_object(self, arg))
 		return NULL;
 
 	err = drgn_program_add_object_finder(&self->prog, py_object_find_fn,
@@ -430,7 +554,7 @@ static PyObject *Program_set_pid(Program *self, PyObject *args, PyObject *kwds)
 	Py_RETURN_NONE;
 }
 
-DEFINE_VECTOR(path_arg_vector, struct path_arg)
+DEFINE_VECTOR(path_arg_vector, struct path_arg);
 
 static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 					 PyObject *kwds)
@@ -448,63 +572,57 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 	struct path_arg_vector path_args = VECTOR_INIT;
 	const char **paths = NULL;
 	if (paths_obj != Py_None) {
-		Py_ssize_t length_hint;
-		PyObject *it, *item;
-
-		it = PyObject_GetIter(paths_obj);
+		_cleanup_pydecref_ PyObject *it = PyObject_GetIter(paths_obj);
 		if (!it)
 			goto out;
 
-		length_hint = PyObject_LengthHint(paths_obj, 1);
-		if (length_hint == -1) {
-			Py_DECREF(it);
+		Py_ssize_t length_hint = PyObject_LengthHint(paths_obj, 1);
+		if (length_hint == -1)
 			goto out;
-		}
 		if (!path_arg_vector_reserve(&path_args, length_hint)) {
 			PyErr_NoMemory();
-			Py_DECREF(it);
 			goto out;
 		}
 
-		while ((item = PyIter_Next(it))) {
-			struct path_arg *path_arg;
-			int ret;
+		for (;;) {
+			_cleanup_pydecref_ PyObject *item = PyIter_Next(it);
+			if (!item)
+				break;
 
-			path_arg = path_arg_vector_append_entry(&path_args);
+			struct path_arg *path_arg =
+				path_arg_vector_append_entry(&path_args);
 			if (!path_arg) {
 				PyErr_NoMemory();
-				Py_DECREF(item);
 				break;
 			}
 			memset(path_arg, 0, sizeof(*path_arg));
-			ret = path_converter(item, path_arg);
-			Py_DECREF(item);
-			if (!ret) {
-				path_args.size--;
+			if (!path_converter(item, path_arg)) {
+				path_arg_vector_pop(&path_args);
 				break;
 			}
 		}
-		Py_DECREF(it);
 		if (PyErr_Occurred())
 			goto out;
 
-		paths = malloc_array(path_args.size, sizeof(*paths));
+		paths = malloc_array(path_arg_vector_size(&path_args),
+				     sizeof(*paths));
 		if (!paths) {
 			PyErr_NoMemory();
 			goto out;
 		}
-		for (size_t i = 0; i < path_args.size; i++)
-			paths[i] = path_args.data[i].path;
+		for (size_t i = 0; i < path_arg_vector_size(&path_args); i++)
+			paths[i] = path_arg_vector_at(&path_args, i)->path;
 	}
-	err = drgn_program_load_debug_info(&self->prog, paths, path_args.size,
+	err = drgn_program_load_debug_info(&self->prog, paths,
+					   path_arg_vector_size(&path_args),
 					   load_default, load_main);
 	free(paths);
 	if (err)
 		set_drgn_error(err);
 
 out:
-	for (size_t i = 0; i < path_args.size; i++)
-		path_cleanup(&path_args.data[i]);
+	vector_for_each(path_arg_vector, path_arg, &path_args)
+		path_cleanup(path_arg);
 	path_arg_vector_deinit(&path_args);
 	if (PyErr_Occurred())
 		return NULL;
@@ -528,9 +646,7 @@ static PyObject *Program_read(Program *self, PyObject *args, PyObject *kwds)
 	struct index_arg address = {};
 	Py_ssize_t size;
 	int physical = 0;
-	PyObject *buf;
 	bool clear;
-
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&n|p:read", keywords,
 					 index_converter, &address, &size,
 					 &physical))
@@ -540,7 +656,8 @@ static PyObject *Program_read(Program *self, PyObject *args, PyObject *kwds)
 		PyErr_SetString(PyExc_ValueError, "negative size");
 		return NULL;
 	}
-	buf = PyBytes_FromStringAndSize(NULL, size);
+	_cleanup_pydecref_ PyObject *buf =
+		PyBytes_FromStringAndSize(NULL, size);
 	if (!buf)
 		return NULL;
 	clear = set_drgn_in_python();
@@ -548,11 +665,9 @@ static PyObject *Program_read(Program *self, PyObject *args, PyObject *kwds)
 				       address.uvalue, size, physical);
 	if (clear)
 		clear_drgn_in_python();
-	if (err) {
-		Py_DECREF(buf);
+	if (err)
 		return set_drgn_error(err);
-	}
-	return buf;
+	return_ptr(buf);
 }
 
 #define METHOD_READ(x, type)							\
@@ -596,33 +711,39 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 					 &filename))
 		return NULL;
 
+	PyObject *ret = NULL;
 	if (PyObject_TypeCheck(name_or_type, &DrgnType_type)) {
 		if (DrgnType_prog((DrgnType *)name_or_type) != self) {
 			PyErr_SetString(PyExc_ValueError,
 					"type is from different program");
-			return NULL;
+			goto out;
 		}
 		Py_INCREF(name_or_type);
-		return name_or_type;
+		ret = name_or_type;
+		goto out;
 	} else if (!PyUnicode_Check(name_or_type)) {
 		PyErr_SetString(PyExc_TypeError,
 				"type() argument 1 must be str or Type");
-		return NULL;
+		goto out;
 	}
 
 	const char *name = PyUnicode_AsUTF8(name_or_type);
 	if (!name)
-		return NULL;
+		goto out;
 	bool clear = set_drgn_in_python();
 	struct drgn_qualified_type qualified_type;
 	err = drgn_program_find_type(&self->prog, name, filename.path,
 				     &qualified_type);
 	if (clear)
 		clear_drgn_in_python();
+	if (err) {
+		set_drgn_error(err);
+		goto out;
+	}
+	ret = DrgnType_wrap(qualified_type);
+out:
 	path_cleanup(&filename);
-	if (err)
-		return set_drgn_error(err);
-	return DrgnType_wrap(qualified_type);
+	return ret;
 }
 
 static DrgnObject *Program_find_object(Program *self, const char *name,
@@ -630,23 +751,22 @@ static DrgnObject *Program_find_object(Program *self, const char *name,
 				       enum drgn_find_object_flags flags)
 {
 	struct drgn_error *err;
-	DrgnObject *ret;
-	bool clear;
 
-	ret = DrgnObject_alloc(self);
+	DrgnObject *ret = DrgnObject_alloc(self);
 	if (!ret)
-		return NULL;
-
-	clear = set_drgn_in_python();
+		goto out;
+	bool clear = set_drgn_in_python();
 	err = drgn_program_find_object(&self->prog, name, filename->path, flags,
 				       &ret->obj);
 	if (clear)
 		clear_drgn_in_python();
-	path_cleanup(filename);
 	if (err) {
+		set_drgn_error(err);
 		Py_DECREF(ret);
-		return set_drgn_error(err);
+		ret = NULL;
 	}
+out:
+	path_cleanup(filename);
 	return ret;
 }
 
@@ -775,7 +895,7 @@ static PyObject *Program_symbols(Program *self, PyObject *args)
 	if (err)
 		return set_drgn_error(err);
 
-	PyObject *list = PyList_New(count);
+	_cleanup_pydecref_ PyObject *list = PyList_New(count);
 	if (!list) {
 		drgn_symbols_destroy(symbols, count);
 		return NULL;
@@ -785,15 +905,13 @@ static PyObject *Program_symbols(Program *self, PyObject *args)
 		if (!pysym) {
 			/* Free symbols which aren't yet added to list. */
 			drgn_symbols_destroy(symbols, count);
-			/* Free list and all symbols already added. */
-			Py_DECREF(list);
 			return NULL;
 		}
 		symbols[i] = NULL;
 		PyList_SET_ITEM(list, i, pysym);
 	}
 	free(symbols);
-	return list;
+	return_ptr(list);
 }
 
 static PyObject *Program_symbol(Program *self, PyObject *arg)
@@ -833,9 +951,7 @@ static ThreadIterator *Program_threads(Program *self)
 	struct drgn_error *err = drgn_thread_iterator_create(&self->prog, &it);
 	if (err)
 		return set_drgn_error(err);
-	ThreadIterator *ret =
-		(ThreadIterator *)ThreadIterator_type.tp_alloc(&ThreadIterator_type,
-							       0);
+	ThreadIterator *ret = call_tp_alloc(ThreadIterator);
 	if (!ret) {
 		drgn_thread_iterator_destroy(it);
 		return NULL;
@@ -890,27 +1006,35 @@ static PyObject *Program_crashed_thread(Program *self)
 	return Thread_wrap(thread);
 }
 
+// Used for testing.
+static PyObject *Program__log(Program *self, PyObject *args, PyObject *kwds)
+{
+	int level;
+	const char *str;
+	if (!PyArg_ParseTuple(args, "is", &level, &str))
+		return NULL;
+	drgn_log(level, &self->prog, "%s", str);
+	Py_RETURN_NONE;
+}
+
 static DrgnObject *Program_subscript(Program *self, PyObject *key)
 {
 	struct drgn_error *err;
-	const char *name;
-	DrgnObject *ret;
-	bool clear;
 
 	if (!PyUnicode_Check(key)) {
 		PyErr_SetObject(PyExc_KeyError, key);
 		return NULL;
 	}
 
-	name = PyUnicode_AsUTF8(key);
+	const char *name = PyUnicode_AsUTF8(key);
 	if (!name)
 		return NULL;
 
-	ret = DrgnObject_alloc(self);
+	_cleanup_pydecref_ DrgnObject *ret = DrgnObject_alloc(self);
 	if (!ret)
 		return NULL;
 
-	clear = set_drgn_in_python();
+	bool clear = set_drgn_in_python();
 	err = drgn_program_find_object(&self->prog, name, NULL,
 				       DRGN_FIND_OBJECT_ANY, &ret->obj);
 	if (clear)
@@ -922,10 +1046,9 @@ static DrgnObject *Program_subscript(Program *self, PyObject *key)
 		} else {
 			set_drgn_error(err);
 		}
-		Py_DECREF(ret);
 		return NULL;
 	}
-	return ret;
+	return_ptr(ret);
 }
 
 static int Program_contains(Program *self, PyObject *key)
@@ -1076,6 +1199,7 @@ static PyMethodDef Program_methods[] = {
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_array_type_DOC},
 	{"function_type", (PyCFunction)Program_function_type,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_function_type_DOC},
+	{"_log", (PyCFunction)Program__log, METH_VARARGS},
 	{},
 };
 
@@ -1124,14 +1248,13 @@ Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds)
 	static char *keywords[] = {"path", NULL};
 	struct drgn_error *err;
 	struct path_arg path = {};
-	Program *prog;
-
 	if (!PyArg_ParseTupleAndKeywords(args, kwds,
 					 "O&:program_from_core_dump", keywords,
 					 path_converter, &path))
 		return NULL;
 
-	prog = (Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
+	_cleanup_pydecref_ Program *prog =
+		(Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
 	if (!prog) {
 		path_cleanup(&path);
 		return NULL;
@@ -1139,49 +1262,39 @@ Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds)
 
 	err = drgn_program_init_core_dump(&prog->prog, path.path);
 	path_cleanup(&path);
-	if (err) {
-		Py_DECREF(prog);
+	if (err)
 		return set_drgn_error(err);
-	}
-	return prog;
+	return_ptr(prog);
 }
 
 Program *program_from_kernel(PyObject *self)
 {
 	struct drgn_error *err;
-	Program *prog;
-
-	prog = (Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
+	_cleanup_pydecref_ Program *prog =
+		(Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
 	if (!prog)
 		return NULL;
-
 	err = drgn_program_init_kernel(&prog->prog);
-	if (err) {
-		Py_DECREF(prog);
+	if (err)
 		return set_drgn_error(err);
-	}
-	return prog;
+	return_ptr(prog);
 }
 
 Program *program_from_pid(PyObject *self, PyObject *args, PyObject *kwds)
 {
-	static char *keywords[] = {"pid", NULL};
 	struct drgn_error *err;
+	static char *keywords[] = {"pid", NULL};
 	int pid;
-	Program *prog;
-
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "i:program_from_pid",
 					 keywords, &pid))
 		return NULL;
 
-	prog = (Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
+	_cleanup_pydecref_ Program *prog =
+		(Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
 	if (!prog)
 		return NULL;
-
 	err = drgn_program_init_pid(&prog->prog, pid);
-	if (err) {
-		Py_DECREF(prog);
+	if (err)
 		return set_drgn_error(err);
-	}
-	return prog;
+	return_ptr(prog);
 }

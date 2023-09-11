@@ -1,12 +1,10 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
  *
  * Miscellanous utility functions.
- *
- * Several of these are taken from the Linux kernel source.
  */
 
 #ifndef DRGN_UTIL_H
@@ -14,6 +12,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -21,6 +20,12 @@
 
 #ifndef LIBDRGN_PUBLIC
 #define LIBDRGN_PUBLIC __attribute__((__visibility__("default")))
+#endif
+
+#if defined(__has_attribute) && __has_attribute(__fallthrough__)
+#define fallthrough __attribute__((__fallthrough__))
+#else
+#define fallthrough do {} while (0)
 #endif
 
 #ifdef NDEBUG
@@ -60,37 +65,24 @@
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
-#define __compiletime_error(message) __attribute__((__error__(message)))
-#else
-#define __compiletime_error(message)
-#endif
-#ifdef __OPTIMIZE__
-# define __compiletime_assert(condition, msg, prefix, suffix)		\
-	do {								\
-		extern void prefix ## suffix(void) __compiletime_error(msg); \
-		if (!(condition))					\
-			prefix ## suffix();				\
-	} while (0)
-#else
-# define __compiletime_assert(condition, msg, prefix, suffix) do { } while (0)
-#endif
-#define _compiletime_assert(condition, msg, prefix, suffix) \
-	__compiletime_assert(condition, msg, prefix, suffix)
-#define compiletime_assert(condition, msg) \
-	_compiletime_assert(condition, msg, __compiletime_assert_, __LINE__)
+/** Return whether two types or expressions have compatible types. */
+#define types_compatible(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
 
-#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:(-!!(e)); }))
-#define BUILD_BUG_ON_MSG(cond, msg) compiletime_assert(!(cond), msg)
+/**
+ * `static_assert(assert_expression, message)` as an expression that evaluates
+ * to `eval_expression`.
+ */
+#define static_assert_expression(assert_expression, message, eval_expression)	\
+	_Generic(sizeof(struct { _Static_assert(assert_expression, message); int _; }),\
+		 default: (eval_expression))
 
-#define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
-
-#define container_of(ptr, type, member) ({				\
-	void *__mptr = (void *)(ptr);					\
-	BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) &&	\
-			 !__same_type(*(ptr), void),			\
-			 "pointer type mismatch in container_of()");	\
-	((type *)(__mptr - offsetof(type, member))); })
+#define container_of(ptr, type, member)				\
+static_assert_expression(					\
+	types_compatible(*(ptr), ((type *)0)->member)		\
+	|| types_compatible(*(ptr), void),			\
+	"pointer does not match member type",			\
+	(type *)((char *)(ptr) - offsetof(type, member))	\
+)
 
 static inline bool strstartswith(const char *s, const char *prefix)
 {
@@ -191,7 +183,10 @@ static inline uint64_t uint_max(int n)
  *
  * A more natural definition would be `i == 0 ? ptr : ptr + i`, but some
  * versions of GCC and Clang generate an unnecessary branch or conditional move
- * (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=97225).
+ * (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=97225). Note that in standard
+ * C, it is undefined behavior to cast to `uintptr_t`, do arithmetic, and cast
+ * back, but GCC allows this as long as the result is within the same object:
+ * https://gcc.gnu.org/onlinedocs/gcc/Arrays-and-pointers-implementation.html.
  */
 #define add_to_possibly_null_pointer(ptr, i)	\
 	((typeof(ptr))((uintptr_t)(ptr) + (i) * sizeof(*(ptr))))

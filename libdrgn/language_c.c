@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
 #include <ctype.h>
@@ -536,14 +536,13 @@ static struct drgn_error *
 c_format_type_name(struct drgn_qualified_type qualified_type, char **ret)
 {
 	struct drgn_error *err;
-	struct string_builder sb = {};
-
+	struct string_builder sb = STRING_BUILDER_INIT;
 	err = c_format_type_name_impl(qualified_type, &sb);
 	if (err) {
 		free(sb.str);
 		return err;
 	}
-	if (!string_builder_finalize(&sb, ret))
+	if (!(*ret = string_builder_null_terminate(&sb)))
 		return &drgn_enomem;
 	return NULL;
 }
@@ -552,8 +551,7 @@ static struct drgn_error *
 c_format_type(struct drgn_qualified_type qualified_type, char **ret)
 {
 	struct drgn_error *err;
-	struct string_builder sb = {};
-
+	struct string_builder sb = STRING_BUILDER_INIT;
 	if (drgn_type_is_complete(qualified_type.type))
 		err = c_define_type(qualified_type, 0, &sb);
 	else
@@ -562,7 +560,7 @@ c_format_type(struct drgn_qualified_type qualified_type, char **ret)
 		free(sb.str);
 		return err;
 	}
-	if (!string_builder_finalize(&sb, ret))
+	if (!(*ret = string_builder_null_terminate(&sb)))
 		return &drgn_enomem;
 	return NULL;
 }
@@ -692,30 +690,70 @@ c_format_int_object(const struct drgn_object *obj,
 		return NULL;
 	}
 
+	union drgn_value value_mem;
+	const union drgn_value *value;
+	err = drgn_object_read_value(obj, &value_mem, &value);
+	if (err)
+		return err;
 	switch (obj->encoding) {
-	case DRGN_OBJECT_ENCODING_SIGNED: {
-		int64_t svalue;
-
-		err = drgn_object_read_signed(obj, &svalue);
-		if (err)
-			return err;
-		if (!string_builder_appendf(sb, "%" PRId64, svalue))
-			return &drgn_enomem;
-		return NULL;
-	}
-	case DRGN_OBJECT_ENCODING_UNSIGNED: {
-		uint64_t uvalue;
-
-		err = drgn_object_read_unsigned(obj, &uvalue);
-		if (err)
-			return err;
-		if (!string_builder_appendf(sb, "%" PRIu64, uvalue))
-			return &drgn_enomem;
-		return NULL;
+	case DRGN_OBJECT_ENCODING_SIGNED:
+		if (!string_builder_appendf(sb, "%" PRId64, value->svalue)) {
+			err = &drgn_enomem;
+			goto out;
+		}
+		break;
+	case DRGN_OBJECT_ENCODING_UNSIGNED:
+		if (!string_builder_appendf(sb, "%" PRIu64, value->uvalue)) {
+			err = &drgn_enomem;
+			goto out;
+		}
+		break;
+	case DRGN_OBJECT_ENCODING_SIGNED_BIG:
+	case DRGN_OBJECT_ENCODING_UNSIGNED_BIG: {
+		if (!string_builder_append(sb, "0x")) {
+			err = &drgn_enomem;
+			goto out;
+		}
+		const uint8_t *buf = (uint8_t *)value->bufp;
+		size_t bytes = drgn_object_size(obj);
+		if (obj->little_endian) {
+			size_t i = bytes - 1;
+			while (i > 0 && buf[i] == 0)
+				i--;
+			if (!string_builder_appendf(sb, "%" PRIx8, buf[i])) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			while (i-- > 0) {
+				if (!string_builder_appendf(sb, "%02" PRIx8, buf[i])) {
+					err = &drgn_enomem;
+					goto out;
+				}
+			}
+		} else {
+			size_t i = 0;
+			while (i < bytes - 1 && buf[i] == 0)
+				i++;
+			if (!string_builder_appendf(sb, "%" PRIx8, buf[i])) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			while (++i < bytes) {
+				if (!string_builder_appendf(sb, "%02" PRIx8, buf[i])) {
+					err = &drgn_enomem;
+					goto out;
+				}
+			}
+		}
+		break;
 	}
 	default:
 		UNREACHABLE();
 	}
+	err = NULL;
+out:
+	drgn_object_deinit_value(obj, value);
+	return err;
 }
 
 static struct drgn_error *
@@ -978,7 +1016,7 @@ struct compound_initializer_state {
 	uint64_t bit_offset;
 };
 
-DEFINE_VECTOR(compound_initializer_stack, struct compound_initializer_state)
+DEFINE_VECTOR(compound_initializer_stack, struct compound_initializer_state);
 
 struct compound_initializer_iter {
 	struct initializer_iter iter;
@@ -997,13 +1035,13 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 		container_of(iter_, struct compound_initializer_iter, iter);
 
 	for (;;) {
-		if (!iter->stack.size)
+		if (compound_initializer_stack_empty(&iter->stack))
 			return &drgn_stop;
 
 		struct compound_initializer_state *top =
-			&iter->stack.data[iter->stack.size - 1];
+			compound_initializer_stack_last(&iter->stack);
 		if (top->member == top->end) {
-			iter->stack.size--;
+			compound_initializer_stack_pop(&iter->stack);
 			continue;
 		}
 
@@ -1063,11 +1101,9 @@ static void compound_initializer_iter_reset(struct initializer_iter *iter_)
 {
 	struct compound_initializer_iter *iter =
 		container_of(iter_, struct compound_initializer_iter, iter);
-	struct drgn_type *underlying_type =
-		drgn_underlying_type(iter->obj->type);
-
-	iter->stack.size = 1;
-	iter->stack.data[0].member = drgn_type_members(underlying_type);
+	compound_initializer_stack_resize(&iter->stack, 1);
+	compound_initializer_stack_first(&iter->stack)->member =
+		drgn_type_members(drgn_underlying_type(iter->obj->type));
 }
 
 static struct drgn_error *
@@ -1077,7 +1113,7 @@ compound_initializer_append_designation(struct initializer_iter *iter_,
 	struct compound_initializer_iter *iter =
 		container_of(iter_, struct compound_initializer_iter, iter);
 	struct compound_initializer_state *top =
-		&iter->stack.data[iter->stack.size - 1];
+		compound_initializer_stack_last(&iter->stack);
 	const char *name = top->member[-1].name;
 
 	if (name && !string_builder_appendf(sb, ".%s = ", name))
@@ -1174,7 +1210,7 @@ c_format_compound_object(const struct drgn_object *obj,
 		} while (new->member < new->end);
 		drgn_object_deinit(&member);
 		if (err)
-			return err;
+			goto out;
 	}
 
 	err = c_format_initializer(drgn_object_program(obj), &iter.iter, indent,
@@ -1604,15 +1640,14 @@ static struct drgn_error *c_format_object(const struct drgn_object *obj,
 					  char **ret)
 {
 	struct drgn_error *err;
-	struct string_builder sb = {};
-
+	struct string_builder sb = STRING_BUILDER_INIT;
 	err = c_format_object_impl(obj, 0, columns, max(columns, (size_t)1),
 				   flags, &sb);
 	if (err) {
 		free(sb.str);
 		return err;
 	}
-	if (!string_builder_finalize(&sb, ret))
+	if (!(*ret = string_builder_null_terminate(&sb)))
 		return &drgn_enomem;
 	return NULL;
 }
@@ -1653,6 +1688,8 @@ enum {
 	C_TOKEN_DOT,
 	C_TOKEN_NUMBER,
 	C_TOKEN_IDENTIFIER,
+	C_TOKEN_TEMPLATE_ARGUMENTS,
+	C_TOKEN_COLON,
 };
 
 #include "c_keywords.inc"
@@ -1699,6 +1736,43 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 		token->kind = C_TOKEN_DOT;
 		p++;
 		break;
+	case ':':
+		token->kind = C_TOKEN_COLON;
+		p++;
+		break;
+	case '<':
+		// This is a hack for cpp_append_to_identifier(). We don't want
+		// to deal with actually parsing template arguments, and we
+		// don't care about "<" otherwise, so this scans a token from
+		// the "<" to its matching ">".
+		if (cpp) {
+			token->kind = C_TOKEN_TEMPLATE_ARGUMENTS;
+			p++;
+			size_t less_thans = 1;
+			bool in_single_quotes = false;
+			do {
+				switch (*p++) {
+				case '<':
+					if (!in_single_quotes)
+						less_thans++;
+					break;
+				case '>':
+					if (!in_single_quotes)
+						less_thans--;
+					break;
+				case '\'':
+					// Handling the edge-case of an escaped single-quote
+					if (!(in_single_quotes && *(p - 2) == '\\'))
+						in_single_quotes = !in_single_quotes;
+					break;
+				case '\0':
+					return drgn_error_create(DRGN_ERROR_SYNTAX,
+								 "invalid template arguments");
+				}
+			} while (less_thans > 0);
+			break;
+		}
+		fallthrough;
 	default:
 		if (isalpha(*p) || *p == '_') {
 			do {
@@ -2063,6 +2137,45 @@ out:
 	return primitive;
 }
 
+
+// The DWARF index currently includes template arguments in indexed names. So,
+// to be able to find a type with template arguments, we have to look it up with
+// the template arguments included. This looks for a C_TOKEN_TEMPLATE_ARGUMENTS
+// token after the identifier and returns the length from the beginning of the
+// identifier to the end of the template arguments.
+//
+// Note that this requires that the user formats the template arguments exactly
+// as they appear in DWARF (which can vary between compilers). In the future, it
+// might be better to properly parse and either normalize the template arguments
+// or look them up as an AST somehow.
+static struct drgn_error *cpp_append_to_identifier(
+	struct drgn_lexer *lexer, const char *identifier, size_t *len_ret)
+{
+	struct drgn_error *err;
+
+	// Only for C++.
+	if (!((struct drgn_c_family_lexer *)lexer)->cpp)
+		return NULL;
+
+	struct drgn_token token;
+
+	do {
+		err = drgn_lexer_pop(lexer, &token);
+	} while (!err && (token.kind == C_TOKEN_IDENTIFIER ||
+			  token.kind == C_TOKEN_COLON));
+
+	if (err)
+		return err;
+	if (token.kind != C_TOKEN_TEMPLATE_ARGUMENTS) {
+		err = drgn_lexer_push(lexer, &token);
+		if (err)
+			return err;
+	}
+
+	*len_ret = token.value + token.len - identifier;
+	return NULL;
+}
+
 static struct drgn_error *
 c_parse_specifier_qualifier_list(struct drgn_program *prog,
 				 struct drgn_lexer *lexer, const char *filename,
@@ -2110,10 +2223,15 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 							 keyword_spelling[token.kind],
 							 specifier_spelling[prev_specifier]);
 			}
-		} else if (token.kind == C_TOKEN_IDENTIFIER &&
-			   specifier == SPECIFIER_NONE && !identifier) {
+		} else if ((token.kind == C_TOKEN_IDENTIFIER ||
+			    token.kind == C_TOKEN_COLON) &&
+			    specifier == SPECIFIER_NONE && !identifier) {
 			identifier = token.value;
 			identifier_len = token.len;
+			err = cpp_append_to_identifier(lexer, identifier,
+						       &identifier_len);
+			if (err)
+				return err;
 		} else if (token.kind == C_TOKEN_STRUCT ||
 			   token.kind == C_TOKEN_UNION ||
 			   token.kind == C_TOKEN_CLASS ||
@@ -2133,7 +2251,8 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 			err = drgn_lexer_pop(lexer, &token);
 			if (err)
 				return err;
-			if (token.kind != C_TOKEN_IDENTIFIER) {
+			if (!(token.kind == C_TOKEN_IDENTIFIER ||
+			      token.kind == C_TOKEN_COLON)) {
 				return drgn_error_format(DRGN_ERROR_SYNTAX,
 							 "expected identifier after '%s'",
 							 keyword_spelling[tag_token]);
@@ -2141,6 +2260,10 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 			}
 			identifier = token.value;
 			identifier_len = token.len;
+			err = cpp_append_to_identifier(lexer, identifier,
+						       &identifier_len);
+			if (err)
+				return err;
 		} else {
 			err = drgn_lexer_push(lexer, &token);
 			if (err)
@@ -2150,18 +2273,19 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 	}
 
 	if (specifier == SPECIFIER_NONE) {
-		enum drgn_type_kind kind;
-
+		uint64_t kinds;
 		if (tag_token == C_TOKEN_STRUCT) {
-			kind = DRGN_TYPE_STRUCT;
+			kinds = 1 << DRGN_TYPE_STRUCT;
 		} else if (tag_token == C_TOKEN_UNION) {
-			kind = DRGN_TYPE_UNION;
+			kinds = 1 << DRGN_TYPE_UNION;
 		} else if (tag_token == C_TOKEN_CLASS) {
-			kind = DRGN_TYPE_CLASS;
+			kinds = 1 << DRGN_TYPE_CLASS;
 		} else if (tag_token == C_TOKEN_ENUM) {
-			kind = DRGN_TYPE_ENUM;
+			kinds = 1 << DRGN_TYPE_ENUM;
 		} else if (identifier) {
-			if (strstartswith(identifier, "size_t")) {
+			if (identifier_len == sizeof("size_t") - 1 &&
+			    memcmp(identifier, "size_t",
+				   sizeof("size_t") - 1) == 0) {
 				err = drgn_program_find_primitive_type(prog,
 								       DRGN_C_TYPE_SIZE_T,
 								       &ret->type);
@@ -2169,7 +2293,9 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 					return err;
 				ret->qualifiers = 0;
 				goto out;
-			} else if (strstartswith(identifier, "ptrdiff_t")) {
+			} else if (identifier_len == sizeof("ptrdiff_t") - 1 &&
+				   memcmp(identifier, "ptrdiff_t",
+					  sizeof("ptrdiff_t") - 1) == 0) {
 				err = drgn_program_find_primitive_type(prog,
 								       DRGN_C_TYPE_PTRDIFF_T,
 								       &ret->type);
@@ -2177,15 +2303,21 @@ c_parse_specifier_qualifier_list(struct drgn_program *prog,
 					return err;
 				ret->qualifiers = 0;
 				goto out;
+			} else if (((struct drgn_c_family_lexer *)lexer)->cpp) {
+				kinds = ((1 << DRGN_TYPE_STRUCT)
+					 | (1 << DRGN_TYPE_UNION)
+					 | (1 << DRGN_TYPE_CLASS)
+					 | (1 << DRGN_TYPE_ENUM)
+					 | (1 << DRGN_TYPE_TYPEDEF));
 			} else {
-				kind = DRGN_TYPE_TYPEDEF;
+				kinds = 1 << DRGN_TYPE_TYPEDEF;
 			}
 		} else {
 			return drgn_error_create(DRGN_ERROR_SYNTAX,
 						 "expected type specifier");
 		}
 
-		err = drgn_program_find_type_impl(prog, kind, identifier,
+		err = drgn_program_find_type_impl(prog, kinds, identifier,
 						  identifier_len, filename,
 						  ret);
 		if (err)

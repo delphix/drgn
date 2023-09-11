@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -40,7 +40,7 @@ begin_virtual_address_translation(struct drgn_program *prog, uint64_t pgtable,
 			goto err;
 		}
 		if (!prog->platform.arch->linux_kernel_pgtable_iterator_next) {
-			err = drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
+			err = drgn_error_format(DRGN_ERROR_NOT_IMPLEMENTED,
 						"virtual address translation is not implemented for %s architecture",
 						prog->platform.arch->name);
 			goto err;
@@ -190,6 +190,35 @@ out:
 	return err;
 }
 
+struct drgn_error *linux_helper_follow_phys(struct drgn_program *prog,
+					    uint64_t pgtable,
+					    uint64_t virt_addr, uint64_t *ret)
+{
+	struct drgn_error *err;
+
+	err = begin_virtual_address_translation(prog, pgtable, virt_addr);
+	if (err)
+		return err;
+
+	struct pgtable_iterator *it = prog->pgtable_it;
+	pgtable_iterator_next_fn *next =
+		prog->platform.arch->linux_kernel_pgtable_iterator_next;
+	uint64_t start_virt_addr, start_phys_addr;
+	err = next(prog, it, &start_virt_addr, &start_phys_addr);
+	if (err)
+		goto out;
+	if (start_phys_addr == UINT64_MAX) {
+		err = drgn_error_create_fault("address is not mapped",
+					      virt_addr);
+		goto out;
+	}
+	*ret = start_phys_addr + (virt_addr - start_virt_addr);
+	err = NULL;
+out:
+	end_virtual_address_translation(prog);
+	return err;
+}
+
 struct drgn_error *linux_helper_per_cpu_ptr(struct drgn_object *res,
 					    const struct drgn_object *ptr,
 					    uint64_t cpu)
@@ -228,7 +257,8 @@ out:
 	return err;
 }
 
-struct drgn_error *linux_helper_idle_task(struct drgn_object *res, uint64_t cpu)
+static struct drgn_error *cpu_rq_member(struct drgn_object *res, uint64_t cpu,
+					const char *member_name)
 {
 	struct drgn_error *err;
 	struct drgn_program *prog = drgn_object_program(res);
@@ -245,57 +275,140 @@ struct drgn_error *linux_helper_idle_task(struct drgn_object *res, uint64_t cpu)
 	err = linux_helper_per_cpu_ptr(&tmp, &tmp, cpu);
 	if (err)
 		goto out;
-	err = drgn_object_member_dereference(res, &tmp, "idle");
+	err = drgn_object_member_dereference(&tmp, &tmp, member_name);
+	if (err)
+		goto out;
+	err = drgn_object_read(res, &tmp);
+out:
+	drgn_object_deinit(&tmp);
+	return err;
+}
+
+struct drgn_error *linux_helper_cpu_curr(struct drgn_object *res, uint64_t cpu)
+{
+	return cpu_rq_member(res, cpu, "curr");
+}
+
+struct drgn_error *linux_helper_idle_task(struct drgn_object *res, uint64_t cpu)
+{
+	return cpu_rq_member(res, cpu, "idle");
+}
+
+struct drgn_error *linux_helper_task_cpu(const struct drgn_object *task,
+					 uint64_t *ret)
+{
+	struct drgn_error *err;
+	struct drgn_object tmp;
+	drgn_object_init(&tmp, drgn_object_program(task));
+
+	// If CONFIG_THREAD_INFO_IN_TASK=y and since Linux kernel commit
+	// bcf9033e5449 ("sched: move CPU field back into thread_info if
+	// THREAD_INFO_IN_TASK=y") (in v5.16), the CPU is task->thread_info.cpu.
+	//
+	// If CONFIG_THREAD_INFO_IN_TASK=y but before that commit, the cpu is
+	// task->cpu.
+	//
+	// If CONFIG_THREAD_INFO_IN_TASK=n or before Linux kernel commit
+	// c65eacbe290b ("sched/core: Allow putting thread_info into
+	// task_struct") (in v4.9), the CPU is
+	// ((struct thread_info *)task->stack)->cpu.
+	//
+	// If none of those exist, then the kernel must be !SMP.
+	err = drgn_object_member_dereference(&tmp, task, "thread_info");
+	if (!err) {
+		err = drgn_object_member(&tmp, &tmp, "cpu");
+		if (err && err->code == DRGN_ERROR_LOOKUP) {
+			drgn_error_destroy(err);
+			err = drgn_object_member_dereference(&tmp, task, "cpu");
+		}
+	} else if (err->code == DRGN_ERROR_LOOKUP) {
+		// CONFIG_THREAD_INFO_IN_TASK=n
+		drgn_error_destroy(err);
+		err = drgn_object_member_dereference(&tmp, task, "stack");
+		if (err)
+			goto out;
+		struct drgn_qualified_type thread_info_type;
+		err = drgn_program_find_type(drgn_object_program(task),
+					     "struct thread_info *", NULL,
+					     &thread_info_type);
+		if (err)
+			goto out;
+		err = drgn_object_cast(&tmp, thread_info_type, &tmp);
+		if (err)
+			goto out;
+		err = drgn_object_member_dereference(&tmp, &tmp, "cpu");
+	}
+	if (!err) {
+		union drgn_value value;
+		err = drgn_object_read_integer(&tmp, &value);
+		if (!err)
+			*ret = value.uvalue;
+	} else if (err->code == DRGN_ERROR_LOOKUP) {
+		// CONFIG_SMP=n
+		drgn_error_destroy(err);
+		*ret = 0;
+		err = NULL;
+	}
 out:
 	drgn_object_deinit(&tmp);
 	return err;
 }
 
 struct drgn_error *
-linux_helper_radix_tree_lookup(struct drgn_object *res,
-			       const struct drgn_object *root, uint64_t index)
+linux_helper_xa_load(struct drgn_object *res,
+		     const struct drgn_object *xa, uint64_t index)
 {
 	struct drgn_error *err;
-	static const uint64_t RADIX_TREE_ENTRY_MASK = 3;
-	uint64_t RADIX_TREE_INTERNAL_NODE;
-	uint64_t RADIX_TREE_MAP_MASK;
-	struct drgn_object node, tmp;
-	struct drgn_qualified_type node_type;
 
+	struct drgn_object entry, node, tmp;
+	struct drgn_qualified_type node_type;
+	uint64_t internal_flag, node_min;
+
+	drgn_object_init(&entry, drgn_object_program(res));
 	drgn_object_init(&node, drgn_object_program(res));
 	drgn_object_init(&tmp, drgn_object_program(res));
 
-	/* node = root->xa_head */
-	err = drgn_object_member_dereference(&node, root, "xa_head");
+	// See xa_for_each() in drgn/helpers/linux/xarray.py for a description
+	// of the cases we have to handle.
+	// entry = xa->xa_head
+	err = drgn_object_member_dereference(&entry, xa, "xa_head");
 	if (!err) {
+		err = drgn_object_read(&entry, &entry);
+		if (err)
+			goto out;
+		// node_type = struct xa_node *
 		err = drgn_program_find_type(drgn_object_program(res),
 					     "struct xa_node *", NULL,
 					     &node_type);
 		if (err)
 			goto out;
-		RADIX_TREE_INTERNAL_NODE = 2;
+		internal_flag = 2;
+		node_min = 4097;
 	} else if (err->code == DRGN_ERROR_LOOKUP) {
 		drgn_error_destroy(err);
-		/* node = (void *)root.rnode */
-		err = drgn_object_member_dereference(&node, root, "rnode");
+		// entry = (void *)xa->rnode
+		err = drgn_object_member_dereference(&entry, xa, "rnode");
 		if (err)
 			goto out;
+		// node_type = typeof(xa->rnode)
+		node_type = drgn_object_qualified_type(&entry);
+		struct drgn_qualified_type voidp_type;
 		err = drgn_program_find_type(drgn_object_program(res), "void *",
-					     NULL, &node_type);
+					     NULL, &voidp_type);
 		if (err)
 			goto out;
-		err = drgn_object_cast(&node, node_type, &node);
+		err = drgn_object_cast(&entry, voidp_type, &entry);
 		if (err)
 			goto out;
-		err = drgn_program_find_type(drgn_object_program(res),
-					     "struct radix_tree_node *", NULL,
-					     &node_type);
-		if (err)
-			goto out;
-		RADIX_TREE_INTERNAL_NODE = 1;
+		internal_flag = 1;
+		node_min = 0;
 	} else {
 		goto out;
 	}
+
+	// xa_is_node() or radix_tree_is_internal_node()
+#define is_node(entry_value) \
+	(((entry_value) & 3) == internal_flag && (entry_value) >= node_min)
 
 	struct drgn_type_member *member;
 	uint64_t member_bit_offset;
@@ -309,54 +422,158 @@ linux_helper_radix_tree_lookup(struct drgn_object *res,
 		goto out;
 	if (drgn_type_kind(member_type.type) != DRGN_TYPE_ARRAY) {
 		err = drgn_error_create(DRGN_ERROR_TYPE,
-					"struct radix_tree_node slots member is not an array");
+					"struct xa_node slots member is not an array");
 		goto out;
 	}
-	RADIX_TREE_MAP_MASK = drgn_type_length(member_type.type) - 1;
-
-	for (;;) {
-		uint64_t value;
-		union drgn_value shift;
-		uint64_t offset;
-
-		err = drgn_object_read(&node, &node);
+	uint64_t XA_CHUNK_MASK = drgn_type_length(member_type.type) - 1;
+	uint64_t sizeof_slots;
+	if (node_min == 0) { // !xarray
+		err = drgn_type_sizeof(member_type.type, &sizeof_slots);
 		if (err)
 			goto out;
-		err = drgn_object_read_unsigned(&node, &value);
-		if (err)
-			goto out;
-		if ((value & RADIX_TREE_ENTRY_MASK) != RADIX_TREE_INTERNAL_NODE)
-			break;
+	}
+
+	uint64_t entry_value;
+	err = drgn_object_read_unsigned(&entry, &entry_value);
+	if (err)
+		goto out;
+	if (is_node(entry_value)) {
+		// node = xa_to_node(entry)
+		// or
+		// node = entry_to_node(entry)
 		err = drgn_object_set_unsigned(&node, node_type,
-					       value & ~RADIX_TREE_INTERNAL_NODE,
-					       0);
+					       entry_value - internal_flag, 0);
 		if (err)
 			goto out;
+		// node_shift = node->shift
 		err = drgn_object_member_dereference(&tmp, &node, "shift");
 		if (err)
 			goto out;
-		err = drgn_object_read_integer(&tmp, &shift);
+		union drgn_value node_shift;
+		err = drgn_object_read_integer(&tmp, &node_shift);
 		if (err)
 			goto out;
-		if (shift.uvalue >= 64)
+
+		uint64_t offset;
+		if (node_shift.uvalue >= 64) // Avoid undefined behavior.
 			offset = 0;
 		else
-			offset = (index >> shift.uvalue) & RADIX_TREE_MAP_MASK;
-		err = drgn_object_member_dereference(&tmp, &node, "slots");
-		if (err)
-			goto out;
-		err = drgn_object_subscript(&node, &tmp, offset);
-		if (err)
-			goto out;
+			offset = index >> node_shift.uvalue;
+		if (offset > XA_CHUNK_MASK)
+			goto null;
+
+		for (;;) {
+			// entry = node->slots[offset]
+			err = drgn_object_member_dereference(&tmp, &node,
+							     "slots");
+			if (err)
+				goto out;
+			err = drgn_object_subscript(&entry, &tmp, offset);
+			if (err)
+				goto out;
+			err = drgn_object_read(&entry, &entry);
+			if (err)
+				goto out;
+			err = drgn_object_read_unsigned(&entry, &entry_value);
+			if (err)
+				goto out;
+
+			if ((entry_value & 3) == internal_flag) {
+				if (node_min != 0 && // xarray
+				    entry_value < 256) { // xa_is_sibling()
+					// entry = node->slots[xa_to_sibling(entry)]
+					err = drgn_object_subscript(&entry,
+								    &tmp,
+								    entry_value >> 2);
+					if (err)
+						goto out;
+					err = drgn_object_read(&entry, &entry);
+					if (err)
+						goto out;
+					err = drgn_object_read_unsigned(&entry,
+									&entry_value);
+					if (err)
+						goto out;
+				} else if (node_min == 0 && // !xarray
+					   tmp.address <= entry_value &&
+					   entry_value < tmp.address + sizeof_slots) { // is_sibling_entry()
+					// entry = *(void **)entry_to_node(entry)
+					struct drgn_qualified_type voidpp_type;
+					err = drgn_program_find_type(drgn_object_program(res),
+								     "void **",
+								     NULL,
+								     &voidpp_type);
+					if (err)
+						goto out;
+					err = drgn_object_set_unsigned(&entry,
+								       voidpp_type,
+								       entry_value - 1,
+								       0);
+					if (err)
+						goto out;
+					err = drgn_object_dereference(&entry,
+								      &entry);
+					if (err)
+						goto out;
+					err = drgn_object_read(&entry, &entry);
+					if (err)
+						goto out;
+					err = drgn_object_read_unsigned(&entry,
+									&entry_value);
+					if (err)
+						goto out;
+				}
+			}
+
+			if (node_shift.uvalue == 0 || !is_node(entry_value))
+				break;
+
+			// node = xa_to_node(entry)
+			// or
+			// node = entry_to_node(entry)
+			err = drgn_object_set_unsigned(&node, node_type,
+						       entry_value - internal_flag,
+						       0);
+			if (err)
+				goto out;
+			// node_shift = node->shift
+			err = drgn_object_member_dereference(&tmp, &node,
+							     "shift");
+			if (err)
+				goto out;
+			err = drgn_object_read_integer(&tmp, &node_shift);
+			if (err)
+				goto out;
+
+			if (node_shift.uvalue >= 64) // Avoid undefined behavior.
+				offset = 0;
+			else
+				offset = (index >> node_shift.uvalue) & XA_CHUNK_MASK;
+		}
+	} else if (index) {
+		goto null;
 	}
 
-	err = drgn_object_copy(res, &node);
+	err = drgn_object_copy(res, &entry);
 out:
 	drgn_object_deinit(&tmp);
 	drgn_object_deinit(&node);
+	drgn_object_deinit(&entry);
 	return err;
+
+null:
+	err = drgn_object_set_unsigned(res, drgn_object_qualified_type(&entry),
+				       0, 0);
+	goto out;
+
+#undef is_node
 }
 
+// Note that this only works since Linux kernel commit 0a835c4f090a
+// ("Reimplement IDR and IDA using the radix tree") (in v4.11). We only need
+// this since Linux kernel commit 95846ecf9dac ("pid: replace pid bitmap
+// implementation with IDR API") (in v4.15) (see find_pid_in_pid_hash()), so
+// that's okay.
 struct drgn_error *linux_helper_idr_find(struct drgn_object *res,
 					 const struct drgn_object *idr,
 					 uint64_t id)
@@ -389,7 +606,7 @@ struct drgn_error *linux_helper_idr_find(struct drgn_object *res,
 	err = drgn_object_address_of(&tmp, &tmp);
 	if (err)
 		goto out;
-	err = linux_helper_radix_tree_lookup(res, &tmp, id);
+	err = linux_helper_xa_load(res, &tmp, id);
 out:
 	drgn_object_deinit(&tmp);
 	return err;

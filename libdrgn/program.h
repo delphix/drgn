@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -25,10 +25,9 @@
 #include "memory_reader.h"
 #include "object_index.h"
 #include "platform.h"
+#include "pp.h"
 #include "type.h"
 #include "vector.h"
-
-struct drgn_symbol;
 
 /**
  * @defgroup Internals Internals
@@ -51,9 +50,9 @@ struct drgn_thread {
 	struct drgn_object object;
 };
 
-DEFINE_VECTOR_TYPE(drgn_typep_vector, struct drgn_type *)
-DEFINE_VECTOR_TYPE(drgn_prstatus_vector, struct nstring)
-DEFINE_HASH_TABLE_TYPE(drgn_thread_set, struct drgn_thread)
+DEFINE_VECTOR_TYPE(drgn_typep_vector, struct drgn_type *);
+DEFINE_VECTOR_TYPE(drgn_prstatus_vector, struct nstring);
+DEFINE_HASH_TABLE_TYPE(drgn_thread_set, struct drgn_thread);
 
 struct drgn_program {
 	/** @privatesection */
@@ -169,6 +168,10 @@ struct drgn_program {
 		bool pgtable_l5_enabled;
 		/** PAGE_SHIFT of the kernel (derived from PAGE_SIZE). */
 		int page_shift;
+
+		/** The original vmcoreinfo data, to expose as an object */
+		char *raw;
+		size_t raw_size;
 	} vmcoreinfo;
 	/*
 	 * Difference between a virtual address in the direct mapping and the
@@ -186,6 +189,20 @@ struct drgn_program {
 	bool in_address_translation;
 	/* Whether @ref drgn_program::direct_mapping_offset has been cached. */
 	bool direct_mapping_offset_cached;
+
+	/*
+	 * Logging.
+	 */
+	drgn_log_fn *log_fn;
+	void *log_arg;
+	enum drgn_log_level log_level;
+
+	/*
+	 * Blocking callbacks.
+	 */
+	drgn_program_begin_blocking_fn *begin_blocking_fn;
+	drgn_program_end_blocking_fn *end_blocking_fn;
+	void *blocking_arg;
 };
 
 /** Initialize a @ref drgn_program. */
@@ -335,6 +352,50 @@ bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 						  uint64_t address,
 						  Dwfl_Module *module,
 						  struct drgn_symbol *ret);
+
+/**
+ * Call before a blocking (I/O or long-running) operation.
+ *
+ * Must be paired with @ref drgn_program_end_blocking().
+ *
+ * @return Opaque pointer to pass to @ref drgn_program_end_blocking().
+ */
+void *drgn_program_begin_blocking(struct drgn_program *prog);
+
+/**
+ * Call after a blocking (I/O or long-running) operation.
+ *
+ * @param[in] state Return value of @ref drgn_program_begin_blocking().
+ */
+void drgn_program_end_blocking(struct drgn_program *prog, void *state);
+
+struct drgn_blocking_guard_struct {
+	struct drgn_program *prog;
+	void *state;
+};
+
+static inline struct drgn_blocking_guard_struct
+drgn_blocking_guard_init(struct drgn_program *prog)
+{
+	return (struct drgn_blocking_guard_struct){
+		prog, drgn_program_begin_blocking(prog),
+	};
+}
+
+static inline void
+drgn_blocking_guard_cleanup(struct drgn_blocking_guard_struct *guard)
+{
+	drgn_program_end_blocking(guard->prog, guard->state);
+}
+
+/**
+ * Scope guard that wraps @ref drgn_program_begin_blocking() and @ref
+ * drgn_program_end_blocking().
+ */
+#define drgn_blocking_guard(prog)						\
+	struct drgn_blocking_guard_struct PP_UNIQUE(guard)			\
+	__attribute__((__cleanup__(drgn_blocking_guard_cleanup), __unused__)) =	\
+	drgn_blocking_guard_init(prog)
 
 /**
  * @}

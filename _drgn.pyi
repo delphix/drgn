@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 libdrgn bindings
@@ -13,6 +13,7 @@ import sys
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     Iterable,
     Iterator,
@@ -26,9 +27,14 @@ from typing import (
 )
 
 if sys.version_info < (3, 8):
-    from typing_extensions import Protocol
+    from typing_extensions import Final, Protocol
 else:
-    from typing import Protocol
+    from typing import Final, Protocol
+
+if sys.version_info < (3, 10):
+    from typing_extensions import TypeAlias
+else:
+    from typing import TypeAlias
 
 # This is effectively typing.SupportsIndex without @typing.runtime_checkable
 # (both of which are only available since Python 3.8), with a more
@@ -43,7 +49,7 @@ class IntegerLike(Protocol):
 
     def __index__(self) -> int: ...
 
-Path = Union[str, bytes, os.PathLike[str], os.PathLike[bytes]]
+Path: TypeAlias = Union[str, bytes, os.PathLike[str], os.PathLike[bytes]]
 """
 Filesystem path.
 
@@ -184,6 +190,10 @@ class Program:
     ) -> Object:
         """
         Get the object (variable, constant, or function) with the given name.
+
+        When debugging the Linux kernel, this can look up certain special
+        objects documented in :ref:`kernel-special-objects`, sometimes without
+        any debugging information loaded.
 
         :param name: The object name.
         :param flags: Flags indicating what kind of object to look for.
@@ -845,9 +855,9 @@ class FindObjectFlags(enum.Flag):
 class Thread:
     """A thread in a program."""
 
-    tid: int
+    tid: Final[int]
     """Thread ID (as defined by :manpage:`gettid(2)`)."""
-    object: Object
+    object: Final[Object]
     """
     If the program is the Linux kernel, the ``struct task_struct *`` object for
     this thread. Otherwise, not defined.
@@ -921,13 +931,13 @@ class Platform:
             the architecture are used.
         """
         ...
-    arch: Architecture
+    arch: Final[Architecture]
     """Instruction set architecture of this platform."""
 
-    flags: PlatformFlags
+    flags: Final[PlatformFlags]
     """Flags which apply to this platform."""
 
-    registers: Sequence[Register]
+    registers: Final[Sequence[Register]]
     """Processor registers on this platform."""
 
 class Architecture(enum.Enum):
@@ -954,6 +964,12 @@ class Architecture(enum.Enum):
     RISCV32 = ...
     """The 32-bit RISC-V architecture."""
 
+    S390X = ...
+    """The s390x architecture, a.k.a. IBM Z or z/Architecture."""
+
+    S390 = ...
+    """The 32-bit s390 architecture, a.k.a. System/390."""
+
     UNKNOWN = ...
     """
     An architecture which is not known to drgn. Certain features are not
@@ -973,7 +989,7 @@ class PlatformFlags(enum.Flag):
 class Register:
     """A ``Register`` represents information about a processor register."""
 
-    names: Sequence[str]
+    names: Final[Sequence[str]]
     """Names of this register."""
 
 host_platform: Platform
@@ -987,13 +1003,13 @@ class Language:
     languages.
     """
 
-    name: str
+    name: Final[str]
     """Name of the programming language."""
 
-    C: Language
+    C: ClassVar[Language]
     """The C programming language."""
 
-    CPP: Language
+    CPP: ClassVar[Language]
     """The C++ programming language."""
 
 class Object:
@@ -1145,13 +1161,13 @@ class Object:
     ) -> None:
         """Create an absent object."""
         ...
-    prog_: Program
+    prog_: Final[Program]
     """Program that this object is from."""
 
-    type_: Type
+    type_: Final[Type]
     """Type of this object."""
 
-    absent_: bool
+    absent_: Final[bool]
     """
     Whether this object is absent.
 
@@ -1159,20 +1175,20 @@ class Object:
     an invalid address).
     """
 
-    address_: Optional[int]
+    address_: Final[Optional[int]]
     """
     Address of this object if it is a reference, ``None`` if it is a value or
     absent.
     """
 
-    bit_offset_: Optional[int]
+    bit_offset_: Final[Optional[int]]
     """
     Offset in bits from this object's address to the beginning of the object if
     it is a reference, ``None`` otherwise. This can only be non-zero for
     scalars.
     """
 
-    bit_field_size_: Optional[int]
+    bit_field_size_: Final[Optional[int]]
     """
     Size in bits of this object if it is a bit field, ``None`` if it is not.
     """
@@ -1510,19 +1526,19 @@ class Symbol:
     identifier along with its corresponding address range in the program.
     """
 
-    name: str
+    name: Final[str]
     """Name of this symbol."""
 
-    address: int
+    address: Final[int]
     """Start address of this symbol."""
 
-    size: int
+    size: Final[int]
     """Size of this symbol in bytes."""
 
-    binding: SymbolBinding
+    binding: Final[SymbolBinding]
     """Linkage behavior and visibility of this symbol."""
 
-    kind: SymbolKind
+    kind: Final[SymbolKind]
     """Kind of entity represented by this symbol."""
 
 class SymbolBinding(enum.Enum):
@@ -1613,10 +1629,12 @@ class StackTrace:
     traces are displayed with ``str()`` by default.
     """
 
-    prog: Program
+    prog: Final[Program]
     """Program that this stack trace is from."""
 
     def __getitem__(self, idx: IntegerLike) -> StackFrame: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[StackFrame]: ...
     def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
 
 class StackFrame:
@@ -1641,7 +1659,7 @@ class StackFrame:
     (int)1
     """
 
-    name: Optional[str]
+    name: Final[Optional[str]]
     """
     Name of the function at this frame, or ``None`` if it could not be
     determined.
@@ -1660,7 +1678,7 @@ class StackFrame:
                 name = hex(frame.pc)
     """
 
-    is_inline: bool
+    is_inline: Final[bool]
     """
     Whether this frame is for an inlined call.
 
@@ -1669,7 +1687,7 @@ class StackFrame:
     symbol).
     """
 
-    interrupted: bool
+    interrupted: Final[bool]
     """
     Whether this stack frame was interrupted (for example, by a hardware
     interrupt, signal, trap, etc.).
@@ -1683,8 +1701,12 @@ class StackFrame:
     the instruction after the call instruction.
     """
 
-    pc: int
+    pc: Final[int]
     """Program counter at this stack frame."""
+
+    sp: Final[int]
+    """Stack pointer at this stack frame."""
+
     def __getitem__(self, name: str) -> Object:
         """
         Implement ``self[name]``. Get the object (variable, function parameter,
@@ -1702,6 +1724,16 @@ class StackFrame:
         name exists in the scope of this frame.
 
         :param name: Object name.
+        """
+        ...
+    def locals(self) -> List[str]:
+        """
+        Get a list of the names of all local objects (local variables, function
+        parameters, local constants, and nested functions) in the scope of this
+        frame.
+
+        Not all names may have present values, but they can be used with the
+        :meth:`[] <.__getitem__>` operator to check.
         """
         ...
     def source(self) -> Tuple[str, int, int]:
@@ -1765,60 +1797,60 @@ class Type:
     :ref:`api-type-constructors`.
     """
 
-    prog: Program
+    prog: Final[Program]
     """Program that this type is from."""
 
-    kind: TypeKind
+    kind: Final[TypeKind]
     """Kind of this type."""
 
-    primitive: Optional[PrimitiveType]
+    primitive: Final[Optional[PrimitiveType]]
     """
     If this is a primitive type (e.g., ``int`` or ``double``), the kind of
     primitive type. Otherwise, ``None``.
     """
 
-    qualifiers: Qualifiers
+    qualifiers: Final[Qualifiers]
     """Bitmask of this type's qualifier."""
 
-    language: Language
+    language: Final[Language]
     """Programming language of this type."""
 
-    name: str
+    name: Final[str]
     """
     Name of this type. This is present for integer, boolean, floating-point,
     and typedef types.
     """
 
-    tag: Optional[str]
+    tag: Final[Optional[str]]
     """
     Tag of this type, or ``None`` if this is an anonymous type. This is present
     for structure, union, class, and enumerated types.
     """
 
-    size: Optional[int]
+    size: Final[Optional[int]]
     """
     Size of this type in bytes, or ``None`` if this is an incomplete type. This
     is present for integer, boolean, floating-point, structure, union, class,
     and pointer types.
     """
 
-    length: Optional[int]
+    length: Final[Optional[int]]
     """
     Number of elements in this type, or ``None`` if this is an incomplete type.
     This is only present for array types.
     """
 
-    is_signed: bool
+    is_signed: Final[bool]
     """Whether this type is signed. This is only present for integer types."""
 
-    byteorder: str
+    byteorder: Final[str]
     """
     Byte order of this type: ``'little'`` if it is little-endian, or ``'big'``
     if it is big-endian. This is present for integer, boolean, floating-point,
     and pointer types.
     """
 
-    type: Type
+    type: Final[Type]
     """
     Type underlying this type, defined as follows:
 
@@ -1832,30 +1864,30 @@ class Type:
     For other types, this attribute is not present.
     """
 
-    members: Optional[Sequence[TypeMember]]
+    members: Final[Optional[Sequence[TypeMember]]]
     """
     List of members of this type, or ``None`` if this is an incomplete type.
     This is present for structure, union, and class types.
     """
 
-    enumerators: Optional[Sequence[TypeEnumerator]]
+    enumerators: Final[Optional[Sequence[TypeEnumerator]]]
     """
     List of enumeration constants of this type, or ``None`` if this is an
     incomplete type. This is only present for enumerated types.
     """
 
-    parameters: Sequence[TypeParameter]
+    parameters: Final[Sequence[TypeParameter]]
     """
     List of parameters of this type. This is only present for function types.
     """
 
-    is_variadic: bool
+    is_variadic: Final[bool]
     """
     Whether this type takes a variable number of arguments. This is only
     present for function types.
     """
 
-    template_parameters: Sequence[TypeTemplateParameter]
+    template_parameters: Final[Sequence[TypeTemplateParameter]]
     """
     List of template parameters of this type. This is present for structure,
     union, class, and function types.
@@ -1939,7 +1971,7 @@ class TypeMember:
         :param bit_offset: :attr:`TypeMember.bit_offset`
         """
         ...
-    object: Object
+    object: Final[Object]
     """
     Member as an :class:`Object`.
 
@@ -1949,26 +1981,26 @@ class TypeMember:
     usually absent.)
     """
 
-    type: Type
+    type: Final[Type]
     """
     Member type.
 
     This is a shortcut for ``TypeMember.object.type``.
     """
 
-    name: Optional[str]
+    name: Final[Optional[str]]
     """Member name, or ``None`` if the member is unnamed."""
 
-    bit_offset: int
+    bit_offset: Final[int]
     """Offset of the member from the beginning of the type in bits."""
 
-    offset: int
+    offset: Final[int]
     """
     Offset of the member from the beginning of the type in bytes. If the offset
     is not byte-aligned, accessing this attribute raises :exc:`ValueError`.
     """
 
-    bit_field_size: Optional[int]
+    bit_field_size: Final[Optional[int]]
     """
     Size in bits of this member if it is a bit field, ``None`` if it is not.
 
@@ -1996,10 +2028,10 @@ class TypeEnumerator:
         :param value: :attr:`TypeEnumerator.value`
         """
         ...
-    name: str
+    name: Final[str]
     "Enumerator name."
 
-    value: int
+    value: Final[int]
     "Enumerator value."
     def __len__(self) -> int: ...
     def __getitem__(self, idx: int) -> Any: ...
@@ -2031,7 +2063,7 @@ class TypeParameter:
         :param name: :attr:`TypeParameter.name`
         """
         ...
-    default_argument: Object
+    default_argument: Final[Object]
     """
     Default argument for parameter.
 
@@ -2045,14 +2077,14 @@ class TypeParameter:
         usually absent.
     """
 
-    type: Type
+    type: Final[Type]
     """
     Parameter type.
 
     This is the same as ``TypeParameter.default_argument.type_``.
     """
 
-    name: Optional[str]
+    name: Final[Optional[str]]
     """Parameter name, or ``None`` if the parameter is unnamed."""
 
 class TypeTemplateParameter:
@@ -2084,7 +2116,7 @@ class TypeTemplateParameter:
         :param is_default: :attr:`TypeTemplateParameter.is_default`
         """
         ...
-    argument: Union[Type, Object]
+    argument: Final[Union[Type, Object]]
     """
     Template argument.
 
@@ -2092,10 +2124,10 @@ class TypeTemplateParameter:
     is a non-type template parameter, then this is an :class:`Object`.
     """
 
-    name: Optional[str]
+    name: Final[Optional[str]]
     """Template parameter name, or ``None`` if the parameter is unnamed."""
 
-    is_default: bool
+    is_default: Final[bool]
     """
     Whether :attr:`argument` is the default for the template parameter.
 
@@ -2290,16 +2322,10 @@ def _linux_helper_direct_mapping_offset(prog: Program) -> int: ...
 def _linux_helper_read_vm(
     prog: Program, pgtable: Object, address: IntegerLike, size: IntegerLike
 ) -> bytes: ...
-def _linux_helper_radix_tree_lookup(root: Object, index: IntegerLike) -> Object:
-    """
-    Look up the entry at a given index in a radix tree.
-
-    :param root: ``struct radix_tree_root *``
-    :param index: Entry index.
-    :return: ``void *`` found entry, or ``NULL`` if not found.
-    """
-    ...
-
+def _linux_helper_follow_phys(
+    prog: Program, pgtable: Object, address: IntegerLike
+) -> int: ...
+def _linux_helper_xa_load(xa: Object, index: IntegerLike) -> Object: ...
 def _linux_helper_per_cpu_ptr(ptr: Object, cpu: IntegerLike) -> Object:
     """
     Return the per-CPU pointer for a given CPU.
@@ -2316,6 +2342,18 @@ def _linux_helper_per_cpu_ptr(ptr: Object, cpu: IntegerLike) -> Object:
     """
     ...
 
+def _linux_helper_cpu_curr(prog: Program, cpu: IntegerLike) -> Object:
+    """
+    Return the task running on the given CPU.
+
+    >>> cpu_curr(prog, 7).comm
+    (char [16])"python3"
+
+    :param cpu: CPU number.
+    :return: ``struct task_struct *``
+    """
+    ...
+
 def _linux_helper_idle_task(prog: Program, cpu: IntegerLike) -> Object:
     """
     Return the idle thread (PID 0, a.k.a swapper) for the given CPU.
@@ -2328,16 +2366,15 @@ def _linux_helper_idle_task(prog: Program, cpu: IntegerLike) -> Object:
     """
     ...
 
-def _linux_helper_idr_find(idr: Object, id: IntegerLike) -> Object:
+def _linux_helper_task_cpu(task: Object) -> int:
     """
-    Look up the entry with the given ID in an IDR.
+    Return the CPU number that the given task last ran on.
 
-    :param idr: ``struct idr *``
-    :param id: Entry ID.
-    :return: ``void *`` found entry, or ``NULL`` if not found.
+    :param task: ``struct task_struct *``
     """
     ...
 
+def _linux_helper_idr_find(idr: Object, id: IntegerLike) -> Object: ...
 def _linux_helper_find_pid(
     prog_or_ns: Union[Program, Object], pid: IntegerLike
 ) -> Object:

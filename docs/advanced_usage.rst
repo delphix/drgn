@@ -46,7 +46,9 @@ Custom Programs
 The main components of a :class:`drgn.Program` are the program memory, types,
 and symbols. The CLI and equivalent library interfaces automatically determine
 these. However, it is also possible to create a "blank" ``Program`` and plug in
-the main components.
+the main components. The :func:`drgn.cli.run_interactive()` function allows you
+to run the same drgn CLI once you've created a :class:`drgn.Program`, so it's
+easy to make a custom program which allows interactive debugging.
 
 :meth:`drgn.Program.add_memory_segment()` defines a range of memory and how to
 read that memory. The following example uses a Btrfs filesystem image as the
@@ -57,13 +59,14 @@ program "memory":
     import drgn
     import os
     import sys
+    from drgn.cli import run_interactive
 
 
     def btrfs_debugger(dev):
         file = open(dev, 'rb')
         size = file.seek(0, 2)
 
-        def read_file(address, count, physical, offset):
+        def read_file(address, count, offset, physical):
             file.seek(offset)
             return file.read(count)
 
@@ -77,6 +80,7 @@ program "memory":
 
     prog = btrfs_debugger(sys.argv[1] if len(sys.argv) >= 2 else '/dev/sda')
     print(drgn.Object(prog, 'struct btrfs_super_block', address=65536))
+    run_interactive(prog, banner_func=lambda _: "BTRFS debugger")
 
 :meth:`drgn.Program.add_type_finder()` and
 :meth:`drgn.Program.add_object_finder()` are the equivalent methods for
@@ -115,3 +119,94 @@ Some of drgn's behavior can be modified through environment variables:
     kernel modules for the running kernel instead of getting them from the core
     dump (0 or 1). The default is 1. This environment variable is mainly
     intended for testing and may be ignored in the future.
+
+.. _kernel-special-objects:
+
+Linux Kernel Special Objects
+----------------------------
+
+When debugging the Linux kernel, there are some special :class:`drgn.Object`\ s
+accessible with :meth:`drgn.Program.object()` and :meth:`drgn.Program[]
+<drgn.Program.__getitem__>`. Some of these are available even without debugging
+information, thanks to metadata called "vmcoreinfo" which is present in kernel
+core dumps. These special objects include:
+
+``UTS_RELEASE``
+    Object type: ``const char []``
+
+    This corresponds to the ``UTS_RELEASE`` macro in the Linux kernel source
+    code. This is the exact kernel release (i.e., the output of ``uname -r``).
+
+    To use this as a Python string, you must convert it::
+
+        >>> release = prog["UTS_RELEASE"].string_().decode("ascii")
+
+    This is available without debugging information.
+
+``PAGE_SIZE``
+    Object type: ``unsigned long``
+
+``PAGE_SHIFT``
+    Object type: ``unsigned int``
+
+``PAGE_MASK``
+    Object type: ``unsigned long``
+
+    These correspond to the macros of the same name in the Linux kernel source
+    code. The page size is the smallest contiguous unit of physical memory
+    which can be allocated or mapped by the kernel.
+
+    >>> prog['PAGE_SIZE']
+    (unsigned long)4096
+    >>> prog['PAGE_SHIFT']
+    (int)12
+    >>> prog['PAGE_MASK']
+    (unsigned long)18446744073709547520
+    >>> 1 << prog['PAGE_SHIFT'] == prog['PAGE_SIZE']
+    True
+    >>> ~(prog['PAGE_SIZE'] - 1) == prog['PAGE_MASK']
+    True
+
+    These are available without debugging information.
+
+``jiffies``
+    Object type: ``volatile unsigned long``
+
+    This is a counter of timer ticks. It is actually an alias of ``jiffies_64``
+    on 64-bit architectures, or the least significant 32 bits of ``jiffies_64``
+    on 32-bit architectures. Since this alias is defined via the linker, drgn
+    handles it specially.
+
+    This is *not* available without debugging information.
+
+``vmemmap``
+    Object type: ``struct page *``
+
+    This is a pointer to the "virtual memory map", an array of ``struct page``
+    for each physical page of memory. While the purpose and implementation
+    details of this array are beyond the scope of this documentation, it is
+    enough to say that it is represented in the kernel source in an
+    architecture-dependent way, frequently as a macro or constant. The
+    definition provided by drgn ensures that users can access it without
+    resorting to architecture-specific logic.
+
+    This is *not* available without debugging information.
+
+``VMCOREINFO``
+    Object type: ``const char []``
+
+    This is the data contained in the vmcoreinfo note, which is present either
+    as an ELF note in ``/proc/kcore`` or ELF vmcores, or as a special data
+    section in kdump-formatted vmcores. The vmcoreinfo note contains critical
+    data necessary for interpreting the kernel image, such as KASLR offsets and
+    data structure locations.
+
+    In the Linux kernel, this data is normally stored in a variable called
+    ``vmcoreinfo_data``. However, drgn reads this information from ELF note or
+    from the diskdump header. It is possible (in rare cases, usually with
+    vmcores created by hypervisors) for a vmcore to contain vmcoreinfo which
+    differs from the data in ``vmcoreinfo_data``, so it is important to
+    distinguish the contents. For that reason, we use the name ``VMCOREINFO`` to
+    distinguish it from the kernel variable ``vmcoreinfo_data``.
+
+    This is available without debugging information.

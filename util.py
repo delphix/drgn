@@ -1,10 +1,12 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 from functools import total_ordering
 import os
 from pathlib import Path
+import platform
 import re
+import sys
 from typing import Union
 
 
@@ -113,3 +115,129 @@ class KernelVersion:
 
     def __str__(self) -> str:
         return self._release
+
+
+NORMALIZED_MACHINE_NAME = platform.machine()
+if NORMALIZED_MACHINE_NAME.startswith("aarch64") or NORMALIZED_MACHINE_NAME == "arm64":
+    NORMALIZED_MACHINE_NAME = "aarch64"
+elif NORMALIZED_MACHINE_NAME.startswith("arm") or NORMALIZED_MACHINE_NAME == "sa110":
+    NORMALIZED_MACHINE_NAME = "arm"
+elif re.fullmatch(r"i.86", NORMALIZED_MACHINE_NAME):
+    NORMALIZED_MACHINE_NAME = "i386"
+elif NORMALIZED_MACHINE_NAME.startswith("ppc64"):
+    NORMALIZED_MACHINE_NAME = "ppc64"
+elif NORMALIZED_MACHINE_NAME.startswith("ppc"):
+    NORMALIZED_MACHINE_NAME = "ppc"
+elif NORMALIZED_MACHINE_NAME == "riscv":
+    NORMALIZED_MACHINE_NAME = "riscv32"
+elif re.match(r"sh[0-9]", NORMALIZED_MACHINE_NAME):
+    NORMALIZED_MACHINE_NAME = "sh"
+elif NORMALIZED_MACHINE_NAME == "sun4u":
+    NORMALIZED_MACHINE_NAME = "sparc64"
+
+if NORMALIZED_MACHINE_NAME == "x86_64":
+    if sys.maxsize > 2**32:
+        SYS = {"bpf": 321, "kexec_file_load": 320, "rt_sigtimedwait": 128}
+    else:  # x32
+        SYS = {"bpf": 321, "kexec_file_load": 320, "rt_sigtimedwait": 523}
+else:
+    SYS = {
+        "aarch64": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "alpha": {"bpf": 515, "rt_sigtimedwait": 355},
+        "arc": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "arm": {
+            "bpf": 386,
+            "kexec_file_load": 401,
+            "rt_sigtimedwait": 177,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "csky": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "hexagon": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "i386": {"bpf": 357, "rt_sigtimedwait": 177, "rt_sigtimedwait_time64": 421},
+        "ia64": {"bpf": 317, "rt_sigtimedwait": 159},
+        "loongarch": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "loongarch64": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "m68k": {"bpf": 354, "rt_sigtimedwait": 177, "rt_sigtimedwait_time64": 421},
+        "microblaze": {
+            "bpf": 387,
+            "rt_sigtimedwait": 177,
+            "rt_sigtimedwait_time64": 421,
+        },
+        # TODO: mips is missing here because I don't know how to distinguish
+        # between the o32 and n32 ABIs.
+        "mips64": {"bpf": 315, "rt_sigtimedwait": 126},
+        "nios2": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "openrisc": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "parisc": {
+            "bpf": 341,
+            "kexec_file_load": 355,
+            "rt_sigtimedwait": 177,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "parisc64": {"bpf": 341, "kexec_file_load": 355, "rt_sigtimedwait": 177},
+        "ppc": {"bpf": 361, "rt_sigtimedwait": 176, "rt_sigtimedwait_time64": 421},
+        "ppc64": {"bpf": 361, "rt_sigtimedwait": 176},
+        "riscv32": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "riscv64": {
+            "bpf": 280,
+            "kexec_file_load": 294,
+            "rt_sigtimedwait": 137,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "s390": {
+            "bpf": 351,
+            "kexec_file_load": 381,
+            "rt_sigtimedwait": 177,
+            "rt_sigtimedwait_time64": 421,
+        },
+        "s390x": {"bpf": 351, "kexec_file_load": 381, "rt_sigtimedwait": 177},
+        "sh": {"bpf": 375, "rt_sigtimedwait": 177, "rt_sigtimedwait_time64": 421},
+        "sparc": {"bpf": 349, "rt_sigtimedwait": 105, "rt_sigtimedwait_time64": 421},
+        "sparc64": {"bpf": 349, "rt_sigtimedwait": 105},
+        "xtensa": {"bpf": 340, "rt_sigtimedwait": 229, "rt_sigtimedwait_time64": 421},
+    }.get(NORMALIZED_MACHINE_NAME, {})

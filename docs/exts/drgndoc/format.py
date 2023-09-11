@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import ast
 from typing import Any, List, Optional, Pattern, Sequence, Tuple, cast
@@ -209,6 +209,28 @@ class _FormatVisitor(NodeVisitor):
         if self._rst:
             self._parts.append("\\")
         self._parts.append("]")
+
+    def visit_UnaryOp(
+        self, node: ast.UnaryOp, parent: Optional[ast.AST], sibling: Optional[ast.AST]
+    ) -> None:
+        if isinstance(node.op, ast.UAdd):
+            self._parts.append("+")
+        elif isinstance(node.op, ast.USub):
+            self._parts.append("-")
+        elif isinstance(node.op, ast.Not):
+            self._parts.append("not ")
+        elif isinstance(node.op, ast.Invert):
+            self._parts.append("~")
+        else:
+            raise NotImplementedError(
+                f"{node.op.__class__.__name__} formatting is not implemented"
+            )
+        parens = not isinstance(node.operand, (ast.Constant, ast.Name))
+        if parens:
+            self._parts.append("(")
+        self._visit(node.operand, node, None)
+        if parens:
+            self._parts.append(")")
 
 
 class Formatter:

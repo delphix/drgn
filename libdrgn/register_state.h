@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -13,13 +13,11 @@
 #define DRGN_REGISTER_STATE_H
 
 #include <assert.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfi.h"
+#include "drgn.h"
 #include "platform.h"
 #include "program.h"
 #include "serialize.h"
@@ -50,14 +48,12 @@
  */
 struct drgn_register_state {
 	/**
-	 * Cached @ref drgn_debug_info_module that contains the program counter.
+	 * Cached @ref drgn_module that contains the program counter.
 	 *
-	 * This is `NULL` if the program counter is not known, if the containing
-	 * module could not be found, or if the containing module's platform
-	 * does not match the program's platform (in which case we can't use it
-	 * anyways).
+	 * This is `NULL` if the program counter is not known or if the
+	 * containing module could not be found.
 	 */
-	struct drgn_debug_info_module *module;
+	struct drgn_module *module;
 	/** Total size of registers allocated in @ref drgn_register_state::buf. */
 	uint32_t regs_size;
 	/** Number of registers allocated in @ref drgn_register_state::buf. */
@@ -133,6 +129,14 @@ struct drgn_register_state *drgn_register_state_create_impl(uint32_t regs_size,
 	drgn_register_state_create_impl(DRGN_REGISTER_END(last_reg),		\
 					DRGN_REGISTER_NUMBER(last_reg) + 1,	\
 					interrupted)
+
+/**
+ * Create a copy of a @ref drgn_register_state.
+ *
+ * @return New register state on success, @c NULL on failure to allocate memory.
+ */
+struct drgn_register_state *
+drgn_register_state_dup(const struct drgn_register_state *regs);
 
 /** Free a @ref drgn_register_state. */
 static inline void

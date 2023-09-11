@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 REGISTERS = [
     *[DrgnRegister(f"r{i}") for i in range(32)],
@@ -20,3 +20,5 @@ REGISTER_LAYOUT = [
     *[DrgnRegisterLayout(f"r{i}", size=8, dwarf_number=i) for i in range(32)],
     *[DrgnRegisterLayout(f"cr{i}", size=8, dwarf_number=68 + i) for i in range(8)],
 ]
+
+STACK_POINTER_REGISTER = "r1"

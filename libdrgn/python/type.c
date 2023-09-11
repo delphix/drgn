@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <stdarg.h>
 
@@ -23,19 +23,16 @@ static const char *drgn_type_kind_str(struct drgn_type *type)
 
 DRGNPY_PUBLIC PyObject *DrgnType_wrap(struct drgn_qualified_type qualified_type)
 {
-	DrgnType *type_obj = (DrgnType *)DrgnType_type.tp_alloc(&DrgnType_type,
-								0);
+	_cleanup_pydecref_ DrgnType *type_obj = call_tp_alloc(DrgnType);
 	if (!type_obj)
 		return NULL;
 	type_obj->type = qualified_type.type;
 	type_obj->qualifiers = qualified_type.qualifiers;
 	Py_INCREF(DrgnType_prog(type_obj));
 	type_obj->attr_cache = PyDict_New();
-	if (!type_obj->attr_cache) {
-		Py_DECREF(type_obj);
+	if (!type_obj->attr_cache)
 		return NULL;
-	}
-	return (PyObject *)type_obj;
+	return (PyObject *)no_cleanup_ptr(type_obj);
 }
 
 static inline struct drgn_qualified_type DrgnType_unwrap(DrgnType *type)
@@ -118,7 +115,7 @@ static PyObject *DrgnType_get_size(DrgnType *self)
 	}
 	if (!drgn_type_is_complete(self->type))
 		Py_RETURN_NONE;
-	return PyLong_FromUnsignedLongLong(drgn_type_size(self->type));
+	return PyLong_FromUint64(drgn_type_size(self->type));
 }
 
 static PyObject *DrgnType_get_length(DrgnType *self)
@@ -129,7 +126,7 @@ static PyObject *DrgnType_get_length(DrgnType *self)
 				    drgn_type_kind_str(self->type));
 	}
 	if (drgn_type_is_complete(self->type))
-		return PyLong_FromUnsignedLongLong(drgn_type_length(self->type));
+		return PyLong_FromUint64(drgn_type_length(self->type));
 	else
 		Py_RETURN_NONE;
 }
@@ -182,8 +179,7 @@ static TypeMember *TypeMember_wrap(PyObject *parent,
 				   struct drgn_type_member *member,
 				   uint64_t bit_offset)
 {
-	TypeMember *py_member =
-		(TypeMember *)TypeMember_type.tp_alloc(&TypeMember_type, 0);
+	_cleanup_pydecref_ TypeMember *py_member = call_tp_alloc(TypeMember);
 	if (!py_member)
 		return NULL;
 
@@ -193,27 +189,19 @@ static TypeMember *TypeMember_wrap(PyObject *parent,
 	if (member->name) {
 		py_member->name = PyUnicode_FromString(member->name);
 		if (!py_member->name)
-			goto err;
+			return NULL;
 	} else {
 		Py_INCREF(Py_None);
 		py_member->name = Py_None;
 	}
-	py_member->bit_offset = PyLong_FromUnsignedLongLong(bit_offset);
+	py_member->bit_offset = PyLong_FromUint64(bit_offset);
 	if (!py_member->bit_offset)
-		goto err;
-	return py_member;
-
-err:
-	Py_DECREF(py_member);
-	return NULL;
+		return NULL;
+	return_ptr(py_member);
 }
 
 static PyObject *DrgnType_get_members(DrgnType *self)
 {
-	PyObject *members_obj;
-	struct drgn_type_member *members;
-	size_t num_members, i;
-
 	if (!drgn_type_has_members(self->type)) {
 		return PyErr_Format(PyExc_AttributeError,
 				    "%s type does not have members",
@@ -223,34 +211,26 @@ static PyObject *DrgnType_get_members(DrgnType *self)
 	if (!drgn_type_is_complete(self->type))
 		Py_RETURN_NONE;
 
-	members = drgn_type_members(self->type);
-	num_members = drgn_type_num_members(self->type);
-	members_obj = PyTuple_New(num_members);
+	struct drgn_type_member *members = drgn_type_members(self->type);
+	size_t num_members = drgn_type_num_members(self->type);
+
+	_cleanup_pydecref_ PyObject *members_obj = PyTuple_New(num_members);
 	if (!members_obj)
 		return NULL;
 
-	for (i = 0; i < num_members; i++) {
+	for (size_t i = 0; i < num_members; i++) {
 		TypeMember *item = TypeMember_wrap((PyObject *)self,
 						   &members[i],
 						   members[i].bit_offset);
 		if (!item)
-			goto err;
+			return NULL;
 		PyTuple_SET_ITEM(members_obj, i, (PyObject *)item);
 	}
-	return members_obj;
-
-err:
-	Py_DECREF(members_obj);
-	return NULL;
+	return_ptr(members_obj);
 }
 
 static PyObject *DrgnType_get_enumerators(DrgnType *self)
 {
-	PyObject *enumerators_obj;
-	const struct drgn_type_enumerator *enumerators;
-	bool is_signed;
-	size_t num_enumerators, i;
-
 	if (!drgn_type_has_enumerators(self->type)) {
 		return PyErr_Format(PyExc_AttributeError,
 				    "%s type does not have enumerators",
@@ -260,15 +240,16 @@ static PyObject *DrgnType_get_enumerators(DrgnType *self)
 	if (!drgn_type_is_complete(self->type))
 		Py_RETURN_NONE;
 
-	enumerators = drgn_type_enumerators(self->type);
-	num_enumerators = drgn_type_num_enumerators(self->type);
-	is_signed = drgn_enum_type_is_signed(self->type);
+	const struct drgn_type_enumerator *enumerators =
+		drgn_type_enumerators(self->type);
+	size_t num_enumerators = drgn_type_num_enumerators(self->type);
+	bool is_signed = drgn_enum_type_is_signed(self->type);
 
-	enumerators_obj = PyTuple_New(num_enumerators);
+	_cleanup_pydecref_ PyObject *enumerators_obj = PyTuple_New(num_enumerators);
 	if (!enumerators_obj)
 		return NULL;
 
-	for (i = 0; i < num_enumerators; i++) {
+	for (size_t i = 0; i < num_enumerators; i++) {
 		PyObject *item;
 
 		if (is_signed) {
@@ -280,42 +261,36 @@ static PyObject *DrgnType_get_enumerators(DrgnType *self)
 						     "sK", enumerators[i].name,
 						     (unsigned long long)enumerators[i].uvalue);
 		}
-		if (!item) {
-			Py_DECREF(enumerators_obj);
+		if (!item)
 			return NULL;
-		}
 		PyTuple_SET_ITEM(enumerators_obj, i, item);
 	}
 
-	return enumerators_obj;
+	return_ptr(enumerators_obj);
 }
 
 static PyObject *DrgnType_get_parameters(DrgnType *self)
 {
-	PyObject *parameters_obj;
-	struct drgn_type_parameter *parameters;
-	size_t num_parameters, i;
-
 	if (!drgn_type_has_parameters(self->type)) {
 		return PyErr_Format(PyExc_AttributeError,
 				    "%s type does not have parameters",
 				    drgn_type_kind_str(self->type));
 	}
 
-	parameters = drgn_type_parameters(self->type);
-	num_parameters = drgn_type_num_parameters(self->type);
-	parameters_obj = PyTuple_New(num_parameters);
+	struct drgn_type_parameter *parameters =
+		drgn_type_parameters(self->type);
+	size_t num_parameters = drgn_type_num_parameters(self->type);
+
+	_cleanup_pydecref_ PyObject *parameters_obj =
+		PyTuple_New(num_parameters);
 	if (!parameters_obj)
 		return NULL;
 
-	for (i = 0; i < num_parameters; i++) {
+	for (size_t i = 0; i < num_parameters; i++) {
 		struct drgn_type_parameter *parameter = &parameters[i];
-		TypeParameter *item;
-
-		item = (TypeParameter *)TypeParameter_type.tp_alloc(&TypeParameter_type,
-								    0);
+		TypeParameter *item = call_tp_alloc(TypeParameter);
 		if (!item)
-			goto err;
+			return NULL;
 		PyTuple_SET_ITEM(parameters_obj, i, (PyObject *)item);
 		Py_INCREF(self);
 		item->lazy_obj.obj = (PyObject *)self;
@@ -323,17 +298,13 @@ static PyObject *DrgnType_get_parameters(DrgnType *self)
 		if (parameter->name) {
 			item->name = PyUnicode_FromString(parameter->name);
 			if (!item->name)
-				goto err;
+				return NULL;
 		} else {
 			Py_INCREF(Py_None);
 			item->name = Py_None;
 		}
 	}
-	return parameters_obj;
-
-err:
-	Py_DECREF(parameters_obj);
-	return NULL;
+	return_ptr(parameters_obj);
 }
 
 static PyObject *DrgnType_get_is_variadic(DrgnType *self)
@@ -358,7 +329,9 @@ static PyObject *DrgnType_get_template_parameters(DrgnType *self)
 		drgn_type_template_parameters(self->type);
 	size_t num_template_parameters =
 		drgn_type_num_template_parameters(self->type);
-	PyObject *template_parameters_obj = PyTuple_New(num_template_parameters);
+
+	_cleanup_pydecref_ PyObject *template_parameters_obj =
+		PyTuple_New(num_template_parameters);
 	if (!template_parameters_obj)
 		return NULL;
 
@@ -367,11 +340,9 @@ static PyObject *DrgnType_get_template_parameters(DrgnType *self)
 			&template_parameters[i];
 
 		TypeTemplateParameter *item =
-			(TypeTemplateParameter *)
-			TypeTemplateParameter_type.tp_alloc(&TypeTemplateParameter_type,
-							    0);
+			call_tp_alloc(TypeTemplateParameter);
 		if (!item)
-			goto err;
+			return NULL;
 		PyTuple_SET_ITEM(template_parameters_obj, i, (PyObject *)item);
 		Py_INCREF(self);
 		item->lazy_obj.obj = (PyObject *)self;
@@ -379,7 +350,7 @@ static PyObject *DrgnType_get_template_parameters(DrgnType *self)
 		if (template_parameter->name) {
 			item->name = PyUnicode_FromString(template_parameter->name);
 			if (!item->name)
-				goto err;
+				return NULL;
 		} else {
 			Py_INCREF(Py_None);
 			item->name = Py_None;
@@ -387,11 +358,7 @@ static PyObject *DrgnType_get_template_parameters(DrgnType *self)
 		item->is_default =
 			PyBool_FromLong(template_parameter->is_default);
 	}
-	return template_parameters_obj;
-
-err:
-	Py_DECREF(template_parameters_obj);
-	return NULL;
+	return_ptr(template_parameters_obj);
 }
 
 struct DrgnType_Attr {
@@ -513,35 +480,27 @@ static int DrgnType_clear(DrgnType *self)
 
 static int append_field(PyObject *parts, bool *first, const char *format, ...)
 {
-	va_list ap;
-	PyObject *str;
-	int ret;
-
 	if (!*first && append_string(parts, ", ") == -1)
 		return -1;
 	*first = false;
 
+	va_list ap;
 	va_start(ap, format);
-	str = PyUnicode_FromFormatV(format, ap);
+	_cleanup_pydecref_ PyObject *str = PyUnicode_FromFormatV(format, ap);
 	va_end(ap);
 	if (!str)
 		return -1;
-
-	ret = PyList_Append(parts, str);
-	Py_DECREF(str);
-	return ret;
+	return PyList_Append(parts, str);
 }
 
 #define append_member(parts, type_obj, first, member) ({			\
 	int _ret = 0;								\
-	PyObject *_obj;								\
-										\
 	if (drgn_type_has_##member((type_obj)->type)) {				\
-		_obj = DrgnType_getter((type_obj), &DrgnType_attr_##member);	\
+		_cleanup_pydecref_ PyObject *_obj =				\
+			DrgnType_getter((type_obj), &DrgnType_attr_##member);	\
 		if (_obj) {							\
 			_ret = append_field((parts), (first), #member"=%R",	\
 					    _obj);				\
-			Py_DECREF(_obj);					\
 		} else {							\
 			_ret = -1;						\
 		}								\
@@ -551,87 +510,74 @@ static int append_field(PyObject *parts, bool *first, const char *format, ...)
 
 static PyObject *DrgnType_repr(DrgnType *self)
 {
-	PyObject *parts = PyList_New(0);
+	_cleanup_pydecref_ PyObject *parts = PyList_New(0);
 	if (!parts)
 		return NULL;
 
-	PyObject *ret = NULL;
 	bool first = true;
 	if (append_format(parts, "prog.%s_type(",
 			  drgn_type_kind_str(self->type)) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, name) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, tag) == -1)
-		goto out;
+		return NULL;
 
 	if (drgn_type_kind(self->type) != DRGN_TYPE_POINTER &&
 	    append_member(parts, self, &first, size) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, is_signed) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, type) == -1)
-		goto out;
+		return NULL;
 	if (drgn_type_kind(self->type) == DRGN_TYPE_POINTER &&
 	    (!drgn_type_program(self->type)->has_platform ||
 	     drgn_type_size(self->type) !=
 	     drgn_platform_address_size(&drgn_type_program(self->type)->platform)) &&
 	    append_member(parts, self, &first, size) == -1)
-		goto out;
+		return NULL;
 	if (drgn_type_has_little_endian(self->type) &&
 	    (!drgn_type_program(self->type)->has_platform ||
 	     drgn_type_little_endian(self->type) !=
 	     drgn_platform_is_little_endian(&drgn_type_program(self->type)->platform))) {
-		PyObject *obj = DrgnType_get_byteorder(self, NULL);
-		if (!obj)
-			goto out;
-		if (append_field(parts, &first, "byteorder=%R", obj) == -1) {
-			Py_DECREF(obj);
-			goto out;
-		}
-		Py_DECREF(obj);
+		_cleanup_pydecref_ PyObject *obj =
+			DrgnType_get_byteorder(self, NULL);
+		if (!obj
+		    || append_field(parts, &first, "byteorder=%R", obj) == -1)
+			return NULL;
 	}
 	if (append_member(parts, self, &first, length) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, members) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, enumerators) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, parameters) == -1)
-		goto out;
+		return NULL;
 	if (append_member(parts, self, &first, is_variadic) == -1)
-		goto out;
+		return NULL;
 	if (drgn_type_has_template_parameters(self->type) &&
 	    drgn_type_num_template_parameters(self->type) > 0 &&
 	    append_member(parts, self, &first, template_parameters) == -1)
-		goto out;
+		return NULL;
 	if (self->qualifiers) {
-		PyObject *obj = DrgnType_getter(self,
-						&DrgnType_attr_qualifiers);
-		if (!obj)
-			goto out;
-		if (append_field(parts, &first, "qualifiers=%R", obj) == -1) {
-			Py_DECREF(obj);
-			goto out;
-		}
-		Py_DECREF(obj);
+		_cleanup_pydecref_ PyObject *obj =
+			DrgnType_getter(self, &DrgnType_attr_qualifiers);
+		if (!obj
+		    || append_field(parts, &first, "qualifiers=%R", obj) == -1)
+			return NULL;
 	}
 	if (drgn_type_language(self->type) !=
 	    drgn_program_language(drgn_type_program(self->type))) {
-		PyObject *obj = DrgnType_get_language(self, NULL);
-		if (append_field(parts, &first, "language=%R", obj) == -1) {
-			Py_DECREF(obj);
-			goto out;
-		}
-		Py_DECREF(obj);
+		_cleanup_pydecref_ PyObject *obj = DrgnType_get_language(self, NULL);
+		if (!obj
+		    || append_field(parts, &first, "language=%R", obj) == -1)
+			return NULL;
 	}
 	if (append_string(parts, ")") == -1)
-		goto out;
+		return NULL;
 
-	ret = join_strings(parts);
-out:
-	Py_DECREF(parts);
-	return ret;
+	return join_strings(parts);
 }
 
 static PyObject *DrgnType_str(DrgnType *self)
@@ -874,16 +820,14 @@ PyTypeObject TypeEnumerator_type = {
 
 static DrgnObject *DrgnType_to_absent_DrgnObject(DrgnType *type)
 {
-	DrgnObject *obj = DrgnObject_alloc(DrgnType_prog(type));
+	_cleanup_pydecref_ DrgnObject *obj = DrgnObject_alloc(DrgnType_prog(type));
 	if (!obj)
 		return NULL;
 	struct drgn_error *err =
 		drgn_object_set_absent(&obj->obj, DrgnType_unwrap(type), 0);
-	if (err) {
-		Py_DECREF(obj);
+	if (err)
 		return set_drgn_error(err);
-	}
-	return obj;
+	return_ptr(obj);
 }
 
 static const char *PyType_name(PyTypeObject *type)
@@ -989,11 +933,11 @@ static int append_lazy_object_repr(PyObject *parts, LazyObject *self)
 			set_drgn_error(err);
 			return -1;
 		}
-		PyObject *tmp = PyUnicode_FromString(type_name);
+		_cleanup_pydecref_ PyObject *tmp = PyUnicode_FromString(type_name);
 		free(type_name);
-		int ret = append_format(parts, "prog.type(%R)", tmp);
-		Py_DECREF(tmp);
-		return ret;
+		if (!tmp)
+			return -1;
+		return append_format(parts, "prog.type(%R)", tmp);
 	} else {
 		return append_format(parts, "%R", object);
 	}
@@ -1055,7 +999,8 @@ static TypeMember *TypeMember_new(PyTypeObject *subtype, PyObject *args,
 	if (LazyObject_arg(object, "TypeMember", true, &obj, &state))
 		return NULL;
 
-	TypeMember *member = (TypeMember *)subtype->tp_alloc(subtype, 0);
+	_cleanup_pydecref_ TypeMember *member =
+		(TypeMember *)subtype->tp_alloc(subtype, 0);
 	if (!member) {
 		Py_DECREF(obj);
 		return NULL;
@@ -1069,14 +1014,10 @@ static TypeMember *TypeMember_new(PyTypeObject *subtype, PyObject *args,
 	} else {
 		bit_offset = PyLong_FromLong(0);
 		if (!bit_offset)
-			goto err;
+			return NULL;
 	}
 	member->bit_offset = bit_offset;
-	return member;
-
-err:
-	Py_DECREF(member);
-	return NULL;
+	return_ptr(member);
 }
 
 static void TypeMember_dealloc(TypeMember *self)
@@ -1088,17 +1029,15 @@ static void TypeMember_dealloc(TypeMember *self)
 
 static PyObject *TypeMember_get_offset(TypeMember *self, void *arg)
 {
-	unsigned long long bit_offset;
-
-	bit_offset = PyLong_AsUnsignedLongLong(self->bit_offset);
-	if (bit_offset == (unsigned long long)-1 && PyErr_Occurred())
+	uint64_t bit_offset = PyLong_AsUint64(self->bit_offset);
+	if (bit_offset == (uint64_t)-1 && PyErr_Occurred())
 		return NULL;
 	if (bit_offset % 8) {
 		PyErr_SetString(PyExc_ValueError,
 				"member is not byte-aligned");
 		return NULL;
 	}
-	return PyLong_FromUnsignedLongLong(bit_offset / 8);
+	return PyLong_FromUint64(bit_offset / 8);
 }
 
 static PyObject *TypeMember_get_bit_field_size(TypeMember *self, void *arg)
@@ -1107,29 +1046,26 @@ static PyObject *TypeMember_get_bit_field_size(TypeMember *self, void *arg)
 	if (!object)
 		return NULL;
 	if (object->obj.is_bit_field)
-		return PyLong_FromUnsignedLongLong(object->obj.bit_size);
+		return PyLong_FromUint64(object->obj.bit_size);
 	else
 		Py_RETURN_NONE;
 }
 
 static PyObject *TypeMember_repr(TypeMember *self)
 {
-	PyObject *parts = PyList_New(0), *ret = NULL;
+	_cleanup_pydecref_ PyObject *parts = PyList_New(0);
 	if (!parts)
 		return NULL;
 	if (append_format(parts, "TypeMember(") < 0 ||
 	    append_lazy_object_repr(parts, (LazyObject *)self) < 0)
-		goto out;
+		return NULL;
 	if (self->name != Py_None &&
 	    append_format(parts, ", name=%R", self->name) < 0)
-		goto out;
+		return NULL;
 	/* Include the bit offset even if it is the default of 0 for clarity. */
 	if (append_format(parts, ", bit_offset=%R)", self->bit_offset) < 0)
-		goto out;
-	ret = join_strings(parts);
-out:
-	Py_DECREF(parts);
-	return ret;
+		return NULL;
+	return join_strings(parts);
 }
 
 static PyMemberDef TypeMember_members[] = {
@@ -1207,21 +1143,18 @@ static void TypeParameter_dealloc(TypeParameter *self)
 
 static PyObject *TypeParameter_repr(TypeParameter *self)
 {
-	PyObject *parts = PyList_New(0), *ret = NULL;
+	_cleanup_pydecref_ PyObject *parts = PyList_New(0);
 	if (!parts)
 		return NULL;
 	if (append_format(parts, "TypeParameter(") < 0 ||
 	    append_lazy_object_repr(parts, (LazyObject *)self) < 0)
-		goto out;
+		return NULL;
 	if (self->name != Py_None &&
 	    append_format(parts, ", name=%R", self->name) < 0)
-		goto out;
+		return NULL;
 	if (append_string(parts, ")") < 0)
-		goto out;
-	ret = join_strings(parts);
-out:
-	Py_DECREF(parts);
-	return ret;
+		return NULL;
+	return join_strings(parts);
 }
 
 static PyMemberDef TypeParameter_members[] = {
@@ -1299,24 +1232,21 @@ static void TypeTemplateParameter_dealloc(TypeTemplateParameter *self)
 
 static PyObject *TypeTemplateParameter_repr(TypeTemplateParameter *self)
 {
-	PyObject *parts = PyList_New(0), *ret = NULL;
+	_cleanup_pydecref_ PyObject *parts = PyList_New(0);
 	if (!parts)
 		return NULL;
 	if (append_format(parts, "TypeTemplateParameter(") < 0 ||
 	    append_lazy_object_repr(parts, (LazyObject *)self) < 0)
-		goto out;
+		return NULL;
 	if (self->name != Py_None &&
 	    append_format(parts, ", name=%R", self->name) < 0)
-		goto out;
+		return NULL;
 	if (self->is_default == Py_True &&
 	    append_string(parts, ", is_default=True") < 0)
-		goto out;
+		return NULL;
 	if (append_string(parts, ")") < 0)
-		goto out;
-	ret = join_strings(parts);
-out:
-	Py_DECREF(parts);
-	return ret;
+		return NULL;
+	return join_strings(parts);
 }
 
 static PyObject *TypeTemplateParameter_get_argument(TypeTemplateParameter *self,
@@ -1452,18 +1382,17 @@ DrgnType *Program_int_type(Program *self, PyObject *args, PyObject *kwds)
 		Program_hold_object(self, name_obj);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
 		return NULL;
 
 	if (drgn_type_name(qualified_type.type) == name &&
 	    _PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_name.id,
-			      name_obj) == -1) {
-		Py_DECREF(type_obj);
+			      name_obj) == -1)
 		return NULL;
-	}
 
-	return type_obj;
+	return_ptr(type_obj);
 }
 
 DrgnType *Program_bool_type(Program *self, PyObject *args, PyObject *kwds)
@@ -1508,18 +1437,17 @@ DrgnType *Program_bool_type(Program *self, PyObject *args, PyObject *kwds)
 		Program_hold_object(self, name_obj);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
 		return NULL;
 
 	if (drgn_type_name(qualified_type.type) == name &&
 	    _PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_name.id,
-			      name_obj) == -1) {
-		Py_DECREF(type_obj);
+			      name_obj) == -1)
 		return NULL;
-	}
 
-	return type_obj;
+	return_ptr(type_obj);
 }
 
 DrgnType *Program_float_type(Program *self, PyObject *args, PyObject *kwds)
@@ -1565,18 +1493,17 @@ DrgnType *Program_float_type(Program *self, PyObject *args, PyObject *kwds)
 		Program_hold_object(self, name_obj);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
 		return NULL;
 
 	if (drgn_type_name(qualified_type.type) == name &&
 	    _PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_name.id,
-			      name_obj) == -1) {
-		Py_DECREF(type_obj);
+			      name_obj) == -1)
 		return NULL;
-	}
 
-	return type_obj;
+	return_ptr(type_obj);
 }
 
 static struct drgn_error *py_lazy_object_thunk_fn(struct drgn_object *res,
@@ -1584,15 +1511,12 @@ static struct drgn_error *py_lazy_object_thunk_fn(struct drgn_object *res,
 {
 	if (!res)
 		return NULL; /* Nothing to free. */
-	PyGILState_STATE gstate = PyGILState_Ensure();
+	PyGILState_guard();
 	DrgnObject *obj = LazyObject_get_borrowed(arg);
-	struct drgn_error *err;
 	if (obj)
-		err = drgn_object_copy(res, &obj->obj);
+		return drgn_object_copy(res, &obj->obj);
 	else
-		err = drgn_error_from_python();
-	PyGILState_Release(gstate);
-	return err;
+		return drgn_error_from_python();
 }
 
 static int lazy_object_from_py(union drgn_lazy_object *lazy_obj,
@@ -1640,9 +1564,8 @@ static int unpack_member(struct drgn_compound_type_builder *builder,
 			return -1;
 	}
 
-	unsigned long long bit_offset =
-		PyLong_AsUnsignedLongLong(member->bit_offset);
-	if (bit_offset == (unsigned long long)-1 && PyErr_Occurred())
+	uint64_t bit_offset = PyLong_AsUint64(member->bit_offset);
+	if (bit_offset == (uint64_t)-1 && PyErr_Occurred())
 		return -1;
 
 	union drgn_lazy_object object;
@@ -1736,7 +1659,7 @@ static DrgnType *Program_compound_type(Program *self, PyObject *args,
 		return NULL;
 	}
 
-	PyObject *cached_members;
+	_cleanup_pydecref_ PyObject *cached_members = NULL;
 	size_t num_members;
 	if (members_obj == Py_None) {
 		if (!size.is_none) {
@@ -1745,7 +1668,6 @@ static DrgnType *Program_compound_type(Program *self, PyObject *args,
 				     drgn_type_kind_spelling[kind]);
 			return NULL;
 		}
-		cached_members = NULL;
 		num_members = 0;
 	} else {
 		if (size.is_none) {
@@ -1765,7 +1687,7 @@ static DrgnType *Program_compound_type(Program *self, PyObject *args,
 	}
 	bool can_cache_members = true;
 
-	PyObject *cached_template_parameters;
+	_cleanup_pydecref_ PyObject *cached_template_parameters;
 	if (template_parameters_obj) {
 		cached_template_parameters =
 			PySequence_Tuple(template_parameters_obj);
@@ -1773,7 +1695,7 @@ static DrgnType *Program_compound_type(Program *self, PyObject *args,
 		cached_template_parameters = PyTuple_New(0);
 	}
 	if (!cached_template_parameters)
-		goto err_members;
+		return NULL;
 	size_t num_template_parameters =
 		PyTuple_GET_SIZE(cached_template_parameters);
 	bool can_cache_template_parameters = true;
@@ -1808,7 +1730,7 @@ static DrgnType *Program_compound_type(Program *self, PyObject *args,
 		set_drgn_error(err);
 err_builder:
 		drgn_compound_type_builder_deinit(&builder);
-		goto err_template_parameters;
+		return NULL;
 	}
 
 	if (tag_obj != Py_None && drgn_type_tag(qualified_type.type) == tag)
@@ -1819,9 +1741,10 @@ err_builder:
 		Program_hold_object(self, cached_template_parameters);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
-		goto err_template_parameters;
+		return NULL;
 
 	if (_PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_tag.id,
 			      tag_obj) == -1 ||
@@ -1833,19 +1756,9 @@ err_builder:
 	     _PyDict_SetItemId(type_obj->attr_cache,
 			       &DrgnType_attr_template_parameters.id,
 			       cached_template_parameters) == -1))
-		goto err_type;
-	Py_XDECREF(cached_members);
-	Py_DECREF(cached_template_parameters);
+		return NULL;
 
-	return type_obj;
-
-err_type:
-	Py_DECREF(type_obj);
-err_template_parameters:
-	Py_DECREF(cached_template_parameters);
-err_members:
-	Py_XDECREF(cached_members);
-	return NULL;
+	return_ptr(type_obj);
 }
 
 DrgnType *Program_struct_type(Program *self, PyObject *args, PyObject *kwds)
@@ -1885,14 +1798,13 @@ static int unpack_enumerator(struct drgn_enum_type_builder *builder,
 
 	struct drgn_error *err;
 	if (is_signed) {
-		long long svalue = PyLong_AsLongLong(enumerator->value);
+		int64_t svalue = PyLong_AsInt64(enumerator->value);
 		if (svalue == -1 && PyErr_Occurred())
 			return -1;
 		err = drgn_enum_type_builder_add_signed(builder, name, svalue);
 	} else {
-		unsigned long long uvalue =
-			PyLong_AsUnsignedLongLong(enumerator->value);
-		if (uvalue == (unsigned long long)-1 && PyErr_Occurred())
+		uint64_t uvalue = PyLong_AsUint64(enumerator->value);
+		if (uvalue == (uint64_t)-1 && PyErr_Occurred())
 			return -1;
 		err = drgn_enum_type_builder_add_unsigned(builder, name,
 							  uvalue);
@@ -1941,7 +1853,7 @@ DrgnType *Program_enum_type(Program *self, PyObject *args, PyObject *kwds)
 		return NULL;
 	}
 
-	PyObject *cached_enumerators;
+	_cleanup_pydecref_ PyObject *cached_enumerators = NULL;
 	struct drgn_qualified_type qualified_type;
 	struct drgn_error *err;
 	if (enumerators_obj == Py_None) {
@@ -1959,8 +1871,6 @@ DrgnType *Program_enum_type(Program *self, PyObject *args, PyObject *kwds)
 						       &qualified_type.type);
 		if (err)
 			return set_drgn_error(err);
-
-		cached_enumerators = NULL;
 	} else {
 		if (compatible_type_obj == Py_None) {
 			PyErr_SetString(PyExc_ValueError,
@@ -1997,7 +1907,7 @@ DrgnType *Program_enum_type(Program *self, PyObject *args, PyObject *kwds)
 			if (unpack_enumerator(&builder,
 					      PyTuple_GET_ITEM(cached_enumerators, i),
 					      is_signed) == -1)
-				goto err_enumerators;
+				return NULL;
 		}
 
 		if (!Program_hold_reserve(self, 1 + (tag_obj != Py_None)))
@@ -2009,7 +1919,7 @@ DrgnType *Program_enum_type(Program *self, PyObject *args, PyObject *kwds)
 			set_drgn_error(err);
 err_builder:
 			drgn_enum_type_builder_deinit(&builder);
-			goto err_enumerators;
+			return NULL;
 		}
 
 		Program_hold_object(self, cached_enumerators);
@@ -2019,9 +1929,10 @@ err_builder:
 		Program_hold_object(self, tag_obj);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
-		goto err_enumerators;
+		return NULL;
 
 	if (_PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_tag.id,
 			      tag_obj) == -1 ||
@@ -2031,16 +1942,9 @@ err_builder:
 			      &DrgnType_attr_enumerators.id,
 			      cached_enumerators ?
 			      cached_enumerators : Py_None) == -1)
-		goto err_type;
-	Py_XDECREF(cached_enumerators);
+		return NULL;
 
-	return type_obj;
-
-err_type:
-	Py_DECREF(type_obj);
-err_enumerators:
-	Py_XDECREF(cached_enumerators);
-	return NULL;
+	return_ptr(type_obj);
 }
 
 DrgnType *Program_typedef_type(Program *self, PyObject *args, PyObject *kwds)
@@ -2079,19 +1983,18 @@ DrgnType *Program_typedef_type(Program *self, PyObject *args, PyObject *kwds)
 		Program_hold_object(self, name_obj);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
 		return NULL;
 
 	if (_PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_type.id,
 			      (PyObject *)aliased_type_obj) == -1 ||
 	    _PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_name.id,
-			      name_obj) == -1) {
-		Py_DECREF(type_obj);
+			      name_obj) == -1)
 		return NULL;
-	}
 
-	return type_obj;
+	return_ptr(type_obj);
 }
 
 DrgnType *Program_pointer_type(Program *self, PyObject *args, PyObject *kwds)
@@ -2135,17 +2038,16 @@ DrgnType *Program_pointer_type(Program *self, PyObject *args, PyObject *kwds)
 	if (err)
 		return set_drgn_error(err);
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
 		return NULL;
 
 	if (_PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_type.id,
-			      (PyObject *)referenced_type_obj) == -1) {
-		Py_DECREF(type_obj);
+			      (PyObject *)referenced_type_obj) == -1)
 		return NULL;
-	}
 
-	return type_obj;
+	return_ptr(type_obj);
 }
 
 DrgnType *Program_array_type(Program *self, PyObject *args, PyObject *kwds)
@@ -2181,17 +2083,16 @@ DrgnType *Program_array_type(Program *self, PyObject *args, PyObject *kwds)
 	if (err)
 		return set_drgn_error(err);
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
 		return NULL;
 
 	if (_PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_type.id,
-			      (PyObject *)element_type_obj) == -1) {
-		Py_DECREF(type_obj);
+			      (PyObject *)element_type_obj) == -1)
 		return NULL;
-	}
 
-	return type_obj;
+	return_ptr(type_obj);
 }
 
 static int unpack_parameter(struct drgn_function_type_builder *builder,
@@ -2256,13 +2157,14 @@ DrgnType *Program_function_type(Program *self, PyObject *args, PyObject *kwds)
 		return NULL;
 	}
 
-	PyObject *cached_parameters = PySequence_Tuple(parameters_obj);
+	_cleanup_pydecref_ PyObject *cached_parameters =
+		PySequence_Tuple(parameters_obj);
 	if (!cached_parameters)
 		return NULL;
 	size_t num_parameters = PyTuple_GET_SIZE(cached_parameters);
 	bool can_cache_parameters = true;
 
-	PyObject *cached_template_parameters;
+	_cleanup_pydecref_ PyObject *cached_template_parameters;
 	if (template_parameters_obj) {
 		cached_template_parameters =
 			PySequence_Tuple(template_parameters_obj);
@@ -2270,7 +2172,7 @@ DrgnType *Program_function_type(Program *self, PyObject *args, PyObject *kwds)
 		cached_template_parameters = PyTuple_New(0);
 	}
 	if (!cached_template_parameters)
-		goto err_parameters;
+		return NULL;
 	size_t num_template_parameters =
 		PyTuple_GET_SIZE(cached_template_parameters);
 	bool can_cache_template_parameters = true;
@@ -2305,7 +2207,7 @@ DrgnType *Program_function_type(Program *self, PyObject *args, PyObject *kwds)
 		set_drgn_error(err);
 err_builder:
 		drgn_function_type_builder_deinit(&builder);
-		goto err_template_parameters;
+		return NULL;
 	}
 
 	if (num_parameters > 0)
@@ -2314,9 +2216,10 @@ err_builder:
 		Program_hold_object(self, cached_template_parameters);
 
 	qualified_type.qualifiers = qualifiers;
-	DrgnType *type_obj = (DrgnType *)DrgnType_wrap(qualified_type);
+	_cleanup_pydecref_ DrgnType *type_obj =
+		(DrgnType *)DrgnType_wrap(qualified_type);
 	if (!type_obj)
-		goto err_template_parameters;
+		return NULL;
 
 	if (_PyDict_SetItemId(type_obj->attr_cache, &DrgnType_attr_type.id,
 			      (PyObject *)return_type_obj) == -1 ||
@@ -2328,17 +2231,7 @@ err_builder:
 	     _PyDict_SetItemId(type_obj->attr_cache,
 			       &DrgnType_attr_template_parameters.id,
 			       cached_template_parameters) == -1))
-		goto err_type;
-	Py_DECREF(cached_parameters);
-	Py_DECREF(cached_template_parameters);
+		return NULL;
 
-	return type_obj;
-
-err_type:
-	Py_DECREF(type_obj);
-err_template_parameters:
-	Py_DECREF(cached_template_parameters);
-err_parameters:
-	Py_DECREF(cached_parameters);
-	return NULL;
+	return_ptr(type_obj);
 }

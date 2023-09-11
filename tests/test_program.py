@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import ctypes
 import itertools
 import os
@@ -539,6 +539,26 @@ class TestTypes(MockProgramTestCase):
         )
         self.assertRaisesRegex(
             ValueError, "no suitable integer type for ptrdiff_t", prog.type, "ptrdiff_t"
+        )
+
+    def test_not_size_t_or_ptrdiff_t(self):
+        self.types.append(
+            self.prog.typedef_type(
+                "size_tea", self.prog.int_type("unsigned char", 1, False)
+            )
+        )
+        self.types.append(
+            self.prog.typedef_type("ptrdiff_tee", self.prog.int_type("char", 1, True))
+        )
+        self.assertIdentical(
+            self.prog.type("size_tea"),
+            self.prog.typedef_type(
+                "size_tea", self.prog.int_type("unsigned char", 1, False)
+            ),
+        )
+        self.assertIdentical(
+            self.prog.type("ptrdiff_tee"),
+            self.prog.typedef_type("ptrdiff_tee", self.prog.int_type("char", 1, True)),
         )
 
     def test_tagged_type(self):

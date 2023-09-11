@@ -1,5 +1,5 @@
 // Copyright 2019 - Serapheim Dimitropoulos
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -36,6 +36,10 @@ static struct drgn_error *drgn_platform_from_kdump(kdump_ctx_t *ctx,
 	else if (strcmp(str, KDUMP_ARCH_PPC64) == 0)
 		arch = &arch_info_ppc64;
 	/* libkdumpfile doesn't support RISC-V */
+	else if (strcmp(str, KDUMP_ARCH_S390X) == 0)
+		arch = &arch_info_s390x;
+	else if (strcmp(str, KDUMP_ARCH_S390) == 0)
+		arch = &arch_info_s390;
 	else
 		arch = &arch_info_unknown;
 
@@ -163,6 +167,9 @@ struct drgn_error *drgn_program_set_kdump(struct drgn_program *prog)
 err_platform:
 	prog->has_platform = had_platform;
 err:
+	// Reset anything we parsed from vmcoreinfo
+	free(prog->vmcoreinfo.raw);
+	memset(&prog->vmcoreinfo, 0, sizeof(prog->vmcoreinfo));
 	kdump_free(ctx);
 	return err;
 }

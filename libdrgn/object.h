@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -152,6 +152,15 @@ struct drgn_error *
 drgn_object_set_unsigned_internal(struct drgn_object *res,
 				  const struct drgn_object_type *type,
 				  uint64_t uvalue);
+
+/**
+ * Like @ref drgn_object_set_float() but @ref drgn_object_type() was already
+ * called and the type is already known to be a floating-point type.
+ */
+struct drgn_error *
+drgn_object_set_float_internal(struct drgn_object *res,
+			       const struct drgn_object_type *type,
+			       double fvalue);
 
 /**
  * Like @ref drgn_object_set_from_buffer() but @ref drgn_object_type() was

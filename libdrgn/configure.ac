@@ -1,7 +1,7 @@
 dnl Copyright (c) Meta Platforms, Inc. and affiliates.
-dnl SPDX-License-Identifier: GPL-3.0-or-later
+dnl SPDX-License-Identifier: LGPL-2.1-or-later
 
-AC_INIT([libdrgn], [0.0.20],
+AC_INIT([libdrgn], [0.0.24],
 	[https://github.com/osandov/drgn/issues],,
 	[https://github.com/osandov/drgn])
 
@@ -16,6 +16,8 @@ AM_PROG_AR
 LT_INIT
 
 AC_SYS_LARGEFILE
+
+MY_C_AUTO
 
 AC_ARG_ENABLE([openmp],
 	      [AS_HELP_STRING([--enable-openmp@<:@=ARG@:>@],
@@ -108,6 +110,7 @@ AS_IF([test "x$enable_compiler_warnings" != xno],
        -Wall dnl
        -Wformat-overflow=2 dnl
        -Wformat-truncation=2 dnl
+       -Wimplicit-fallthrough dnl
        ], [WARN_CFLAGS], [$compiler_flags_test])])
 AS_IF([test "x$enable_compiler_warnings" = xerror],
       [AX_APPEND_FLAG([-Werror], [WARN_CFLAGS])])

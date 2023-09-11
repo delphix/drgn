@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -32,7 +32,7 @@
  */
 
 DEFINE_BINARY_SEARCH_TREE_TYPE(drgn_memory_segment_tree,
-			       struct drgn_memory_segment)
+			       struct drgn_memory_segment);
 
 /**
  * Memory reader.

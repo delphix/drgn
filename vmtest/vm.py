@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import os
 from pathlib import Path
@@ -9,10 +9,16 @@ import socket
 import subprocess
 import sys
 import tempfile
+from typing import Optional
 
 from util import nproc, out_of_date
-
-_9PFS_MSIZE = 1024 * 1024
+from vmtest.config import HOST_ARCHITECTURE, Kernel, local_kernel
+from vmtest.download import (
+    DOWNLOAD_KERNEL_ARGPARSE_METAVAR,
+    DownloadKernel,
+    download,
+    download_kernel_argparse_type,
+)
 
 # Script run as init in the virtual machine.
 _INIT_TEMPLATE = r"""#!/bin/sh
@@ -27,10 +33,13 @@ _INIT_TEMPLATE = r"""#!/bin/sh
 set -eu
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-export PYTHON={python}
 {kdump_needs_nosmp}
 
-trap 'poweroff -f' EXIT
+# On exit, power off. We don't use the poweroff command because very minimal
+# installations don't have it (e.g., the debootstrap minbase variant). The
+# magic SysRq returns immediately without waiting for the poweroff, so we sleep
+# for a while and panic if it takes longer than that.
+trap 'echo o > /proc/sysrq-trigger && sleep 60' exit
 
 umask 022
 
@@ -38,39 +47,45 @@ HOSTNAME=vmtest
 VPORT_NAME=com.osandov.vmtest.0
 RELEASE=$(uname -r)
 
-# Set up overlayfs on the temporary directory containing this script.
-mnt=$(dirname "$0")
-mount -t tmpfs tmpfs "$mnt"
-mkdir "$mnt/upper" "$mnt/work" "$mnt/merged"
+# Set up overlayfs.
+if [ ! -w /tmp ]; then
+	mount -t tmpfs tmpfs /tmp
+fi
+mkdir /tmp/upper /tmp/work /tmp/merged
+mkdir /tmp/upper/dev /tmp/upper/etc /tmp/upper/mnt
+mkdir -m 555 /tmp/upper/proc /tmp/upper/sys
+mkdir -m 1777 /tmp/upper/tmp
+if [ -e /tmp/host ]; then
+	mkdir /tmp/host_upper /tmp/host_work /tmp/upper/host
+fi
 
-mkdir "$mnt/upper/dev" "$mnt/upper/etc" "$mnt/upper/mnt"
-mkdir -m 555 "$mnt/upper/proc" "$mnt/upper/sys"
-mkdir -m 1777 "$mnt/upper/tmp"
-
-mount -t overlay -o lowerdir=/,upperdir="$mnt/upper",workdir="$mnt/work" overlay "$mnt/merged"
+mount -t overlay -o lowerdir=/,upperdir=/tmp/upper,workdir=/tmp/work overlay /tmp/merged
+if [ -e /tmp/host ]; then
+	mount -t overlay -o lowerdir=/tmp/host,upperdir=/tmp/host_upper,workdir=/tmp/host_work overlay /tmp/merged/host
+fi
 
 # Mount core filesystems.
-mount -t devtmpfs -o nosuid,noexec dev "$mnt/merged/dev"
-mkdir "$mnt/merged/dev/shm"
-mount -t tmpfs -o nosuid,nodev tmpfs "$mnt/merged/dev/shm"
-mount -t proc -o nosuid,nodev,noexec proc "$mnt/merged/proc"
-mount -t sysfs -o nosuid,nodev,noexec sys "$mnt/merged/sys"
+mount -t devtmpfs -o nosuid,noexec dev /tmp/merged/dev
+mkdir /tmp/merged/dev/shm
+mount -t tmpfs -o nosuid,nodev tmpfs /tmp/merged/dev/shm
+mount -t proc -o nosuid,nodev,noexec proc /tmp/merged/proc
+mount -t sysfs -o nosuid,nodev,noexec sys /tmp/merged/sys
 # cgroup2 was added in Linux v4.5.
-mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 "$mnt/merged/sys/fs/cgroup" || true
+mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /tmp/merged/sys/fs/cgroup || true
 # Ideally we'd just be able to create an opaque directory for /tmp on the upper
 # layer. However, before Linux kernel commit 51f7e52dc943 ("ovl: share inode
 # for hard link") (in v4.8), overlayfs doesn't handle hard links correctly,
 # which breaks some tests.
-mount -t tmpfs -o nosuid,nodev tmpfs "$mnt/merged/tmp"
+mount -t tmpfs -o nosuid,nodev tmpfs /tmp/merged/tmp
 
 # Pivot into the new root.
-pivot_root "$mnt/merged" "$mnt/merged/mnt"
+pivot_root /tmp/merged /tmp/merged/mnt
 cd /
 umount -l /mnt
 
 # Load kernel modules.
 mkdir -p "/lib/modules/$RELEASE"
-mount -t 9p -o trans=virtio,cache=loose,ro,msize={_9PFS_MSIZE} modules "/lib/modules/$RELEASE"
+mount --bind {kernel_dir} "/lib/modules/$RELEASE"
 for module in configs rng_core virtio_rng; do
 	modprobe "$module"
 done
@@ -173,19 +188,24 @@ class LostVMError(Exception):
     pass
 
 
-def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
+def run_in_vm(
+    command: str, kernel: Kernel, root_dir: Optional[Path], build_dir: Path
+) -> int:
+    if root_dir is None:
+        if kernel.arch is HOST_ARCHITECTURE:
+            root_dir = Path("/")
+        else:
+            root_dir = build_dir / kernel.arch.name / "rootfs"
+
+    qemu_exe = "qemu-system-" + kernel.arch.name
     match = re.search(
         r"QEMU emulator version ([0-9]+(?:\.[0-9]+)*)",
-        subprocess.check_output(
-            ["qemu-system-x86_64", "-version"], universal_newlines=True
-        ),
+        subprocess.check_output([qemu_exe, "-version"], universal_newlines=True),
     )
     if not match:
         raise Exception("could not determine QEMU version")
     qemu_version = tuple(int(x) for x in match.group(1).split("."))
 
-    # multidevs was added in QEMU 4.2.0.
-    multidevs = ",multidevs=remap" if qemu_version >= (4, 2) else ""
     # QEMU's 9pfs O_NOATIME handling was fixed in 5.1.0. The fix was backported
     # to 5.0.1.
     env = os.environ.copy()
@@ -193,14 +213,21 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
         onoatimehack_so = _build_onoatimehack(build_dir)
         env["LD_PRELOAD"] = f"{str(onoatimehack_so)}:{env.get('LD_PRELOAD', '')}"
 
-    if os.access("/dev/kvm", os.R_OK | os.W_OK):
-        kvm_args = ["-cpu", "host", "-enable-kvm"]
-    else:
-        print(
-            "warning: /dev/kvm cannot be accessed; falling back to emulation",
-            file=sys.stderr,
-        )
-        kvm_args = []
+    kvm_args = []
+    if HOST_ARCHITECTURE is not None and kernel.arch.name == HOST_ARCHITECTURE.name:
+        if os.access("/dev/kvm", os.R_OK | os.W_OK):
+            kvm_args = ["-cpu", "host", "-enable-kvm"]
+        else:
+            print(
+                "warning: /dev/kvm cannot be accessed; falling back to emulation",
+                file=sys.stderr,
+            )
+
+    virtfs_options = "security_model=none,readonly=on"
+    # multidevs was added in QEMU 4.2.0.
+    if qemu_version >= (4, 2):
+        virtfs_options += ",multidevs=remap"
+    _9pfs_mount_options = f"trans=virtio,cache=loose,msize={1024 * 1024}"
 
     with tempfile.TemporaryDirectory(prefix="drgn-vmtest-") as temp_dir, socket.socket(
         socket.AF_UNIX
@@ -210,47 +237,75 @@ def run_in_vm(command: str, kernel_dir: Path, build_dir: Path) -> int:
         server_sock.bind(str(socket_path))
         server_sock.listen()
 
-        init = (temp_path / "init").resolve()
-        with open(init, "w") as init_file:
+        init_path = temp_path / "init"
+
+        unshare_args = []
+        if root_dir == Path("/"):
+            host_virtfs_args = []
+            init = str(init_path.resolve())
+            host_dir_prefix = ""
+        else:
+            # Try to detect if the rootfs was created without privileges (e.g.,
+            # by vmtest.rootfsbuild) and remap the UIDs/GIDs if so.
+            if (root_dir / "bin" / "mount").stat().st_uid != 0:
+                unshare_args = [
+                    "unshare",
+                    "--map-root-user",
+                    "--map-users=auto",
+                    "--map-groups=auto",
+                ]
+            host_virtfs_args = [
+                "-virtfs",
+                f"local,path=/,mount_tag=host,{virtfs_options}",
+            ]
+            init = f'/bin/sh -- -c "/bin/mount -t tmpfs tmpfs /tmp && /bin/mkdir /tmp/host && /bin/mount -t 9p -o {_9pfs_mount_options},ro host /tmp/host && . /tmp/host{init_path.resolve()}"'
+            host_dir_prefix = "/host"
+
+        with init_path.open("w") as init_file:
             init_file.write(
                 _INIT_TEMPLATE.format(
-                    _9PFS_MSIZE=_9PFS_MSIZE,
-                    python=shlex.quote(sys.executable),
-                    cwd=shlex.quote(os.getcwd()),
+                    cwd=shlex.quote(host_dir_prefix + os.getcwd()),
+                    kernel_dir=shlex.quote(
+                        host_dir_prefix + str(kernel.path.resolve())
+                    ),
                     command=shlex.quote(command),
                     kdump_needs_nosmp="" if kvm_args else "export KDUMP_NEEDS_NOSMP=1",
                 )
             )
-        os.chmod(init, 0o755)
+        init_path.chmod(0o755)
+
         with subprocess.Popen(
             [
                 # fmt: off
-                "qemu-system-x86_64", *kvm_args,
+                *unshare_args,
 
-                "-smp", str(nproc()), "-m", "2G",
+                qemu_exe, *kvm_args,
 
-                "-nodefaults", "-display", "none", "-serial", "mon:stdio",
+                # Limit the number of cores to 8, otherwise we can reach an OOM troubles.
+                "-smp", str(min(nproc(), 8)), "-m", "2G",
+
+                "-display", "none", "-serial", "mon:stdio",
 
                 # This along with -append panic=-1 ensures that we exit on a
                 # panic instead of hanging.
                 "-no-reboot",
 
                 "-virtfs",
-                f"local,id=root,path=/,mount_tag=/dev/root,security_model=none,readonly=on{multidevs}",
+                f"local,id=root,path={root_dir},mount_tag=/dev/root,{virtfs_options}",
+                *host_virtfs_args,
 
-                "-virtfs",
-                f"local,path={kernel_dir},mount_tag=modules,security_model=none,readonly=on",
-
-                "-device", "virtio-rng-pci",
+                "-device", "virtio-rng",
 
                 "-device", "virtio-serial",
                 "-chardev", f"socket,id=vmtest,path={socket_path}",
                 "-device",
                 "virtserialport,chardev=vmtest,name=com.osandov.vmtest.0",
 
-                "-kernel", str(kernel_dir / "vmlinuz"),
+                *kernel.arch.qemu_options,
+
+                "-kernel", str(kernel.path / "vmlinuz"),
                 "-append",
-                f"rootfstype=9p rootflags=trans=virtio,cache=loose,msize={_9PFS_MSIZE} ro console=0,115200 panic=-1 crashkernel=256M init={init}",
+                f"rootfstype=9p rootflags={_9pfs_mount_options} ro console={kernel.arch.qemu_console},115200 panic=-1 crashkernel=256M init={init}",
                 # fmt: on
             ],
             env=env,
@@ -299,7 +354,7 @@ if __name__ == "__main__":
         metavar="DIR",
         type=Path,
         default="build/vmtest",
-        help="directory for build artifacts and downloaded kernels",
+        help="directory for vmtest artifacts",
     )
     parser.add_argument(
         "--lost-status",
@@ -311,8 +366,20 @@ if __name__ == "__main__":
     parser.add_argument(
         "-k",
         "--kernel",
+        metavar=DOWNLOAD_KERNEL_ARGPARSE_METAVAR,
+        type=download_kernel_argparse_type,
+        required=HOST_ARCHITECTURE is None,
         default=argparse.SUPPRESS,
-        help="kernel to use (default: latest available kernel)",
+        help="kernel to use"
+        + ("" if HOST_ARCHITECTURE is None else " (default: latest available kernel)"),
+    )
+    parser.add_argument(
+        "-r",
+        "--root-directory",
+        metavar="DIR",
+        default=argparse.SUPPRESS,
+        type=Path,
+        help="directory to use as root directory in VM (default: / for the host architecture, $directory/$arch/rootfs otherwise)",
     )
     parser.add_argument(
         "command",
@@ -322,17 +389,19 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    kernel = getattr(args, "kernel", "*")
-    if kernel.startswith(".") or kernel.startswith("/"):
-        kernel_dir = Path(kernel)
+    if not hasattr(args, "kernel"):
+        assert HOST_ARCHITECTURE is not None
+        args.kernel = DownloadKernel(HOST_ARCHITECTURE, "*")
+    if args.kernel.pattern.startswith(".") or args.kernel.pattern.startswith("/"):
+        kernel = local_kernel(args.kernel.arch, Path(args.kernel.pattern))
     else:
-        from vmtest.download import download_kernels
-
-        kernel_dir = next(download_kernels(args.directory, "x86_64", (kernel,)))
+        kernel = next(download(args.directory, [args.kernel]))  # type: ignore[assignment]
+    if not hasattr(args, "root_directory"):
+        args.root_directory = None
 
     try:
         command = " ".join(args.command) if args.command else "sh -i"
-        sys.exit(run_in_vm(command, kernel_dir, args.directory))
+        sys.exit(run_in_vm(command, kernel, args.root_directory, args.directory))
     except LostVMError as e:
         print("error:", e, file=sys.stderr)
         sys.exit(args.lost_status)

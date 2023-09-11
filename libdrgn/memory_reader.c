@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
 #include <errno.h>
@@ -36,7 +36,7 @@ drgn_memory_segment_to_key(const struct drgn_memory_segment *entry)
 
 DEFINE_BINARY_SEARCH_TREE_FUNCTIONS(drgn_memory_segment_tree, node,
 				    drgn_memory_segment_to_key,
-				    binary_search_tree_scalar_cmp, splay)
+				    binary_search_tree_scalar_cmp, splay);
 
 void drgn_memory_reader_init(struct drgn_memory_reader *reader)
 {

@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 from collections import defaultdict
 from pathlib import Path
@@ -10,14 +10,18 @@ from drgn.helpers.linux.slab import (
     find_containing_slab_cache,
     find_slab_cache,
     for_each_slab_cache,
+    get_slab_cache_aliases,
     slab_cache_for_each_allocated_object,
     slab_cache_is_merged,
+    slab_object_info,
 )
 from tests.linux_kernel import (
     LinuxKernelTestCase,
     skip_unless_have_full_mm_support,
     skip_unless_have_test_kmod,
 )
+
+SLAB_SYSFS_PATH = Path("/sys/kernel/slab")
 
 
 def get_proc_slabinfo_names():
@@ -44,11 +48,10 @@ def fallback_slab_cache_names(prog):
 
 class TestSlab(LinuxKernelTestCase):
     def _slab_cache_aliases(self):
-        slab_path = Path("/sys/kernel/slab")
-        if not slab_path.exists():
-            self.skipTest(f"{slab_path} does not exist")
+        if not SLAB_SYSFS_PATH.exists():
+            self.skipTest(f"{str(SLAB_SYSFS_PATH)} does not exist")
         aliases = defaultdict(list)
-        for child in slab_path.iterdir():
+        for child in SLAB_SYSFS_PATH.iterdir():
             if not child.name.startswith(":"):
                 aliases[child.stat().st_ino].append(child.name)
         return aliases
@@ -74,6 +77,39 @@ class TestSlab(LinuxKernelTestCase):
         else:
             self.fail("couldn't find slab cache")
         self.assertTrue(slab_cache_is_merged(slab_cache))
+
+    def test_get_slab_cache_aliases(self):
+        if not SLAB_SYSFS_PATH.exists():
+            # A SLOB or SLAB kernel, or one without SYSFS. Test that the
+            # helper fails as expected.
+            self.assertRaisesRegex(
+                LookupError, "CONFIG_SYSFS", get_slab_cache_aliases, self.prog
+            )
+            return
+        # Otherwise, the helper should work, test functionality.
+        alias_to_name = get_slab_cache_aliases(self.prog)
+        for aliases in self._slab_cache_aliases().values():
+            # Alias groups of size 1 are either non-mergeable slabs, or
+            # mergeable slabs which haven't actually been merged. Either way,
+            # they should not be present in the dictionary.
+            if len(aliases) == 1:
+                self.assertNotIn(aliases[0], alias_to_name)
+                continue
+
+            # Find out which cache in the group is target -- it won't be
+            # included in the alias dict.
+            for alias in aliases:
+                if alias not in alias_to_name:
+                    target_alias = alias
+                    aliases.remove(alias)
+                    break
+            else:
+                self.fail("could not find target slab cache name")
+
+            # All aliases should map to the same name
+            for alias in aliases:
+                self.assertEqual(alias_to_name[alias], target_alias)
+            self.assertNotIn(target_alias, alias_to_name)
 
     def test_for_each_slab_cache(self):
         try:
@@ -107,14 +143,12 @@ class TestSlab(LinuxKernelTestCase):
                 cache = self.prog[f"drgn_test_{size}_kmem_cache"]
                 objects = self.prog[f"drgn_test_{size}_slab_objects"]
                 if self.prog["drgn_test_slob"]:
-                    self.assertRaisesRegex(
-                        ValueError,
-                        "SLOB is not supported",
-                        next,
-                        slab_cache_for_each_allocated_object(
-                            cache, f"struct drgn_test_{size}_slab_object"
-                        ),
-                    )
+                    with self.assertRaisesRegex(ValueError, "SLOB is not supported"):
+                        next(
+                            slab_cache_for_each_allocated_object(
+                                cache, f"struct drgn_test_{size}_slab_object"
+                            )
+                        )
                 else:
                     self.assertEqual(
                         sorted(
@@ -125,6 +159,26 @@ class TestSlab(LinuxKernelTestCase):
                         ),
                         list(objects),
                     )
+
+    @skip_unless_have_full_mm_support
+    @skip_unless_have_test_kmod
+    def test_slab_object_info(self):
+        for size in ("small", "big"):
+            with self.subTest(size=size):
+                cache = self.prog[f"drgn_test_{size}_kmem_cache"]
+                objects = self.prog[f"drgn_test_{size}_slab_objects"]
+                if self.prog["drgn_test_slob"]:
+                    self.assertIsNone(slab_object_info(objects[0]))
+                else:
+                    info = slab_object_info(objects[0])
+                    self.assertEqual(info.slab_cache, cache)
+                    self.assertEqual(info.address, objects[0].value_())
+                    self.assertTrue(info.allocated)
+
+                    info = slab_object_info(objects[0].value.address_of_())
+                    self.assertEqual(info.slab_cache, cache)
+                    self.assertEqual(info.address, objects[0].value_())
+                    self.assertTrue(info.allocated)
 
     @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod

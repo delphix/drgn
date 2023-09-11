@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Networking
@@ -12,7 +12,7 @@ Linux kernel networking subsystem.
 import operator
 from typing import Iterator, Union
 
-from drgn import NULL, IntegerLike, Object, Program, cast, container_of
+from drgn import NULL, IntegerLike, Object, Program, Type, cast, container_of, sizeof
 from drgn.helpers.linux.fs import fget
 from drgn.helpers.linux.list import hlist_for_each_entry, list_for_each_entry
 from drgn.helpers.linux.list_nulls import hlist_nulls_for_each_entry
@@ -26,8 +26,10 @@ __all__ = (
     "netdev_for_each_tx_queue",
     "netdev_get_by_index",
     "netdev_get_by_name",
+    "netdev_priv",
     "sk_fullsock",
     "sk_nulls_for_each",
+    "skb_shinfo",
 )
 
 
@@ -189,6 +191,32 @@ def netdev_get_by_name(
     return NULL(prog_or_net.prog_, "struct net_device *")
 
 
+def netdev_priv(dev: Object, type: Union[str, Type] = "void") -> Object:
+    """
+    Return the private data of a network device.
+
+    >>> dev = netdev_get_by_name(prog, "wlp0s20f3")
+    >>> netdev_priv(dev)
+    (void *)0xffff9419c9dec9c0
+    >>> netdev_priv(dev, "struct ieee80211_sub_if_data")
+    *(struct ieee80211_sub_if_data *)0xffff9419c9dec9c0 = {
+        ...
+    }
+
+    :param dev: ``struct net_device *``
+    :param type: Type of private data.
+    :return: ``type *``
+    """
+    prog = dev.prog_
+    try:
+        offset = prog.cache["net_device_aligned_size"]
+    except KeyError:
+        # 31 is NETDEV_ALIGN - 1
+        offset = (sizeof(prog.type("struct net_device")) + 31) & ~31
+        prog.cache["net_device_aligned_size"] = offset
+    return Object(prog, prog.pointer_type(prog.type(type)), dev.value_() + offset)
+
+
 def sk_fullsock(sk: Object) -> bool:
     """
     Check whether a socket is a full socket, i.e., not a time-wait or request
@@ -213,3 +241,22 @@ def sk_nulls_for_each(head: Object) -> Iterator[Object]:
         "struct sock", head, "__sk_common.skc_nulls_node"
     ):
         yield sk
+
+
+def skb_shinfo(skb: Object) -> Object:
+    """
+    Get the shared info for a socket buffer.
+
+    :param skb: ``struct sk_buff *``
+    :return: ``struct skb_shared_info *``
+    """
+    prog = skb.prog_
+    try:
+        NET_SKBUFF_DATA_USES_OFFSET = prog.cache["NET_SKBUFF_DATA_USES_OFFSET"]
+    except KeyError:
+        NET_SKBUFF_DATA_USES_OFFSET = sizeof(prog.type("long")) > 4
+        prog.cache["NET_SKBUFF_DATA_USES_OFFSET"] = NET_SKBUFF_DATA_USES_OFFSET
+    if NET_SKBUFF_DATA_USES_OFFSET:
+        return cast("struct skb_shared_info *", skb.head + skb.end)
+    else:
+        return cast("struct skb_shared_info *", skb.end)

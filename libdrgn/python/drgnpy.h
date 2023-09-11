@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #ifndef DRGNPY_H
 #define DRGNPY_H
@@ -11,10 +11,13 @@
 #include "structmember.h"
 
 #include "docstrings.h"
+#include "../cleanup.h"
 #include "../drgn.h"
 // IWYU pragma: end_exports
 
 #include "../hash_table.h"
+#include "../hash_table.h"
+#include "../pp.h"
 #include "../program.h"
 
 /* These were added in Python 3.7. */
@@ -39,12 +42,56 @@
 
 #define DRGNPY_PUBLIC __attribute__((__visibility__("default")))
 
+// PyLong_From* and PyLong_As* for stdint.h types. These use _Generic for
+// slightly more type safety (e.g., so you can't pass an int64_t to
+// PyLong_FromUint64()).
+#if ULONG_MAX == UINT64_MAX
+#define PyLong_FromUint64(v) _Generic((v), uint64_t: PyLong_FromUnsignedLong)(v)
+#define PyLong_AsUint64(obj) ((uint64_t)PyLong_AsUnsignedLong(obj))
+#define PyLong_AsUint64Mask(obj) ((uint64_t)PyLong_AsUnsignedLongMask(obj))
+#elif ULLONG_MAX == UINT64_MAX
+#define PyLong_FromUint64(v) _Generic((v), uint64_t: PyLong_FromUnsignedLongLong)(v)
+#define PyLong_AsUint64(obj) ((uint64_t)PyLong_AsUnsignedLongLong(obj))
+#define PyLong_AsUint64Mask(obj) ((uint64_t)PyLong_AsUnsignedLongLongMask(obj))
+#endif
+
+#if LONG_MIN == INT64_MIN && LONG_MAX == INT64_MAX
+#define PyLong_FromInt64(v) _Generic((v), int64_t: PyLong_FromLong)(v)
+#define PyLong_AsInt64(obj) ((int64_t)PyLong_AsLong(obj))
+#elif LLONG_MIN == INT64_MIN && LLONG_MAX == INT64_MAX
+#define PyLong_FromInt64(v) _Generic((v), int64_t: PyLong_FromLongLong)(v)
+#define PyLong_AsInt64(obj) ((int64_t)PyLong_AsLongLong(obj))
+#endif
+
+#if ULONG_MAX >= UINT32_MAX
+#define PyLong_FromUint32(v) _Generic((v), uint32_t: PyLong_FromUnsignedLong)(v)
+#define PyLong_FromUint16(v) _Generic((v), uint16_t: PyLong_FromUnsignedLong)(v)
+#define PyLong_FromUint8(v) _Generic((v), uint8_t: PyLong_FromUnsignedLong)(v)
+#endif
+
 #define Py_RETURN_BOOL(cond) do {	\
 	if (cond)			\
 		Py_RETURN_TRUE;		\
 	else				\
 		Py_RETURN_FALSE;	\
 } while (0)
+
+static inline void pydecrefp(void *p)
+{
+	Py_XDECREF(*(PyObject **)p);
+}
+
+/** Scope guard that wraps PyGILState_Ensure() and PyGILState_Release(). */
+#define PyGILState_guard()						\
+	__attribute__((__cleanup__(PyGILState_Releasep), __unused__))	\
+	PyGILState_STATE PP_UNIQUE(gstate) = PyGILState_Ensure()
+static inline void PyGILState_Releasep(PyGILState_STATE *gstatep)
+{
+	PyGILState_Release(*gstatep);
+}
+
+/** Call @c Py_XDECREF() when the variable goes out of scope. */
+#define _cleanup_pydecref_ _cleanup_(pydecrefp)
 
 typedef struct {
 	PyObject_HEAD
@@ -84,7 +131,7 @@ typedef struct {
 	struct drgn_platform *platform;
 } Platform;
 
-DEFINE_HASH_SET_TYPE(pyobjectp_set, PyObject *)
+DEFINE_HASH_SET_TYPE(pyobjectp_set, PyObject *);
 
 typedef struct {
 	PyObject_HEAD
@@ -197,6 +244,7 @@ extern PyObject *ObjectAbsentError;
 extern PyObject *OutOfBoundsError;
 
 int add_module_constants(PyObject *m);
+int init_logging(void);
 
 bool set_drgn_in_python(void);
 void clear_drgn_in_python(void);
@@ -205,15 +253,15 @@ void *set_drgn_error(struct drgn_error *err);
 void *set_error_type_name(const char *format,
 			  struct drgn_qualified_type qualified_type);
 
+#define call_tp_alloc(type) ((type *)type##_type.tp_alloc(&type##_type, 0))
+
 PyObject *Language_wrap(const struct drgn_language *language);
 int language_converter(PyObject *o, void *p);
 int add_languages(void);
 
 static inline DrgnObject *DrgnObject_alloc(Program *prog)
 {
-	DrgnObject *ret;
-
-	ret = (DrgnObject *)DrgnObject_type.tp_alloc(&DrgnObject_type, 0);
+	DrgnObject *ret = call_tp_alloc(DrgnObject);
 	if (ret) {
 		drgn_object_init(&ret->obj, &prog->prog);
 		Py_INCREF(prog);
@@ -281,13 +329,12 @@ struct index_arg {
 };
 int index_converter(PyObject *o, void *p);
 
-/* Helpers for path arguments based on posixmodule.c in CPython. */
 struct path_arg {
 	bool allow_none;
 	char *path;
 	Py_ssize_t length;
 	PyObject *object;
-	PyObject *cleanup;
+	PyObject *bytes;
 };
 int path_converter(PyObject *o, void *p);
 void path_cleanup(struct path_arg *path);
@@ -303,13 +350,18 @@ PyObject *drgnpy_linux_helper_direct_mapping_offset(PyObject *self,
 						    PyObject *arg);
 PyObject *drgnpy_linux_helper_read_vm(PyObject *self, PyObject *args,
 				      PyObject *kwds);
+PyObject *drgnpy_linux_helper_follow_phys(PyObject *self, PyObject *args,
+					  PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_per_cpu_ptr(PyObject *self, PyObject *args,
 					    PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_cpu_curr(PyObject *self, PyObject *args,
+					 PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_idle_task(PyObject *self, PyObject *args,
 					  PyObject *kwds);
-DrgnObject *drgnpy_linux_helper_radix_tree_lookup(PyObject *self,
-						  PyObject *args,
-						  PyObject *kwds);
+PyObject *drgnpy_linux_helper_task_cpu(PyObject *self, PyObject *args,
+				       PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_xa_load(PyObject *self, PyObject *args,
+					PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_idr_find(PyObject *self, PyObject *args,
 					 PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_find_pid(PyObject *self, PyObject *args,

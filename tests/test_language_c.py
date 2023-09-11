@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 from functools import reduce
+from itertools import chain
 import operator
 
 from drgn import (
@@ -787,6 +788,58 @@ class TestLexer(TestCase):
             C_TOKEN.ENUM,
         ]
         self.assertEqual([token.kind for token in self.lex(s, cpp=True)], tokens)
+
+    def test_cpp_identifiers_with_template_parameters(self):
+        token_pairs = (
+            ("vector", "<int>"),
+            ("pair", "<int, double>"),
+            ("unordered_map", "<std::string, std::vector<pair<short, bool>>>"),
+            ("IntLiteral", "<123>"),
+            ("IntLiteralWithSuffix", "<123UL>"),
+            ("FloatLiteral", "<1.987>"),
+            ("FloatLiteralWithExponent", "<1.23423e+1f>"),
+            ("PointerLiteral", "<&asdf>"),
+            ("ParenthesizedPointerLiteral", "<(&asdf)>"),
+            ("CharLiteral", "<'a'>"),
+            ("CharLiteralEdgeCase1", "<'<'>"),
+            ("CharLiteralEdgeCase2", "<'>'>"),
+            ("CharLiteralEdgeCase3", r"<'\''>"),
+        )
+        self.assertEqual(
+            [
+                (token.kind, token.value)
+                for token in self.lex(
+                    " ".join("".join(pair) for pair in token_pairs), cpp=True
+                )
+            ],
+            [
+                (C_TOKEN.TEMPLATE_ARGUMENTS if i % 2 else C_TOKEN.IDENTIFIER, value)
+                for i, value in enumerate(chain.from_iterable(token_pairs))
+            ],
+        )
+
+    def test_cpp_identifiers_with_invalid_template_parameters(self):
+        for s in [
+            "vector<int",
+            "pair<<int, double>",
+            "unordered_map<string, vector<pair<short, bool>>",
+        ]:
+            self.assertRaisesRegex(
+                SyntaxError,
+                "invalid template arguments",
+                list,
+                self.lex(s, cpp=True),
+            )
+        for s in [
+            "vectorint>",
+            "pair<int, double>>",
+        ]:
+            self.assertRaisesRegex(
+                SyntaxError,
+                "invalid character",
+                list,
+                self.lex(s, cpp=True),
+            )
 
     def test_identifiers(self):
         s = "_ x foo _bar baz1"
@@ -2356,3 +2409,123 @@ class TestPrettyPrintObject(MockProgramTestCase):
             else:
                 type_name = type_
             self.assertEqual(str(Object(self.prog, type_)), f"({type_name})<absent>")
+
+    def test_bigint(self):
+        segment = bytearray(16)
+        self.add_memory_segment(segment, virt_addr=0xFFFF0000)
+
+        for byteorder in ("little", "big"):
+            with self.subTest(byteorder=byteorder):
+                obj = Object(
+                    self.prog,
+                    self.prog.int_type("unsigned __int128", 16, False, byteorder),
+                    address=0xFFFF0000,
+                )
+                for value in (
+                    0,
+                    0x100,
+                    0x112233445566778899AABBCCDDEEFF,
+                    0xFEDCBA9876543210,
+                ):
+                    segment[:] = value.to_bytes(16, byteorder)
+                    self.assertEqual(str(obj), "(unsigned __int128)" + hex(value))
+
+    def test_bigint_in_array(self):
+        segment = bytearray(16 * 3)
+        self.add_memory_segment(segment, virt_addr=0xFFFF0000)
+
+        for byteorder in ("little", "big"):
+            with self.subTest(byteorder=byteorder):
+                segment[:16] = (0x112233445566778899AABBCCDDEEFF).to_bytes(
+                    16, byteorder
+                )
+                segment[16:32] = (0xDEADBEEF).to_bytes(16, byteorder)
+                obj = Object(
+                    self.prog,
+                    self.prog.array_type(
+                        self.prog.int_type("unsigned __int128", 16, False, byteorder), 3
+                    ),
+                    address=0xFFFF0000,
+                )
+                self.assertEqual(
+                    str(obj),
+                    "(unsigned __int128 [3]){ 0x112233445566778899aabbccddeeff, 0xdeadbeef }",
+                )
+                self.assertEqual(
+                    obj.format_(implicit_elements=True),
+                    "(unsigned __int128 [3]){ 0x112233445566778899aabbccddeeff, 0xdeadbeef, 0x0 }",
+                )
+
+    def test_bigint_in_struct(self):
+        segment = bytearray(16 * 3)
+        self.add_memory_segment(segment, virt_addr=0xFFFF0000)
+
+        for byteorder in ("little", "big"):
+            with self.subTest(byteorder=byteorder):
+                segment[:16] = (0x112233445566778899AABBCCDDEEFF).to_bytes(
+                    16, byteorder
+                )
+                segment[16:32] = (0xDEADBEEF).to_bytes(16, byteorder)
+                type = self.prog.int_type("unsigned __int128", 16, False, byteorder)
+                obj = Object(
+                    self.prog,
+                    self.prog.struct_type(
+                        "foo",
+                        16 * 3,
+                        (
+                            TypeMember(type, "a"),
+                            TypeMember(type, "b", 16 * 8),
+                            TypeMember(type, "c", 16 * 8 * 2),
+                        ),
+                    ),
+                    address=0xFFFF0000,
+                )
+                self.assertEqual(
+                    str(obj),
+                    """\
+(struct foo){
+	.a = (unsigned __int128)0x112233445566778899aabbccddeeff,
+	.b = (unsigned __int128)0xdeadbeef,
+	.c = (unsigned __int128)0x0,
+}""",
+                )
+                self.assertEqual(
+                    obj.format_(implicit_members=False),
+                    """\
+(struct foo){
+	.a = (unsigned __int128)0x112233445566778899aabbccddeeff,
+	.b = (unsigned __int128)0xdeadbeef,
+}""",
+                )
+
+    def test_bigint_typedef(self):
+        self.add_memory_segment(
+            (0xDEADBEEF).to_bytes(16, "little"), virt_addr=0xFFFF0000
+        )
+        type = self.prog.typedef_type(
+            "__uint128_t", self.prog.int_type("unsigned __int128", 16, False)
+        )
+
+        self.assertEqual(
+            str(Object(self.prog, type, address=0xFFFF0000)),
+            "(__uint128_t)0xdeadbeef",
+        )
+
+        self.assertEqual(
+            str(Object(self.prog, self.prog.array_type(type, 1), address=0xFFFF0000)),
+            "(__uint128_t [1]){ 0xdeadbeef }",
+        )
+
+        self.assertEqual(
+            str(
+                Object(
+                    self.prog,
+                    self.prog.struct_type("foo", 16, (TypeMember(type, "a"),)),
+                    address=0xFFFF0000,
+                )
+            ),
+            """\
+(struct foo){
+	.a = (__uint128_t)0xdeadbeef,
+}""",
+        )

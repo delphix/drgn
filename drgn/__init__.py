@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Programmable debugger
@@ -142,7 +142,7 @@ __all__ = (
 
 
 if sys.version_info >= (3, 8):
-    _open_code = io.open_code
+    _open_code = io.open_code  # novermin
 else:
     from typing import BinaryIO
 

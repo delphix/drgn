@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import ctypes
 import enum
@@ -192,6 +192,7 @@ class C_TOKEN(enum.IntEnum):
     DOT = auto()
     NUMBER = auto()
     IDENTIFIER = auto()
+    TEMPLATE_ARGUMENTS = auto()
 
 
 class Token:

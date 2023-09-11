@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
 #include <byteswap.h>
@@ -16,66 +16,34 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "binary_buffer.h"
 #include "debug_info.h"
+#include "elf_file.h"
 #include "error.h"
 #include "linux_kernel.h"
+#include "openmp.h"
+#include "platform.h"
 #include "program.h"
 #include "util.h"
 
-static const char * const drgn_debug_scn_names[] = {
-	[DRGN_SCN_DEBUG_INFO] = ".debug_info",
-	[DRGN_SCN_DEBUG_TYPES] = ".debug_types",
-	[DRGN_SCN_DEBUG_ABBREV] = ".debug_abbrev",
-	[DRGN_SCN_DEBUG_STR] = ".debug_str",
-	[DRGN_SCN_DEBUG_STR_OFFSETS] = ".debug_str_offsets",
-	[DRGN_SCN_DEBUG_LINE] = ".debug_line",
-	[DRGN_SCN_DEBUG_LINE_STR] = ".debug_line_str",
-	[DRGN_SCN_DEBUG_ADDR] = ".debug_addr",
-	[DRGN_SCN_DEBUG_FRAME] = ".debug_frame",
-	[DRGN_SCN_EH_FRAME] = ".eh_frame",
-	[DRGN_SCN_ORC_UNWIND_IP] = ".orc_unwind_ip",
-	[DRGN_SCN_ORC_UNWIND] = ".orc_unwind",
-	[DRGN_SCN_DEBUG_LOC] = ".debug_loc",
-	[DRGN_SCN_DEBUG_LOCLISTS] = ".debug_loclists",
-	[DRGN_SCN_TEXT] = ".text",
-	[DRGN_SCN_GOT] = ".got",
-};
-
-struct drgn_error *
-drgn_error_debug_info_scn(struct drgn_debug_info_module *module,
-			  enum drgn_debug_info_scn scn, const char *ptr,
-			  const char *message)
+static inline Dwarf *drgn_elf_file_dwarf_key(struct drgn_elf_file * const *entry)
 {
-	const char *name = dwfl_module_info(module->dwfl_module, NULL, NULL,
-					    NULL, NULL, NULL, NULL, NULL);
-	return drgn_error_format(DRGN_ERROR_OTHER, "%s: %s+%#tx: %s",
-				 name, drgn_debug_scn_names[scn],
-				 ptr - (const char *)module->scn_data[scn]->d_buf,
-				 message);
+	return (*entry)->dwarf;
 }
+DEFINE_HASH_TABLE_FUNCTIONS(drgn_elf_file_dwarf_table, drgn_elf_file_dwarf_key,
+			    ptr_key_hash_pair, scalar_key_eq);
+DEFINE_VECTOR_FUNCTIONS(drgn_module_vector);
 
-struct drgn_error *drgn_debug_info_buffer_error(struct binary_buffer *bb,
-						const char *pos,
-						const char *message)
-{
-	struct drgn_debug_info_buffer *buffer =
-		container_of(bb, struct drgn_debug_info_buffer, bb);
-	return drgn_error_debug_info_scn(buffer->module, buffer->scn, pos,
-					 message);
-}
-
-DEFINE_VECTOR_FUNCTIONS(drgn_debug_info_module_vector)
-
-struct drgn_debug_info_module_key {
+struct drgn_module_key {
 	const void *build_id;
 	size_t build_id_len;
 	uint64_t start, end;
 };
 
-static inline struct drgn_debug_info_module_key
-drgn_debug_info_module_key(struct drgn_debug_info_module * const *entry)
+static inline struct drgn_module_key
+drgn_module_key(struct drgn_module * const *entry)
 {
-	return (struct drgn_debug_info_module_key){
+	return (struct drgn_module_key){
 		.build_id = (*entry)->build_id,
 		.build_id_len = (*entry)->build_id_len,
 		.start = (*entry)->start,
@@ -84,27 +52,25 @@ drgn_debug_info_module_key(struct drgn_debug_info_module * const *entry)
 }
 
 static inline struct hash_pair
-drgn_debug_info_module_key_hash_pair(const struct drgn_debug_info_module_key *key)
+drgn_module_key_hash_pair(const struct drgn_module_key *key)
 {
 	size_t hash = hash_bytes(key->build_id, key->build_id_len);
 	hash = hash_combine(hash, key->start);
 	hash = hash_combine(hash, key->end);
 	return hash_pair_from_avalanching_hash(hash);
 }
-static inline bool
-drgn_debug_info_module_key_eq(const struct drgn_debug_info_module_key *a,
-			      const struct drgn_debug_info_module_key *b)
+static inline bool drgn_module_key_eq(const struct drgn_module_key *a,
+				      const struct drgn_module_key *b)
 {
 	return (a->build_id_len == b->build_id_len &&
 		memcmp(a->build_id, b->build_id, a->build_id_len) == 0 &&
 		a->start == b->start && a->end == b->end);
 }
-DEFINE_HASH_TABLE_FUNCTIONS(drgn_debug_info_module_table,
-			    drgn_debug_info_module_key,
-			    drgn_debug_info_module_key_hash_pair,
-			    drgn_debug_info_module_key_eq)
+DEFINE_HASH_TABLE_FUNCTIONS(drgn_module_table, drgn_module_key,
+			    drgn_module_key_hash_pair, drgn_module_key_eq);
 
-DEFINE_HASH_SET_FUNCTIONS(c_string_set, c_string_key_hash_pair, c_string_key_eq)
+DEFINE_HASH_SET_FUNCTIONS(c_string_set, c_string_key_hash_pair,
+			  c_string_key_eq);
 
 /**
  * @c Dwfl_Callbacks::find_elf() implementation.
@@ -128,7 +94,7 @@ static int drgn_dwfl_find_elf(Dwfl_Module *dwfl_module, void **userdatap,
 			      const char *name, Dwarf_Addr base,
 			      char **file_name, Elf **elfp)
 {
-	struct drgn_debug_info_module *module = *userdatap;
+	struct drgn_module *module = *userdatap;
 	/*
 	 * libdwfl consumes the returned path, file descriptor, and ELF handle,
 	 * so clear the fields.
@@ -151,7 +117,7 @@ static int drgn_dwfl_linux_proc_find_elf(Dwfl_Module *dwfl_module,
 					 Dwarf_Addr base, char **file_name,
 					 Elf **elfp)
 {
-	struct drgn_debug_info_module *module = *userdatap;
+	struct drgn_module *module = *userdatap;
 	if (module->elf) {
 		return drgn_dwfl_find_elf(dwfl_module, userdatap, name, base,
 					  file_name, elfp);
@@ -169,7 +135,7 @@ static int drgn_dwfl_build_id_find_elf(Dwfl_Module *dwfl_module,
 				       Dwarf_Addr base, char **file_name,
 				       Elf **elfp)
 {
-	struct drgn_debug_info_module *module = *userdatap;
+	struct drgn_module *module = *userdatap;
 	if (module->elf) {
 		return drgn_dwfl_find_elf(dwfl_module, userdatap, name, base,
 					  file_name, elfp);
@@ -213,25 +179,32 @@ static const Dwfl_Callbacks drgn_userspace_core_dump_dwfl_callbacks = {
 	.section_address = drgn_dwfl_section_address,
 };
 
-static void
-drgn_debug_info_module_destroy(struct drgn_debug_info_module *module)
+static void drgn_module_destroy(struct drgn_module *module)
 {
 	if (module) {
 		drgn_error_destroy(module->err);
-		drgn_orc_module_info_deinit(module);
-		drgn_dwarf_module_info_deinit(module);
+		drgn_module_orc_info_deinit(module);
+		drgn_module_dwarf_info_deinit(module);
 		elf_end(module->elf);
 		if (module->fd != -1)
 			close(module->fd);
 		free(module->path);
+		for (struct drgn_elf_file_dwarf_table_iterator it =
+		     drgn_elf_file_dwarf_table_first(&module->split_dwarf_files);
+		     it.entry;
+		     it = drgn_elf_file_dwarf_table_next(it))
+			drgn_elf_file_destroy(*it.entry);
+		drgn_elf_file_dwarf_table_deinit(&module->split_dwarf_files);
+		if (module->debug_file != module->loaded_file)
+			drgn_elf_file_destroy(module->debug_file);
+		drgn_elf_file_destroy(module->loaded_file);
 		free(module->name);
 		free(module);
 	}
 }
 
-static void
-drgn_debug_info_module_finish_indexing(struct drgn_debug_info *dbinfo,
-				       struct drgn_debug_info_module *module)
+static void drgn_module_finish_indexing(struct drgn_debug_info *dbinfo,
+					struct drgn_module *module)
 {
 	module->state = DRGN_DEBUG_INFO_MODULE_INDEXED;
 	if (module->name) {
@@ -283,13 +256,13 @@ static int drgn_dwfl_module_removed(Dwfl_Module *dwfl_module, void *userdatap,
 	 * but dwfl_report_end() has the wrong signature for the removed
 	 * callback.
 	 */
-	struct drgn_debug_info_module *module = *(void **)userdatap;
+	struct drgn_module *module = *(void **)userdatap;
 	if (arg->finish_indexing && module &&
 	    module->state == DRGN_DEBUG_INFO_MODULE_INDEXING)
-		drgn_debug_info_module_finish_indexing(arg->dbinfo, module);
+		drgn_module_finish_indexing(arg->dbinfo, module);
 	if (arg->free_all || !module ||
 	    module->state != DRGN_DEBUG_INFO_MODULE_INDEXED) {
-		drgn_debug_info_module_destroy(module);
+		drgn_module_destroy(module);
 	} else {
 		/*
 		 * The module was already indexed. Report it again so libdwfl
@@ -306,26 +279,24 @@ static int drgn_dwfl_module_removed(Dwfl_Module *dwfl_module, void *userdatap,
 static void drgn_debug_info_free_modules(struct drgn_debug_info *dbinfo,
 					 bool finish_indexing, bool free_all)
 {
-	for (struct drgn_debug_info_module_table_iterator it =
-	     drgn_debug_info_module_table_first(&dbinfo->modules); it.entry; ) {
-		struct drgn_debug_info_module *module = *it.entry;
-		struct drgn_debug_info_module **nextp = it.entry;
+	for (struct drgn_module_table_iterator it =
+	     drgn_module_table_first(&dbinfo->modules); it.entry; ) {
+		struct drgn_module *module = *it.entry;
+		struct drgn_module **nextp = it.entry;
 		do {
-			struct drgn_debug_info_module *next = module->next;
+			struct drgn_module *next = module->next;
 			if (finish_indexing &&
-			    module->state == DRGN_DEBUG_INFO_MODULE_INDEXING) {
-				drgn_debug_info_module_finish_indexing(dbinfo,
-								       module);
-			}
+			    module->state == DRGN_DEBUG_INFO_MODULE_INDEXING)
+				drgn_module_finish_indexing(dbinfo, module);
 			if (free_all ||
 			    module->state != DRGN_DEBUG_INFO_MODULE_INDEXED) {
 				if (module == *nextp) {
 					if (nextp == it.entry && !next) {
-						it = drgn_debug_info_module_table_delete_iterator(&dbinfo->modules,
-												  it);
+						it = drgn_module_table_delete_iterator(&dbinfo->modules,
+										       it);
 					} else {
 						if (!next)
-							it = drgn_debug_info_module_table_next(it);
+							it = drgn_module_table_next(it);
 						*nextp = next;
 					}
 				}
@@ -334,10 +305,10 @@ static void drgn_debug_info_free_modules(struct drgn_debug_info *dbinfo,
 						 &userdatap, NULL, NULL, NULL,
 						 NULL, NULL, NULL);
 				*userdatap = NULL;
-				drgn_debug_info_module_destroy(module);
+				drgn_module_destroy(module);
 			} else {
 				if (!next)
-					it = drgn_debug_info_module_table_next(it);
+					it = drgn_module_table_next(it);
 				nextp = &module->next;
 			}
 			module = next;
@@ -409,17 +380,19 @@ drgn_debug_info_report_module(struct drgn_debug_info_load_state *load,
 		*new_ret = false;
 
 	struct hash_pair hp;
-	struct drgn_debug_info_module_table_iterator it;
+	// Silence -Wmaybe-uninitialized false positive last seen with GCC 12 on
+	// i386 and Arm.
+	struct drgn_module_table_iterator it = {};
 	if (build_id_len) {
-		struct drgn_debug_info_module_key key = {
+		struct drgn_module_key key = {
 			.build_id = build_id,
 			.build_id_len = build_id_len,
 			.start = start,
 			.end = end,
 		};
-		hp = drgn_debug_info_module_table_hash(&key);
-		it = drgn_debug_info_module_table_search_hashed(&dbinfo->modules,
-								&key, hp);
+		hp = drgn_module_table_hash(&key);
+		it = drgn_module_table_search_hashed(&dbinfo->modules, &key,
+						     hp);
 		if (it.entry &&
 		    (*it.entry)->state == DRGN_DEBUG_INFO_MODULE_INDEXED) {
 			/* We've already indexed this module. */
@@ -457,11 +430,12 @@ drgn_debug_info_report_module(struct drgn_debug_info_load_state *load,
 	if (new_ret)
 		*new_ret = true;
 
-	struct drgn_debug_info_module *module = calloc(1, sizeof(*module));
+	struct drgn_module *module = calloc(1, sizeof(*module));
 	if (!module) {
 		err = &drgn_enomem;
 		goto free;
 	}
+	module->prog = load->dbinfo->prog;
 	module->state = DRGN_DEBUG_INFO_MODULE_NEW;
 	module->build_id = build_id;
 	module->build_id_len = build_id_len;
@@ -479,12 +453,12 @@ drgn_debug_info_report_module(struct drgn_debug_info_load_state *load,
 	module->path = path_key;
 	module->fd = fd;
 	module->elf = elf;
+	drgn_elf_file_dwarf_table_init(&module->split_dwarf_files);
 
 	/* path_key, fd and elf are owned by the module now. */
 
-	if (!drgn_debug_info_module_vector_append(&load->new_modules,
-						  &module)) {
-		drgn_debug_info_module_destroy(module);
+	if (!drgn_module_vector_append(&load->new_modules, &module)) {
+		drgn_module_destroy(module);
 		return &drgn_enomem;
 	}
 	if (build_id_len) {
@@ -496,12 +470,11 @@ drgn_debug_info_report_module(struct drgn_debug_info_load_state *load,
 			 */
 			module->next = (*it.entry)->next;
 			(*it.entry)->next = module;
-		} else if (drgn_debug_info_module_table_insert_searched(&dbinfo->modules,
-									&module,
-									hp,
-									NULL) < 0) {
-			load->new_modules.size--;
-			drgn_debug_info_module_destroy(module);
+		} else if (drgn_module_table_insert_searched(&dbinfo->modules,
+							     &module, hp,
+							     NULL) < 0) {
+			drgn_module_vector_pop(&load->new_modules);
+			drgn_module_destroy(module);
 			return &drgn_enomem;
 		}
 	}
@@ -627,11 +600,11 @@ struct drgn_mapped_file_segment {
 	uint64_t file_offset;
 };
 
-DEFINE_VECTOR(drgn_mapped_file_segment_vector, struct drgn_mapped_file_segment)
+DEFINE_VECTOR(drgn_mapped_file_segment_vector, struct drgn_mapped_file_segment);
 
 DEFINE_HASH_MAP(drgn_mapped_files, const char *,
 		struct drgn_mapped_file_segment_vector, c_string_key_hash_pair,
-		c_string_key_eq)
+		c_string_key_eq);
 
 struct userspace_core_report_state {
 	struct drgn_mapped_files files;
@@ -752,10 +725,10 @@ userspace_core_get_mapped_files(struct drgn_debug_info_load_state *load,
 		 * mappings with different memory protections even though the
 		 * protection is not included in NT_FILE. Merge them if we can.
 		 */
-		if (it.entry->value.size > 0 &&
-		    drgn_mapped_file_segments_contiguous(&it.entry->value.data[it.entry->value.size - 1],
-							 &segment))
-			it.entry->value.data[it.entry->value.size - 1].end = segment.end;
+		if (!drgn_mapped_file_segment_vector_empty(&it.entry->value)
+		    && drgn_mapped_file_segments_contiguous(drgn_mapped_file_segment_vector_last(&it.entry->value),
+							    &segment))
+			drgn_mapped_file_segment_vector_last(&it.entry->value)->end = segment.end;
 		else if (!drgn_mapped_file_segment_vector_append(&it.entry->value,
 								 &segment))
 			return &drgn_enomem;
@@ -1344,8 +1317,8 @@ userspace_core_report_mapped_files(struct drgn_debug_info_load_state *load,
 	     it.entry; it = drgn_mapped_files_next(it)) {
 		err = userspace_core_maybe_report_file(load, core,
 						       it.entry->key,
-						       it.entry->value.data,
-						       it.entry->value.size);
+						       drgn_mapped_file_segment_vector_begin(&it.entry->value),
+						       drgn_mapped_file_segment_vector_size(&it.entry->value));
 		if (err)
 			return err;
 	}
@@ -1808,7 +1781,8 @@ out:
 }
 
 static struct drgn_error *
-drgn_debug_info_find_sections(struct drgn_debug_info_module *module)
+drgn_module_find_files(struct drgn_debug_info_load_state *load,
+		       struct drgn_module *module)
 {
 	struct drgn_error *err;
 
@@ -1818,60 +1792,67 @@ drgn_debug_info_find_sections(struct drgn_debug_info_module *module)
 			return err;
 	}
 
-	/*
-	 * Note: not dwfl_module_getelf(), because then libdwfl applies
-	 * ELF relocations to all sections, not just debug sections.
-	 */
-	Dwarf_Addr bias;
+	GElf_Addr loaded_file_bias;
+	Elf *loaded_elf = NULL;
+	Dwarf_Addr debug_file_bias;
 	Dwarf *dwarf;
-	#pragma omp critical(drgn_dwfl_module_getdwarf)
-	dwarf = dwfl_module_getdwarf(module->dwfl_module, &bias);
-	if (!dwarf)
-		return drgn_error_libdwfl();
-	Elf *elf = dwarf_getelf(dwarf);
-	if (!elf)
-		return drgn_error_libdw();
-	GElf_Ehdr ehdr_mem, *ehdr = gelf_getehdr(elf, &ehdr_mem);
-	if (!ehdr)
-		return drgn_error_libelf();
-	drgn_platform_from_elf(ehdr, &module->platform);
-
-	size_t shstrndx;
-	if (elf_getshdrstrndx(elf, &shstrndx))
-		return drgn_error_libelf();
-
-	Elf_Scn *scn = NULL;
-	while ((scn = elf_nextscn(elf, scn))) {
-		GElf_Shdr shdr_mem;
-		GElf_Shdr *shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr)
-			return drgn_error_libelf();
-
-		if (shdr->sh_type != SHT_PROGBITS)
-			continue;
-		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!scnname)
-			return drgn_error_libelf();
-
-		for (size_t i = 0; i < DRGN_NUM_DEBUG_SCNS; i++) {
-			if (!module->scns[i] &&
-			    strcmp(scnname, drgn_debug_scn_names[i]) == 0) {
-				module->scns[i] = scn;
-				break;
-			}
+	err = NULL;
+	#pragma omp critical(drgn_module_find_files)
+	{
+		// We don't need the loaded file for the Linux kernel, and we
+		// always report the debug file as the main file to libdwfl.
+		if (!(load->dbinfo->prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)) {
+			loaded_elf = dwfl_module_getelf(module->dwfl_module,
+							&loaded_file_bias);
+			if (!loaded_elf)
+				err = drgn_error_libdwfl();
 		}
+		if (!err) {
+			dwarf = dwfl_module_getdwarf(module->dwfl_module,
+						     &debug_file_bias);
+			if (!dwarf)
+				err = drgn_error_libdwfl();
+		}
+	}
+	if (err)
+		return err;
+
+	const char *loaded_file_path;
+	const char *debug_file_path;
+	dwfl_module_info(module->dwfl_module, NULL, NULL, NULL, NULL, NULL,
+			 &loaded_file_path, &debug_file_path);
+	// If the loaded file also has debugging information, debug_file_path is
+	// NULL. (debug_file_path is also NULL if libdwfl got the debug file
+	// from debuginfod, so this isn't 100% correct, but it'll at least
+	// identify the module.)
+	if (!debug_file_path)
+		debug_file_path = loaded_file_path;
+
+	module->debug_file_bias = debug_file_bias;
+	err = drgn_elf_file_create(module, debug_file_path, dwarf_getelf(dwarf),
+				   &module->debug_file);
+	if (err) {
+		module->debug_file = NULL;
+		return err;
+	}
+	module->debug_file->dwarf = dwarf;
+	if (!module->debug_file->scns[DRGN_SCN_DEBUG_INFO] ||
+	    !module->debug_file->scns[DRGN_SCN_DEBUG_ABBREV]) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "missing debugging information sections");
 	}
 
 	Dwarf *altdwarf = dwarf_getalt(dwarf);
 	if (altdwarf) {
-		elf = dwarf_getelf(altdwarf);
-		if (!elf)
+		Elf *altelf = dwarf_getelf(altdwarf);
+		if (!altelf)
 			return drgn_error_libdw();
-		if (elf_getshdrstrndx(elf, &shstrndx))
+		size_t shstrndx;
+		if (elf_getshdrstrndx(altelf, &shstrndx))
 			return drgn_error_libelf();
 
-		scn = NULL;
-		while ((scn = elf_nextscn(elf, scn))) {
+		Elf_Scn *scn = NULL;
+		while ((scn = elf_nextscn(altelf, scn))) {
 			GElf_Shdr shdr_mem;
 			GElf_Shdr *shdr = gelf_getshdr(scn, &shdr_mem);
 			if (!shdr)
@@ -1879,7 +1860,8 @@ drgn_debug_info_find_sections(struct drgn_debug_info_module *module)
 
 			if (shdr->sh_type != SHT_PROGBITS)
 				continue;
-			const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
+			const char *scnname = elf_strptr(altelf, shstrndx,
+							 shdr->sh_name);
 			if (!scnname)
 				return drgn_error_libelf();
 
@@ -1887,98 +1869,56 @@ drgn_debug_info_find_sections(struct drgn_debug_info_module *module)
 			 * TODO: save more sections and support imported units.
 			 */
 			if (strcmp(scnname, ".debug_info") == 0 &&
-			    !module->alt_debug_info)
-				module->alt_debug_info = scn;
-			else if (strcmp(scnname, ".debug_str") == 0 &&
-				   !module->alt_debug_str)
-				module->alt_debug_str = scn;
+			    !module->debug_file->alt_debug_info_data) {
+				err = read_elf_section(scn,
+						       &module->debug_file->alt_debug_info_data);
+				if (err)
+					return err;
+			} else if (strcmp(scnname, ".debug_str") == 0 &&
+				   !module->debug_file->alt_debug_str_data) {
+				err = read_elf_section(scn,
+						       &module->debug_file->alt_debug_str_data);
+				if (err)
+					return err;
+			}
 		}
 	}
+	err = drgn_elf_file_precache_sections(module->debug_file);
+	if (err)
+		return err;
 
-	return NULL;
-}
-
-static void truncate_null_terminated_section(Elf_Data *data)
-{
-	if (data) {
-		const char *buf = data->d_buf;
-		const char *nul = memrchr(buf, '\0', data->d_size);
-		if (nul)
-			data->d_size = nul - buf + 1;
-		else
-			data->d_size = 0;
-	}
-}
-
-static struct drgn_error *
-drgn_debug_info_precache_sections(struct drgn_debug_info_module *module)
-{
-	struct drgn_error *err;
-
-	for (size_t i = 0; i < DRGN_NUM_DEBUG_SCN_DATA_PRECACHE; i++) {
-		if (module->scns[i]) {
-			err = read_elf_section(module->scns[i],
-					       &module->scn_data[i]);
-			if (err)
+	if (loaded_elf) {
+		module->loaded_file_bias = loaded_file_bias;
+		if (loaded_elf == module->debug_file->elf) {
+			module->loaded_file = module->debug_file;
+		} else {
+			err = drgn_elf_file_create(module, loaded_file_path,
+						   loaded_elf,
+						   &module->loaded_file);
+			if (err) {
+				module->loaded_file = NULL;
 				return err;
+			}
 		}
 	}
-	if (module->alt_debug_info) {
-		err = read_elf_section(module->alt_debug_info,
-				       &module->alt_debug_info_data);
-		if (err)
-			return err;
-	}
-	if (module->alt_debug_str) {
-		err = read_elf_section(module->alt_debug_str,
-				       &module->alt_debug_str_data);
-		if (err)
-			return err;
-	}
-
-	/*
-	 * Truncate any extraneous bytes so that we can assume that a pointer
-	 * within .debug_{,line_}str is always null-terminated.
-	 */
-	truncate_null_terminated_section(module->scn_data[DRGN_SCN_DEBUG_STR]);
-	truncate_null_terminated_section(module->scn_data[DRGN_SCN_DEBUG_LINE_STR]);
-	truncate_null_terminated_section(module->alt_debug_str_data);
 	return NULL;
-}
-
-struct drgn_error *
-drgn_debug_info_module_cache_section(struct drgn_debug_info_module *module,
-				     enum drgn_debug_info_scn scn)
-{
-	if (module->scn_data[scn])
-		return NULL;
-	return read_elf_section(module->scns[scn], &module->scn_data[scn]);
 }
 
 static struct drgn_error *
 drgn_debug_info_read_module(struct drgn_debug_info_load_state *load,
 			    struct drgn_dwarf_index_state *index,
-			    struct drgn_debug_info_module *head)
+			    struct drgn_module *head)
 {
 	struct drgn_error *err;
-	struct drgn_debug_info_module *module;
+	struct drgn_module *module;
 	for (module = head; module; module = module->next) {
-		err = drgn_debug_info_find_sections(module);
+		err = drgn_module_find_files(load, module);
 		if (err) {
 			module->err = err;
 			continue;
 		}
-		if (module->scns[DRGN_SCN_DEBUG_INFO] &&
-		    module->scns[DRGN_SCN_DEBUG_ABBREV]) {
-			err = drgn_debug_info_precache_sections(module);
-			if (err) {
-				module->err = err;
-				continue;
-			}
-			module->state = DRGN_DEBUG_INFO_MODULE_INDEXING;
-			return drgn_dwarf_index_read_module(index,
-							    module);
-		}
+		module->state = DRGN_DEBUG_INFO_MODULE_INDEXING;
+		return drgn_dwarf_index_read_module(index, module);
 	}
 	/*
 	 * We checked all of the files and didn't find debugging information.
@@ -2011,25 +1951,26 @@ drgn_debug_info_read_module(struct drgn_debug_info_load_state *load,
 static struct drgn_error *
 drgn_debug_info_update_index(struct drgn_debug_info_load_state *load)
 {
-	if (!load->new_modules.size)
+	if (drgn_module_vector_empty(&load->new_modules))
 		return NULL;
 	struct drgn_debug_info *dbinfo = load->dbinfo;
 	if (!c_string_set_reserve(&dbinfo->module_names,
-				  c_string_set_size(&dbinfo->module_names) +
-				  load->new_modules.size))
+				  c_string_set_size(&dbinfo->module_names)
+				  + drgn_module_vector_size(&load->new_modules)))
 		return &drgn_enomem;
 
 	struct drgn_dwarf_index_state index;
 	if (!drgn_dwarf_index_state_init(&index, dbinfo))
 		return &drgn_enomem;
 	struct drgn_error *err = NULL;
-	#pragma omp parallel for schedule(dynamic)
-	for (size_t i = 0; i < load->new_modules.size; i++) {
+	#pragma omp parallel for schedule(dynamic) num_threads(drgn_num_threads)
+	for (size_t i = 0; i < drgn_module_vector_size(&load->new_modules); i++) {
 		if (err)
 			continue;
+		struct drgn_module *module =
+			*drgn_module_vector_at(&load->new_modules, i);
 		struct drgn_error *module_err =
-			drgn_debug_info_read_module(load, &index,
-						    load->new_modules.data[i]);
+			drgn_debug_info_read_module(load, &index, module);
 		if (module_err) {
 			#pragma omp critical(drgn_debug_info_update_index_error)
 			if (err)
@@ -2038,11 +1979,11 @@ drgn_debug_info_update_index(struct drgn_debug_info_load_state *load)
 				err = module_err;
 		}
 	}
-	if (!err)
-		err = drgn_dwarf_info_update_index(&index);
-	drgn_dwarf_index_state_deinit(&index);
-	if (!err)
+	if (!err) {
 		drgn_debug_info_free_modules(dbinfo, true, false);
+		err = drgn_dwarf_info_update_index(&index);
+	}
+	drgn_dwarf_index_state_deinit(&index);
 	return err;
 }
 
@@ -2055,7 +1996,7 @@ drgn_debug_info_report_flush(struct drgn_debug_info_load_state *load)
 	dwfl_report_begin_add(dbinfo->dwfl);
 	if (err)
 		return err;
-	load->new_modules.size = 0;
+	drgn_module_vector_clear(&load->new_modules);
 	return NULL;
 }
 
@@ -2095,6 +2036,7 @@ struct drgn_error *drgn_debug_info_load(struct drgn_debug_info *dbinfo,
 		.load_default = load_default,
 		.load_main = load_main,
 		.new_modules = VECTOR_INIT,
+		.errors = STRING_BUILDER_INIT,
 		.max_errors = max_errors ? atoi(max_errors) : 5,
 	};
 	dwfl_report_begin_add(dbinfo->dwfl);
@@ -2127,13 +2069,9 @@ struct drgn_error *drgn_debug_info_load(struct drgn_debug_info *dbinfo,
 	 * the core dump.
 	 */
 
-	/*
-	 * If this fails, it's too late to roll back. This can only fail with
-	 * enomem, so it's not a big deal.
-	 */
 	err = drgn_debug_info_report_finalize_errors(&load);
 out:
-	drgn_debug_info_module_vector_deinit(&load.new_modules);
+	drgn_module_vector_deinit(&load.new_modules);
 	return err;
 
 err:
@@ -2167,7 +2105,7 @@ struct drgn_error *drgn_debug_info_create(struct drgn_program *prog,
 		free(dbinfo);
 		return drgn_error_libdwfl();
 	}
-	drgn_debug_info_module_table_init(&dbinfo->modules);
+	drgn_module_table_init(&dbinfo->modules);
 	c_string_set_init(&dbinfo->module_names);
 	drgn_dwarf_info_init(dbinfo);
 	*ret = dbinfo;
@@ -2181,45 +2119,114 @@ void drgn_debug_info_destroy(struct drgn_debug_info *dbinfo)
 	drgn_dwarf_info_deinit(dbinfo);
 	c_string_set_deinit(&dbinfo->module_names);
 	drgn_debug_info_free_modules(dbinfo, false, true);
-	assert(drgn_debug_info_module_table_empty(&dbinfo->modules));
-	drgn_debug_info_module_table_deinit(&dbinfo->modules);
+	assert(drgn_module_table_empty(&dbinfo->modules));
+	drgn_module_table_deinit(&dbinfo->modules);
 	dwfl_end(dbinfo->dwfl);
 	free(dbinfo);
 }
 
+struct drgn_elf_file *drgn_module_find_dwarf_file(struct drgn_module *module,
+						  Dwarf *dwarf)
+{
+	if (!module->debug_file)
+		return NULL;
+	if (dwarf == module->debug_file->dwarf)
+		return module->debug_file;
+	struct drgn_elf_file_dwarf_table_iterator it =
+		drgn_elf_file_dwarf_table_search(&module->split_dwarf_files,
+						 &dwarf);
+	return it.entry ? *it.entry : NULL;
+}
+
 struct drgn_error *
-drgn_debug_info_module_find_cfi(struct drgn_program *prog,
-				struct drgn_debug_info_module *module,
-				uint64_t pc, struct drgn_cfi_row **row_ret,
-				bool *interrupted_ret,
-				drgn_register_number *ret_addr_regno_ret)
+drgn_module_create_split_dwarf_file(struct drgn_module *module,
+				    const char *name, Dwarf *dwarf,
+				    struct drgn_elf_file **ret)
+{
+	struct drgn_error *err;
+	err = drgn_elf_file_create(module, name, dwarf_getelf(dwarf), ret);
+	if (err)
+		return err;
+	err = drgn_elf_file_precache_sections(*ret);
+	if (err) {
+		drgn_elf_file_destroy(*ret);
+		return err;
+	}
+	(*ret)->dwarf = dwarf;
+	int r = drgn_elf_file_dwarf_table_insert(&module->split_dwarf_files,
+						 ret, NULL);
+	if (r < 0) {
+		drgn_elf_file_destroy(*ret);
+		return &drgn_enomem;
+	}
+	assert(r > 0);
+	return NULL;
+}
+
+struct drgn_error *
+drgn_module_find_cfi(struct drgn_program *prog, struct drgn_module *module,
+		     uint64_t pc, struct drgn_elf_file **file_ret,
+		     struct drgn_cfi_row **row_ret, bool *interrupted_ret,
+		     drgn_register_number *ret_addr_regno_ret)
 {
 	struct drgn_error *err;
 
-	Dwarf_Addr bias;
-	dwfl_module_info(module->dwfl_module, NULL, NULL, NULL, &bias, NULL,
-			 NULL, NULL);
-	uint64_t unbiased_pc = pc - bias;
+	// If the file's platform doesn't match the program's, we can't use its
+	// CFI.
+	const bool can_use_loaded_file =
+		(module->loaded_file &&
+		 drgn_platforms_equal(&module->loaded_file->platform,
+				      &prog->platform));
+	const bool can_use_debug_file =
+		(module->debug_file &&
+		 drgn_platforms_equal(&module->debug_file->platform,
+				      &prog->platform));
 
 	if (prog->prefer_orc_unwinder) {
-		err = drgn_debug_info_find_orc_cfi(module, unbiased_pc, row_ret,
-						   interrupted_ret,
-						   ret_addr_regno_ret);
-		if (err != &drgn_not_found)
-			return err;
-		return drgn_debug_info_find_dwarf_cfi(module, unbiased_pc,
-						      row_ret, interrupted_ret,
-						      ret_addr_regno_ret);
+		if (can_use_debug_file) {
+			*file_ret = module->debug_file;
+			err = drgn_module_find_orc_cfi(module, pc, row_ret,
+						       interrupted_ret,
+						       ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+			err = drgn_module_find_dwarf_cfi(module, pc, row_ret,
+							 interrupted_ret,
+							 ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+		}
+		if (can_use_loaded_file) {
+			*file_ret = module->loaded_file;
+			return drgn_module_find_eh_cfi(module, pc, row_ret,
+						       interrupted_ret,
+						       ret_addr_regno_ret);
+		}
 	} else {
-		err = drgn_debug_info_find_dwarf_cfi(module, unbiased_pc,
-						     row_ret, interrupted_ret,
-						     ret_addr_regno_ret);
-		if (err != &drgn_not_found)
-			return err;
-		return drgn_debug_info_find_orc_cfi(module, unbiased_pc,
-						    row_ret, interrupted_ret,
-						    ret_addr_regno_ret);
+		if (can_use_debug_file) {
+			*file_ret = module->debug_file;
+			err = drgn_module_find_dwarf_cfi(module, pc, row_ret,
+							 interrupted_ret,
+							 ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+		}
+		if (can_use_loaded_file) {
+			*file_ret = module->loaded_file;
+			err = drgn_module_find_eh_cfi(module, pc, row_ret,
+						      interrupted_ret,
+						      ret_addr_regno_ret);
+			if (err != &drgn_not_found)
+				return err;
+		}
+		if (can_use_debug_file) {
+			*file_ret = module->debug_file;
+			return drgn_module_find_orc_cfi(module, pc, row_ret,
+							interrupted_ret,
+							ret_addr_regno_ret);
+		}
 	}
+	return &drgn_not_found;
 }
 
 #if !_ELFUTILS_PREREQ(0, 175)
@@ -2299,21 +2306,6 @@ struct drgn_error *find_elf_file(char **path_ret, int *fd_ret, Elf **elf_ret,
 	*path_ret = NULL;
 	*fd_ret = -1;
 	*elf_ret = NULL;
-	return NULL;
-}
-
-struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret)
-{
-	GElf_Shdr shdr_mem, *shdr;
-	shdr = gelf_getshdr(scn, &shdr_mem);
-	if (!shdr)
-		return drgn_error_libelf();
-	if ((shdr->sh_flags & SHF_COMPRESSED) && elf_compress(scn, 0, 0) < 0)
-		return drgn_error_libelf();
-	Elf_Data *data = elf_rawdata(scn, NULL);
-	if (!data)
-		return drgn_error_libelf();
-	*ret = data;
 	return NULL;
 }
 

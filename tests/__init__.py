@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import functools
 from typing import Any, NamedTuple, Optional
@@ -158,18 +158,21 @@ def identical(a, b):
                 ),
             ):
                 return False
-            exc_a = exc_b = False
-            try:
-                value_a = a.value_()
-            except Exception:
-                exc_a = True
-            try:
-                value_b = b.value_()
-            except Exception:
-                exc_b = True
-            if exc_a != exc_b:
-                return False
-            return exc_a or _identical(value_a, value_b)
+            if a.address_ is None:
+                exc_a = exc_b = False
+                try:
+                    value_a = a.value_()
+                except Exception:
+                    exc_a = True
+                try:
+                    value_b = b.value_()
+                except Exception:
+                    exc_b = True
+                if exc_a != exc_b:
+                    return False
+                return exc_a or _identical(value_a, value_b)
+            else:
+                return True
         elif isinstance(a, Type) and isinstance(b, Type):
             if a.qualifiers != b.qualifiers:
                 return False

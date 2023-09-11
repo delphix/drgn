@@ -351,6 +351,8 @@ It's even possible to run drgn scripts directly with the proper `shebang
     $ sudo ./script2.py
     You have 36 filesystems mounted
 
+.. _interactive-mode:
+
 Interactive Mode
 ^^^^^^^^^^^^^^^^
 
@@ -400,6 +402,6 @@ Next Steps
 ----------
 
 Refer to the :doc:`api_reference`. Look through the :doc:`helpers`. Read some
-:doc:`case_studies`. Browse through the official `examples
-<https://github.com/osandov/drgn/tree/main/examples>`_ and `tools
-<https://github.com/osandov/drgn/tree/main/tools>`_.
+:doc:`case_studies`. Browse through the `tools
+<https://github.com/osandov/drgn/tree/main/tools>`_. Check out the `community
+contributions <https://github.com/osandov/drgn/tree/main/contrib>`_.

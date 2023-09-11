@@ -1,10 +1,10 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "drgn.h"
 #include "lexer.h"
 
-DEFINE_VECTOR_FUNCTIONS(drgn_token_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_token_vector);
 
 void drgn_lexer_init(struct drgn_lexer *lexer, drgn_lexer_func func,
 		     const char *str)
@@ -22,11 +22,11 @@ void drgn_lexer_deinit(struct drgn_lexer *lexer)
 struct drgn_error *drgn_lexer_pop(struct drgn_lexer *lexer,
 				  struct drgn_token *token)
 {
-	if (lexer->stack.size) {
+	if (drgn_token_vector_empty(&lexer->stack)) {
+		return lexer->func(lexer, token);
+	} else {
 		*token = *drgn_token_vector_pop(&lexer->stack);
 		return NULL;
-	} else {
-		return lexer->func(lexer, token);
 	}
 }
 

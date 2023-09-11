@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
 #include <byteswap.h>
@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "cleanup.h"
 #include "debug_info.h"
 #include "error.h"
 #include "helpers.h"
@@ -37,9 +38,9 @@ static inline uint32_t drgn_thread_to_key(const struct drgn_thread *entry)
 	return entry->tid;
 }
 
-DEFINE_VECTOR_FUNCTIONS(drgn_prstatus_vector)
+DEFINE_VECTOR_FUNCTIONS(drgn_prstatus_vector);
 DEFINE_HASH_TABLE_FUNCTIONS(drgn_thread_set, drgn_thread_to_key,
-			    int_key_hash_pair, scalar_key_eq)
+			    int_key_hash_pair, scalar_key_eq);
 
 struct drgn_thread_iterator {
 	struct drgn_program *prog;
@@ -104,6 +105,8 @@ void drgn_program_init(struct drgn_program *prog,
 		drgn_program_set_platform(prog, platform);
 	char *env = getenv("DRGN_PREFER_ORC_UNWINDER");
 	prog->prefer_orc_unwinder = env && atoi(env);
+	drgn_program_set_log_level(prog, DRGN_LOG_NONE);
+	drgn_program_set_log_file(prog, stderr);
 	drgn_object_init(&prog->vmemmap, prog);
 }
 
@@ -134,6 +137,7 @@ void drgn_program_deinit(struct drgn_program *prog)
 	drgn_memory_reader_deinit(&prog->reader);
 
 	free(prog->file_segments);
+	free(prog->vmcoreinfo.raw);
 
 #ifdef WITH_LIBKDUMPFILE
 	if (prog->kdump_ctx)
@@ -205,12 +209,20 @@ drgn_program_check_initialized(struct drgn_program *prog)
 static struct drgn_error *has_kdump_signature(const char *path, int fd,
 					      bool *ret)
 {
-	char signature[KDUMP_SIG_LEN];
+	char signature[max_iconst(KDUMP_SIG_LEN, FLATTENED_SIG_LEN)];
 	ssize_t r = pread_all(fd, signature, sizeof(signature), 0);
 	if (r < 0)
 		return drgn_error_create_os("pread", errno, path);
-	*ret = (r == sizeof(signature)
-		&& memcmp(signature, KDUMP_SIGNATURE, sizeof(signature)) == 0);
+	if (r >= FLATTENED_SIG_LEN
+	    && memcmp(signature, FLATTENED_SIGNATURE, FLATTENED_SIG_LEN) == 0) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "the given file is in the makedumpfile flattened "
+					 "format, which drgn does not support; use "
+					 "'makedumpfile -R newfile <oldfile' to reassemble "
+					 "the file into a format drgn can read");
+	}
+	*ret = (r >= KDUMP_SIG_LEN
+	        && memcmp(signature, KDUMP_SIGNATURE, KDUMP_SIG_LEN) == 0);
 	return NULL;
 }
 
@@ -570,6 +582,7 @@ out_segments:
 out_notes:
 	// Reset anything we parsed from ELF notes.
 	prog->aarch64_insn_pac_mask = 0;
+	free(prog->vmcoreinfo.raw);
 	memset(&prog->vmcoreinfo, 0, sizeof(prog->vmcoreinfo));
 out_platform:
 	prog->has_platform = had_platform;
@@ -649,8 +662,10 @@ static void drgn_program_set_language_from_main(struct drgn_program *prog)
 		return;
 	const struct drgn_language *lang;
 	err = drgn_debug_info_main_language(prog->dbinfo, &lang);
-	if (err)
+	if (err) {
 		drgn_error_destroy(err);
+		return;
+	}
 	if (lang)
 		prog->lang = lang;
 }
@@ -684,6 +699,7 @@ drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
 	if (!n && !load_default && !load_main)
 		return NULL;
 
+	drgn_blocking_guard(prog);
 	struct drgn_debug_info *dbinfo = prog->dbinfo;
 	if (!dbinfo) {
 		err = drgn_debug_info_create(prog, &dbinfo);
@@ -1232,6 +1248,101 @@ drgn_program_find_thread(struct drgn_program *prog, uint32_t tid,
 		return drgn_program_find_thread_userspace_core(prog, tid, ret);
 }
 
+// Get the CPU that crashed in a Linux kernel core dump.
+static struct drgn_error *
+drgn_program_kernel_get_crashed_cpu(struct drgn_program *prog, uint64_t *ret)
+{
+	struct drgn_error *err;
+	struct drgn_object cpu;
+	drgn_object_init(&cpu, prog);
+	union drgn_value cpu_value;
+
+	// Since Linux kernel commit 1717f2096b54 ("panic, x86: Fix re-entrance
+	// problem due to panic on NMI") (in v4.5), the crashed CPU is stored in
+	// an atomic_t panic_cpu on all architectures.
+	err = drgn_program_find_object(prog, "panic_cpu", NULL,
+				       DRGN_FIND_OBJECT_VARIABLE, &cpu);
+	if (!err) {
+		err = drgn_object_member(&cpu, &cpu, "counter");
+		if (err)
+			goto out;
+		err = drgn_object_read_integer(&cpu, &cpu_value);
+		if (!err)
+			*ret = cpu_value.uvalue;
+	} else if (err->code == DRGN_ERROR_LOOKUP) {
+		// On x86 and x86-64 only, the crashed CPU is also in an int
+		// crashing_cpu. Use this as a fallback for kernels before
+		// commit 1717f2096b54 ("panic, x86: Fix re-entrance problem due
+		// to panic on NMI") (in v4.5).
+		drgn_error_destroy(err);
+		err = drgn_program_find_object(prog, "crashing_cpu", NULL,
+					       DRGN_FIND_OBJECT_VARIABLE, &cpu);
+		if (!err) {
+			err = drgn_object_read_integer(&cpu, &cpu_value);
+			if (err)
+				goto out;
+			// Since Linux kernel commit 5bc329503e81 ("x86/mce:
+			// Handle broadcasted MCE gracefully with kexec") (in
+			// v4.12), crashing_cpu is defined in !SMP kernels, but
+			// it's always -1.
+			if (cpu_value.svalue == -1)
+				*ret = 0;
+			else
+				*ret = cpu_value.uvalue;
+		} else if (err->code == DRGN_ERROR_LOOKUP) {
+			// Before Linux kernel commit 5bc329503e81 ("x86/mce:
+			// Handle broadcasted MCE gracefully with kexec") (in
+			// v4.12), crashing_cpu is only defined in SMP kernels.
+			drgn_error_destroy(err);
+			err = NULL;
+			*ret = 0;
+		}
+	}
+
+out:
+	drgn_object_deinit(&cpu);
+	return err;
+}
+
+static struct drgn_error *
+drgn_program_find_thread_kernel_cpu_curr(struct drgn_program *prog,
+					 uint64_t cpu,
+					 struct drgn_thread **ret)
+{
+	struct drgn_error *err;
+	struct drgn_thread *thread = malloc(sizeof(*thread));
+	if (!thread)
+		return &drgn_enomem;
+	thread->prog = prog;
+
+	struct drgn_object tmp;
+	drgn_object_init(&tmp, prog);
+	drgn_object_init(&thread->object, prog);
+
+	err = linux_helper_cpu_curr(&thread->object, cpu);
+	if (err)
+		goto out;
+
+	err = drgn_object_member_dereference(&tmp, &thread->object, "pid");
+	if (err)
+		goto out;
+	union drgn_value tid;
+	err = drgn_object_read_integer(&tmp, &tid);
+	if (err)
+		goto out;
+	thread->tid = tid.uvalue;
+
+	*ret = thread;
+
+out:
+	if (err) {
+		drgn_object_deinit(&thread->object);
+		free(thread);
+	}
+	drgn_object_deinit(&tmp);
+	return err;
+}
+
 static struct drgn_error *
 drgn_program_kernel_core_dump_cache_crashed_thread(struct drgn_program *prog)
 {
@@ -1243,68 +1354,22 @@ drgn_program_kernel_core_dump_cache_crashed_thread(struct drgn_program *prog)
 	if (prog->crashed_thread)
 		return NULL;
 
-	struct drgn_object crashing_cpu;
-	union drgn_value crashing_cpu_value;
-	drgn_object_init(&crashing_cpu, prog);
-	err = drgn_program_find_object(prog, "crashing_cpu", NULL,
-				       DRGN_FIND_OBJECT_VARIABLE,
-				       &crashing_cpu);
-	if (!err) {
-		err = drgn_object_read_integer(&crashing_cpu,
-					       &crashing_cpu_value);
-	} else if (err->code == DRGN_ERROR_LOOKUP) {
-		/*
-		 * Before Linux kernel commit 5bc329503e81 ("x86/mce: Handle
-		 * broadcasted MCE gracefully with kexec") (in v4.12),
-		 * crashing_cpu is only defined in SMP kernels.
-		 */
-		drgn_error_destroy(err);
-		err = NULL;
-		crashing_cpu_value.uvalue = 0;
-	}
-	drgn_object_deinit(&crashing_cpu);
+	uint64_t crashed_cpu;
+	err = drgn_program_kernel_get_crashed_cpu(prog, &crashed_cpu);
 	if (err)
 		return err;
-	/*
-	 * Since Linux kernel commit 5bc329503e81 ("x86/mce: Handle broadcasted
-	 * MCE gracefully with kexec") (in v4.12), crashing_cpu is defined in
-	 * !SMP kernels, but it's always -1.
-	 */
-	if (crashing_cpu_value.svalue == -1)
-		crashing_cpu_value.uvalue = 0;
-	if (crashing_cpu_value.uvalue >= prog->prstatus_vector.size)
+
+	if (crashed_cpu >= drgn_prstatus_vector_size(&prog->prstatus_vector))
 		return NULL;
 
-	struct nstring *prstatus =
-		&prog->prstatus_vector.data[crashing_cpu_value.uvalue];
-	uint32_t crashed_thread_tid;
-	err = get_prstatus_pid(prog, prstatus->str, prstatus->len,
-			       &crashed_thread_tid);
-	if (err)
-		return err;
-
-	if (crashed_thread_tid == 0) {
-		prog->crashed_thread = malloc(sizeof(*prog->crashed_thread));
-		if (!prog->crashed_thread)
-			return &drgn_enomem;
-		prog->crashed_thread->prog = prog;
-		prog->crashed_thread->tid = crashed_thread_tid;
-		drgn_object_init(&prog->crashed_thread->object, prog);
-		err = linux_helper_idle_task(&prog->crashed_thread->object,
-					     crashing_cpu_value.uvalue);
-		if (err) {
-			drgn_object_deinit(&prog->crashed_thread->object);
-			free(prog->crashed_thread);
-		}
-	} else {
-		err = drgn_program_find_thread(prog, crashed_thread_tid,
-					       &prog->crashed_thread);
-	}
+	err = drgn_program_find_thread_kernel_cpu_curr(prog, crashed_cpu,
+						       &prog->crashed_thread);
 	if (err) {
 		prog->crashed_thread = NULL;
 		return err;
 	}
-	prog->crashed_thread->prstatus = *prstatus;
+	prog->crashed_thread->prstatus =
+		*drgn_prstatus_vector_at(&prog->prstatus_vector, crashed_cpu);
 	return NULL;
 }
 
@@ -1385,8 +1450,8 @@ struct drgn_error *drgn_program_find_prstatus_by_cpu(struct drgn_program *prog,
 	if (err)
 		return err;
 
-	if (cpu < prog->prstatus_vector.size) {
-		*ret = prog->prstatus_vector.data[cpu];
+	if (cpu < drgn_prstatus_vector_size(&prog->prstatus_vector)) {
+		*ret = *drgn_prstatus_vector_at(&prog->prstatus_vector, cpu);
 		return get_prstatus_pid(prog, ret->str, ret->len, tid_ret);
 	} else {
 		ret->str = NULL;
@@ -1551,7 +1616,7 @@ drgn_program_read_memory(struct drgn_program *prog, void *buf, uint64_t address,
 	return NULL;
 }
 
-DEFINE_VECTOR(char_vector, char)
+DEFINE_VECTOR(char_vector, char);
 
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_read_c_string(struct drgn_program *prog, uint64_t address,
@@ -1561,21 +1626,17 @@ drgn_program_read_c_string(struct drgn_program *prog, uint64_t address,
 	struct drgn_error *err = drgn_program_address_mask(prog, &address_mask);
 	if (err)
 		return err;
-	struct char_vector str = VECTOR_INIT;
+	_cleanup_(char_vector_deinit) struct char_vector str = VECTOR_INIT;
 	for (;;) {
 		address &= address_mask;
 		char *c = char_vector_append_entry(&str);
-		if (!c) {
-			char_vector_deinit(&str);
+		if (!c)
 			return &drgn_enomem;
-		}
-		if (str.size <= max_size) {
+		if (char_vector_size(&str) <= max_size) {
 			err = drgn_memory_reader_read(&prog->reader, c, address,
 						      1, physical);
-			if (err) {
-				char_vector_deinit(&str);
+			if (err)
 				return err;
-			}
 			if (!*c)
 				break;
 		} else {
@@ -1585,7 +1646,7 @@ drgn_program_read_c_string(struct drgn_program *prog, uint64_t address,
 		address++;
 	}
 	char_vector_shrink_to_fit(&str);
-	*ret = str.data;
+	char_vector_steal(&str, ret, NULL);
 	return NULL;
 }
 
@@ -1719,7 +1780,7 @@ drgn_program_find_symbol_by_address(struct drgn_program *prog, uint64_t address,
 	return NULL;
 }
 
-DEFINE_VECTOR(symbolp_vector, struct drgn_symbol *)
+DEFINE_VECTOR(symbolp_vector, struct drgn_symbol *);
 
 enum {
 	SYMBOLS_SEARCH_NAME = (1 << 0),
@@ -1809,13 +1870,12 @@ symbols_search(struct drgn_program *prog, struct symbols_search_arg *arg,
 	}
 
 	if (err) {
-		for (size_t i = 0; i < arg->results.size; i++)
-			drgn_symbol_destroy(arg->results.data[i]);
+		vector_for_each(symbolp_vector, symbolp, &arg->results)
+			drgn_symbol_destroy(*symbolp);
 		symbolp_vector_deinit(&arg->results);
 	} else {
 		symbolp_vector_shrink_to_fit(&arg->results);
-		*count_ret = arg->results.size;
-		*syms_ret = arg->results.data;
+		symbolp_vector_steal(&arg->results, syms_ret, count_ret);
 	}
 	return err;
 }
@@ -1940,4 +2000,39 @@ drgn_program_element_info(struct drgn_program *prog, struct drgn_type *type,
 
 	ret->qualified_type = drgn_type_type(underlying_type);
 	return drgn_type_bit_size(ret->qualified_type.type, &ret->bit_size);
+}
+
+LIBDRGN_PUBLIC void
+drgn_program_set_blocking_callback(struct drgn_program *prog,
+				   drgn_program_begin_blocking_fn *begin_callback,
+				   drgn_program_end_blocking_fn *end_callback,
+				   void *callback_arg)
+{
+	prog->begin_blocking_fn = begin_callback;
+	prog->end_blocking_fn = end_callback;
+	prog->blocking_arg = callback_arg;
+}
+
+LIBDRGN_PUBLIC void
+drgn_program_get_blocking_callback(struct drgn_program *prog,
+				   drgn_program_begin_blocking_fn **begin_callback_ret,
+				   drgn_program_end_blocking_fn **end_callback_ret,
+				   void **callback_arg_ret)
+{
+	*begin_callback_ret = prog->begin_blocking_fn;
+	*end_callback_ret = prog->end_blocking_fn;
+	*callback_arg_ret = prog->blocking_arg;
+}
+
+void *drgn_program_begin_blocking(struct drgn_program *prog)
+{
+	if (!prog->begin_blocking_fn)
+		return NULL;
+	return prog->begin_blocking_fn(prog, prog->blocking_arg);
+}
+
+void drgn_program_end_blocking(struct drgn_program *prog, void *state)
+{
+	if (prog->end_blocking_fn)
+		prog->end_blocking_fn(prog, prog->blocking_arg, state);
 }

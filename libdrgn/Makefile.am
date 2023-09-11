@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 ACLOCAL_AMFLAGS = -I m4
 
@@ -9,14 +9,13 @@ AM_CPPFLAGS = -I $(top_srcdir)/include -D_GNU_SOURCE
 AM_CFLAGS = $(WARN_CFLAGS) $(SANITIZER_CFLAGS)
 AM_LDFLAGS= $(SANITIZER_LDFLAGS)
 
-noinst_HEADERS = include/dwarf.h \
-		 include/elf.h \
-		 include/elfutils/known-dwarf.h
+noinst_HEADERS = include/elf.h
 
 include_HEADERS = drgn.h
 
 ARCH_DEFS_PYS = arch_aarch64_defs.py \
 		arch_ppc64_defs.py \
+		arch_s390x_defs.py \
 		arch_x86_64_defs.py
 
 ARCH_DEFS_INCS = $(ARCH_DEFS_PYS:_defs.py=_defs.inc)
@@ -27,7 +26,9 @@ STRSWITCH_INCS = drgn_program_parse_vmcoreinfo.inc \
 BUILT_SOURCES = $(ARCH_DEFS_INCS) \
 		$(STRSWITCH_INCS) \
 		c_keywords.inc \
-		drgn.h
+		drgn.h \
+		drgn_section_name_to_index.inc \
+		elf_sections.h
 
 noinst_LTLIBRARIES = libdrgnimpl.la
 
@@ -46,12 +47,20 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 cfi.c \
 			 cfi.h \
 			 cityhash.h \
+			 cleanup.h \
 			 debug_info.c \
 			 debug_info.h \
+			 drgn_section_name_to_index.inc \
+			 dwarf_constants.c \
+			 dwarf_constants.h \
 			 dwarf_info.c \
 			 dwarf_info.h \
+			 elf_file.c \
+			 elf_file.h \
+			 elf_sections.h \
 			 error.c \
 			 error.h \
+			 generics.h \
 			 hash_table.c \
 			 hash_table.h \
 			 helpers.h \
@@ -67,6 +76,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 linux_kernel.c \
 			 linux_kernel.h \
 			 linux_kernel_helpers.c \
+			 log.c \
+			 log.h \
 			 memory_reader.c \
 			 memory_reader.h \
 			 minmax.h \
@@ -75,6 +86,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 object.h \
 			 object_index.c \
 			 object_index.h \
+			 openmp.c \
+			 openmp.h \
 			 orc.h \
 			 orc_info.c \
 			 orc_info.h \
@@ -99,7 +112,6 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 type.c \
 			 type.h \
 			 util.h \
-			 vector.c \
 			 vector.h
 
 libdrgnimpl_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden $(OPENMP_CFLAGS) \
@@ -128,6 +140,12 @@ drgn.h: drgn.h.in configure.ac
 		-e 's/@DRGN_VERSION_PATCH@/$(word 3,$(subst ., ,@PACKAGE_VERSION@))/g' \
 		$< > $@
 
+drgn_section_name_to_index.inc: build-aux/gen_elf_sections.py build-aux/gen_strswitch.py build-aux/codegen_utils.py
+	$(AM_V_GEN)$(PYTHON) $< | $(PYTHON) $(word 2, $^) -o $@ -
+
+elf_sections.h: build-aux/gen_elf_sections.py build-aux/codegen_utils.py
+	$(AM_V_GEN)$(PYTHON) $< -H > $@
+
 lib_LTLIBRARIES = libdrgn.la
 
 libdrgn_la_SOURCES =
@@ -147,7 +165,7 @@ _drgn_la_SOURCES = python/constants.c \
 		   python/error.c \
 		   python/helpers.c \
 		   python/language.c \
-		   python/module.c \
+		   python/main.c \
 		   python/object.c \
 		   python/platform.c \
 		   python/program.c \
@@ -188,6 +206,7 @@ EXTRA_DIST = $(ARCH_DEFS_PYS) \
 	     build-aux/gen_arch_inc_strswitch.py \
 	     build-aux/gen_c_keywords_inc_strswitch.py \
 	     build-aux/gen_constants.py \
+	     build-aux/gen_elf_sections.py \
 	     build-aux/gen_strswitch.py \
 	     drgn.h.in
 

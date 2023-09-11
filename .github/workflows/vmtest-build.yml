@@ -7,22 +7,37 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [default, alternative, tiny]
+        arch: [x86_64, aarch64, ppc64, s390x, arm]
+      fail-fast: false
+      max-parallel: 5
+    # Build on 20.04 so that we don't get host binaries (e.g., objtool) that
+    # depend on libraries too new for other distros.
+    runs-on: ubuntu-20.04
+    permissions:
+      contents: write
     env:
       GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install dwarves libelf-dev
           pip install aiohttp uritemplate
-      - name: Build and upload assets
-        run: python3 -m vmtest.manage --kernel-directory build/vmtest/linux.git --build-directory build/vmtest/kbuild -K
+      - name: Build and upload ${{ matrix.arch }} ${{ matrix.flavor }} kernels
+        run: python3 -m vmtest.manage --kernel-directory build/vmtest/linux.git --build-directory build/vmtest/kbuild -K -a ${{ matrix.arch }} -f ${{ matrix.flavor }}
       - name: Upload kernel build logs
         if: always()
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: kernel-build-logs
           path: build/vmtest/kbuild/*.log
           if-no-files-found: ignore
+  test:
+    needs: build
+    uses: ./.github/workflows/ci.yml
+    with:
+      test_all_python_versions: true

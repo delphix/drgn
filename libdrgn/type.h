@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -17,8 +17,6 @@
 #include "drgn.h"
 #include "hash_table.h"
 #include "vector.h"
-
-struct drgn_language;
 
 /**
  * @ingroup Internals
@@ -60,7 +58,7 @@ struct drgn_type_finder {
 	struct drgn_type_finder *next;
 };
 
-DEFINE_HASH_SET_TYPE(drgn_dedupe_type_set, struct drgn_type *)
+DEFINE_HASH_SET_TYPE(drgn_dedupe_type_set, struct drgn_type *);
 
 /** <tt>(type, member name)</tt> pair. */
 struct drgn_member_key {
@@ -89,8 +87,8 @@ struct drgn_member_value {
  */
 #else
 DEFINE_HASH_MAP_TYPE(drgn_member_map, struct drgn_member_key,
-		      struct drgn_member_value)
-DEFINE_HASH_SET_TYPE(drgn_type_set, struct drgn_type *)
+		      struct drgn_member_value);
+DEFINE_HASH_SET_TYPE(drgn_type_set, struct drgn_type *);
 #endif
 
 /**
@@ -179,7 +177,7 @@ struct drgn_error *drgn_float_type_create(struct drgn_program *prog,
 					  struct drgn_type **ret);
 
 DEFINE_VECTOR_TYPE(drgn_type_template_parameter_vector,
-		   struct drgn_type_template_parameter)
+		   struct drgn_type_template_parameter);
 
 /**
  * Common builder shared between compound and function types for template
@@ -201,7 +199,7 @@ drgn_template_parameters_builder_add(struct drgn_template_parameters_builder *bu
 				     const union drgn_lazy_object *argument,
 				     const char *name, bool is_default);
 
-DEFINE_VECTOR_TYPE(drgn_type_member_vector, struct drgn_type_member)
+DEFINE_VECTOR_TYPE(drgn_type_member_vector, struct drgn_type_member);
 
 /** Builder for members of a structure, union, or class type. */
 struct drgn_compound_type_builder {
@@ -263,7 +261,7 @@ drgn_compound_type_create(struct drgn_compound_type_builder *builder,
 			  const struct drgn_language *lang,
 			  struct drgn_type **ret);
 
-DEFINE_VECTOR_TYPE(drgn_type_enumerator_vector, struct drgn_type_enumerator)
+DEFINE_VECTOR_TYPE(drgn_type_enumerator_vector, struct drgn_type_enumerator);
 
 /** Builder for enumerators of an enumerated type. */
 struct drgn_enum_type_builder {
@@ -409,7 +407,7 @@ drgn_incomplete_array_type_create(struct drgn_program *prog,
 				  const struct drgn_language *lang,
 				  struct drgn_type **ret);
 
-DEFINE_VECTOR_TYPE(drgn_type_parameter_vector, struct drgn_type_parameter)
+DEFINE_VECTOR_TYPE(drgn_type_parameter_vector, struct drgn_type_parameter);
 
 /** Builder for parameters of a function type. */
 struct drgn_function_type_builder {
@@ -560,9 +558,6 @@ bool drgn_type_is_scalar(struct drgn_type *type);
 struct drgn_error *drgn_type_bit_size(struct drgn_type *type,
 				      uint64_t *ret);
 
-/** Get the appropriate @ref drgn_object_encoding for a @ref drgn_type. */
-enum drgn_object_encoding drgn_type_object_encoding(struct drgn_type *type);
-
 /** Initialize type-related fields in a @ref drgn_program. */
 void drgn_program_init_types(struct drgn_program *prog);
 /** Deinitialize type-related fields in a @ref drgn_program. */
@@ -584,11 +579,11 @@ void drgn_program_deinit_types(struct drgn_program *prog);
  * @return @c NULL on success, &@ref drgn_not_found if the type wasn't found,
  * non-@c NULL on other error.
  */
-struct drgn_error *
-drgn_program_find_type_impl(struct drgn_program *prog,
-			    enum drgn_type_kind kind, const char *name,
-			    size_t name_len, const char *filename,
-			    struct drgn_qualified_type *ret);
+struct drgn_error *drgn_program_find_type_impl(struct drgn_program *prog,
+					       uint64_t kinds, const char *name,
+					       size_t name_len,
+					       const char *filename,
+					       struct drgn_qualified_type *ret);
 
 /** Find a primitive type in a @ref drgn_program. */
 struct drgn_error *

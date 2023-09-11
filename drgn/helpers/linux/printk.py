@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Log Buffer
@@ -158,12 +158,23 @@ def _get_printk_records_lockless(prog: Program, prb: Object) -> List[PrintkRecor
 
 
 def _get_printk_records_structured(prog: Program) -> List[PrintkRecord]:
-    printk_logp_type = prog.type("struct printk_log *")
+    try:
+        printk_logp_type = prog.type("struct printk_log *")
+    except LookupError:
+        # Before Linux kernel commit 62e32ac3505a ("printk: rename struct log
+        # to struct printk_log") (in v3.11), records were "struct log" instead
+        # of "struct printk_log". RHEL 7 kernel still uses old naming.
+        printk_logp_type = prog.type("struct log *")
+
     have_caller_id = printk_logp_type.type.has_member("caller_id")
     LOG_CONT = prog["LOG_CONT"].value_()
 
     result = []
-    log_buf = prog["log_buf"].read_()
+    # Between Linux kernel commits cbd357008604 ("bpf: verifier (add ability to
+    # receive verification log)") (in v3.18) and e7bf8249e8f1 ("bpf:
+    # encapsulate verifier log state into a structure") (in v4.15),
+    # kernel/bpf/verifier.c also contains a variable named log_buf.
+    log_buf = prog.object("log_buf", filename="printk.c").read_()
     current_idx = prog["log_first_idx"].read_()
     next_idx = prog["log_next_idx"].read_()
     seq = prog["log_first_seq"].value_()
