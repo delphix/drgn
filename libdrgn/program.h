@@ -19,6 +19,7 @@
 #include <libkdumpfile/kdumpfile.h>
 #endif
 
+#include "debug_info.h"
 #include "drgn.h"
 #include "hash_table.h"
 #include "language.h"
@@ -107,7 +108,7 @@ struct drgn_program {
 	 * Debugging information.
 	 */
 	struct drgn_object_index oindex;
-	struct drgn_debug_info *dbinfo;
+	struct drgn_debug_info dbinfo;
 
 	/*
 	 * Program information.
@@ -243,6 +244,11 @@ struct drgn_error *drgn_program_init_kernel(struct drgn_program *prog);
  * Implement @ref drgn_program_from_pid() on an initialized @ref drgn_program.
  */
 struct drgn_error *drgn_program_init_pid(struct drgn_program *prog, pid_t pid);
+
+struct drgn_error *
+drgn_program_add_object_finder_impl(struct drgn_program *prog,
+				    struct drgn_object_finder *finder,
+				    drgn_object_find_fn fn, void *arg);
 
 static inline struct drgn_error *
 drgn_program_is_little_endian(struct drgn_program *prog, bool *ret)
