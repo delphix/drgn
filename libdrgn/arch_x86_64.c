@@ -19,15 +19,11 @@
 #include "arch_x86_64_defs.inc"
 
 static const struct drgn_cfi_row default_dwarf_cfi_row_x86_64 = DRGN_CFI_ROW(
-	/*
-	 * The System V psABI defines the CFA as the value of rsp in the calling
-	 * frame.
-	 */
+	// The System V psABI defines the CFA as the value of rsp in the calling
+	// frame.
 	[DRGN_REGISTER_NUMBER(rsp)] = { DRGN_CFI_RULE_CFA_PLUS_OFFSET },
-	/*
-	 * Other callee-saved registers default to DW_CFA_same_value. This isn't
-	 * explicitly documented in the psABI, but it seems to be the consensus.
-	 */
+	// Other callee-saved registers default to DW_CFA_same_value. This isn't
+	// explicitly documented in the psABI, but it seems to be the consensus.
 	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(rbx)),
 	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(rbp)),
 	DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r12)),
@@ -168,16 +164,14 @@ orc_to_cfi_x86_64(const struct drgn_orc_entry *orc,
 				       &rule))					\
 		return &drgn_enomem;						\
 } while (0)
-		/*
-		 * This ORC entry is for an interrupt handler before it saves
-		 * the whole pt_regs. These registers are not clobbered before
-		 * they are saved, so they should have the same value. See Linux
-		 * kernel commit 81b67439d147 ("x86/unwind/orc: Fix premature
-		 * unwind stoppage due to IRET frames").
-		 *
-		 * This probably also applies to other registers, but to stay on
-		 * the safe side we only handle registers used by ORC.
-		 */
+		// This ORC entry is for an interrupt handler before it saves
+		// the whole pt_regs. These registers are not clobbered before
+		// they are saved, so they should have the same value. See Linux
+		// kernel commit 81b67439d147 ("x86/unwind/orc: Fix premature
+		// unwind stoppage due to IRET frames").
+		//
+		// This probably also applies to other registers, but to stay on
+		// the safe side we only handle registers used by ORC.
 		SET_SAME_VALUE_RULE(r10);
 		SET_SAME_VALUE_RULE(r13);
 		SET_SAME_VALUE_RULE(rdi);
@@ -452,14 +446,12 @@ linux_kernel_get_initial_registers_x86_64(const struct drgn_object *task_obj,
 	if (err)
 		return err;
 
-	/*
-	 * Since Linux kernel commit 0100301bfdf5 ("sched/x86: Rewrite the
-	 * switch_to() code") (in v4.9), sp points to a struct
-	 * inactive_task_frame, which we can use to get the callee-saved
-	 * registers. Before that, sp points to bp. As long as frame pointers
-	 * are enabled, this in turn points to the previous bp and the return
-	 * address.
-	 */
+	// Since Linux kernel commit 0100301bfdf5 ("sched/x86: Rewrite the
+	// switch_to() code") (in v4.9), sp points to a struct
+	// inactive_task_frame, which we can use to get the callee-saved
+	// registers. Before that, sp points to bp. As long as frame pointers
+	// are enabled, this in turn points to the previous bp and the return
+	// address.
 	struct drgn_qualified_type frame_type;
 	err = drgn_program_find_type(prog, "struct inactive_task_frame *", NULL,
 				     &frame_type);
@@ -512,10 +504,8 @@ apply_elf_reloc_x86_64(const struct drgn_relocating_section *relocating,
 		return drgn_reloc_add32(relocating, r_offset, r_addend,
 					sym_value
 					- (relocating->addr + r_offset));
-	/*
-	 * The only difference between 32 and 32S is how overflow is checked,
-	 * which we don't do.
-	 */
+	// The only difference between 32 and 32S is how overflow is checked,
+	// which we don't do.
 	case R_X86_64_32:
 	case R_X86_64_32S:
 		return drgn_reloc_add32(relocating, r_offset, r_addend,
@@ -535,19 +525,17 @@ linux_kernel_live_direct_mapping_fallback_x86_64(struct drgn_program *prog,
 						 uint64_t *size_ret)
 {
 	struct drgn_error *err;
-	unsigned long page_offset_base_address;
 
 	*size_ret = UINT64_C(1) << 46;
+	unsigned long page_offset_base_address;
 	err = proc_kallsyms_symbol_addr("page_offset_base",
 					&page_offset_base_address);
 	if (!err) {
 		return drgn_program_read_word(prog, page_offset_base_address,
 					      false, address_ret);
 	} else if (err == &drgn_not_found) {
-		/*
-		 * This is only called for pre-4.11 kernels, so we can assume
-		 * the old location.
-		 */
+		// This is only called for pre-4.11 kernels, so we can assume
+		// the old location.
 		*address_ret = UINT64_C(0xffff880000000000);
 		return NULL;
 	} else {
@@ -557,7 +545,11 @@ linux_kernel_live_direct_mapping_fallback_x86_64(struct drgn_program *prog,
 
 struct pgtable_iterator_x86_64 {
 	struct pgtable_iterator it;
+	// Index of next page table entry to use in a level.
 	uint16_t index[5];
+	// Index of end of cached entries in a level (i.e., the first index
+	// greater than index[level] that isn't cached).
+	uint16_t cached_index[5];
 	uint64_t table[5][512];
 };
 
@@ -572,7 +564,6 @@ linux_kernel_pgtable_iterator_create_x86_64(struct drgn_program *prog,
 	return NULL;
 }
 
-
 static void linux_kernel_pgtable_iterator_destroy_x86_64(struct pgtable_iterator *_it)
 {
 	free(container_of(_it, struct pgtable_iterator_x86_64, it));
@@ -584,7 +575,8 @@ linux_kernel_pgtable_iterator_init_x86_64(struct drgn_program *prog,
 {
 	struct pgtable_iterator_x86_64 *it =
 		container_of(_it, struct pgtable_iterator_x86_64, it);
-	memset(it->index, 0xff, sizeof(it->index));
+	memset(it->index, 0, sizeof(it->index));
+	memset(it->cached_index, 0, sizeof(it->cached_index));
 }
 
 static struct drgn_error *
@@ -597,14 +589,14 @@ linux_kernel_pgtable_iterator_next_x86_64(struct drgn_program *prog,
 	static const int PGTABLE_SHIFT = 9;
 	static const int PGTABLE_MASK = (1 << PGTABLE_SHIFT) - 1;
 	static const uint64_t PRESENT = 0x1;
-	static const uint64_t PSE = 0x80; /* a.k.a. huge page */
+	static const uint64_t PSE = 0x80; // a.k.a. huge page
 	static const uint64_t ADDRESS_MASK = UINT64_C(0xffffffffff000);
 	struct drgn_error *err;
 	bool bswap = drgn_platform_bswap(&prog->platform);
 	struct pgtable_iterator_x86_64 *it =
 		container_of(_it, struct pgtable_iterator_x86_64, it);
 	uint64_t virt_addr = it->it.virt_addr;
-	int levels = prog->vmcoreinfo.pgtable_l5_enabled ? 5 : 4, level;
+	int levels = prog->vmcoreinfo.pgtable_l5_enabled ? 5 : 4;
 
 	uint64_t start_non_canonical =
 		(UINT64_C(1) <<
@@ -619,16 +611,16 @@ linux_kernel_pgtable_iterator_next_x86_64(struct drgn_program *prog,
 		return NULL;
 	}
 
-	/* Find the lowest level with cached entries. */
+	// Find the lowest level with cached entries.
+	int level;
 	for (level = 0; level < levels; level++) {
-		if (it->index[level] < array_size(it->table[level]))
+		if (it->index[level] < it->cached_index[level])
 			break;
 	}
-	/* For every level below that, refill the cache/return pages. */
+	// For every level below that, refill the cache/return pages.
 	for (;; level--) {
 		uint64_t table;
 		bool table_physical;
-		uint16_t index;
 		if (level == levels) {
 			table = it->it.pgtable;
 			table_physical = false;
@@ -651,20 +643,26 @@ linux_kernel_pgtable_iterator_next_x86_64(struct drgn_program *prog,
 			}
 			table_physical = true;
 		}
-		index = (virt_addr >>
-			 (PAGE_SHIFT + PGTABLE_SHIFT * (level - 1))) & PGTABLE_MASK;
-		/*
-		 * It's only marginally more expensive to read 4096 bytes than 8
-		 * bytes, so we always read to the end of the table.
-		 */
+		uint64_t index = (virt_addr >>
+				  (PAGE_SHIFT + PGTABLE_SHIFT * (level - 1)));
+		size_t num_to_cache = 1;
+		if (it->it.last_virt_addr_hint > virt_addr) {
+			uint64_t last_index = (it->it.last_virt_addr_hint >>
+					       (PAGE_SHIFT + PGTABLE_SHIFT * (level - 1)));
+			num_to_cache = min(last_index - index + 1,
+					   array_size(it->table[level - 1])
+					   - (index & PGTABLE_MASK));
+		}
+		index &= PGTABLE_MASK;
 		err = drgn_program_read_memory(prog,
 					       &it->table[level - 1][index],
 					       table + 8 * index,
-					       sizeof(it->table[0]) - 8 * index,
+					       num_to_cache * 8,
 					       table_physical);
 		if (err)
 			return err;
 		it->index[level - 1] = index;
+		it->cached_index[level - 1] = index + num_to_cache;
 	}
 }
 
