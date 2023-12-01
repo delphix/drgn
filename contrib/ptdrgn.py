@@ -159,6 +159,7 @@ def run_interactive(
         "offsetof",
         "reinterpret",
         "sizeof",
+        "stack_trace",
     ]
     for attr in drgn_globals:
         init_globals[attr] = getattr(drgn, attr)
@@ -184,6 +185,10 @@ For help, type help(drgn).
         init_globals = globals_func(init_globals)
 
     old_path = list(sys.path)
+    try:
+        old_default_prog = drgn.get_default_prog()
+    except drgn.NoDefaultProgramError:
+        old_default_prog = None
     # The ptpython history file format is different from a standard readline
     # history file since it must handle multi-line input, and it includes some
     # metadata as well. Use a separate history format, even though it would be
@@ -191,6 +196,8 @@ For help, type help(drgn).
     histfile = os.path.expanduser("~/.drgn_history.ptpython")
     try:
         sys.path.insert(0, "")
+
+        drgn.set_default_prog(prog)
 
         print(banner)
         embed(
@@ -200,6 +207,7 @@ For help, type help(drgn).
             configure=configure,
         )
     finally:
+        drgn.set_default_prog(old_default_prog)
         sys.path[:] = old_path
 
 

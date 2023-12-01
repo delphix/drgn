@@ -14,18 +14,20 @@ import types
 from typing import Mapping
 
 from drgn import Program
+from drgn.helpers.common.prog import takes_program_or_default
 
 __all__ = ("get_kconfig",)
 
 
+@takes_program_or_default
 def get_kconfig(prog: Program) -> Mapping[str, str]:
     """
     Get the kernel build configuration as a mapping from the option name to the
     value.
 
-    >>> get_kconfig(prog)['CONFIG_SMP']
+    >>> get_kconfig()['CONFIG_SMP']
     'y'
-    >>> get_kconfig(prog)['CONFIG_HZ']
+    >>> get_kconfig()['CONFIG_HZ']
     '300'
 
     This is only supported if the kernel was compiled with ``CONFIG_IKCONFIG``.

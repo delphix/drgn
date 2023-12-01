@@ -44,6 +44,7 @@ import io
 import pkgutil
 import sys
 import types
+from typing import Union
 
 from _drgn import (
     NULL,
@@ -53,6 +54,7 @@ from _drgn import (
     IntegerLike,
     Language,
     MissingDebugInfoError,
+    NoDefaultProgramError,
     Object,
     ObjectAbsentError,
     OutOfBoundsError,
@@ -79,12 +81,14 @@ from _drgn import (
     cast,
     container_of,
     filename_matches,
+    get_default_prog,
     host_platform,
     offsetof,
     program_from_core_dump,
     program_from_kernel,
     program_from_pid,
     reinterpret,
+    set_default_prog,
     sizeof,
 )
 
@@ -104,6 +108,7 @@ __all__ = (
     "Language",
     "MissingDebugInfoError",
     "NULL",
+    "NoDefaultProgramError",
     "Object",
     "ObjectAbsentError",
     "OutOfBoundsError",
@@ -131,13 +136,16 @@ __all__ = (
     "container_of",
     "execscript",
     "filename_matches",
+    "get_default_prog",
     "host_platform",
     "offsetof",
     "program_from_core_dump",
     "program_from_kernel",
     "program_from_pid",
     "reinterpret",
+    "set_default_prog",
     "sizeof",
+    "stack_trace",
 )
 
 
@@ -191,7 +199,7 @@ def execscript(path: str, *args: str) -> None:
                 return None
 
         tasks = [
-            task for task in for_each_task(prog)
+            task for task in for_each_task()
             if task_exe_path(task) == sys.argv[1]
         ]
 
@@ -200,7 +208,7 @@ def execscript(path: str, *args: str) -> None:
     >>> execscript('exe.py', '/usr/bin/bash')
     >>> tasks[0].pid
     (pid_t)358442
-    >>> task_exe_path(find_task(prog, 357954))
+    >>> task_exe_path(find_task(357954))
     '/usr/bin/vim'
 
     :param path: File path of the script.
@@ -254,3 +262,19 @@ def execscript(path: str, *args: str) -> None:
             sys.modules["__main__"] = saved_module[0]
         else:
             del sys.modules["__main__"]
+
+
+def stack_trace(thread: Union[Object, IntegerLike]) -> StackTrace:
+    """
+    Get the stack trace for the given thread using the :ref:`default program
+    argument <default-program>`.
+
+    See :meth:`Program.stack_trace()` for more details.
+
+    :param thread: Thread ID, ``struct pt_regs`` object, or
+        ``struct task_struct *`` object.
+    """
+    if isinstance(thread, Object):
+        return thread.prog_.stack_trace(thread)
+    else:
+        return get_default_prog().stack_trace(thread)

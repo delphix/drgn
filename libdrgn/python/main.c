@@ -27,8 +27,36 @@ static int add_type(PyObject *module, PyTypeObject *type)
 }
 
 PyObject *MissingDebugInfoError;
+static PyObject *NoDefaultProgramError;
 PyObject *ObjectAbsentError;
 PyObject *OutOfBoundsError;
+
+static _Thread_local PyObject *default_prog;
+
+static PyObject *get_default_prog(PyObject *self, PyObject *_)
+{
+	if (!default_prog) {
+		PyErr_SetString(NoDefaultProgramError, "no default program");
+		return NULL;
+	}
+	Py_INCREF(default_prog);
+	return default_prog;
+}
+
+static PyObject *set_default_prog(PyObject *self, PyObject *arg)
+{
+	if (arg == Py_None) {
+		Py_CLEAR(default_prog);
+	} else if (PyObject_TypeCheck(arg, &Program_type)) {
+		Py_INCREF(arg);
+		Py_XSETREF(default_prog, arg);
+	} else {
+		PyErr_SetString(PyExc_TypeError,
+				"prog must be Program or None");
+		return NULL;
+	}
+	Py_RETURN_NONE;
+}
 
 static PyObject *filename_matches(PyObject *self, PyObject *args,
 				  PyObject *kwds)
@@ -102,6 +130,10 @@ static PyObject *offsetof_(PyObject *self, PyObject *args, PyObject *kwds)
 }
 
 static PyMethodDef drgn_methods[] = {
+	{"get_default_prog", get_default_prog, METH_NOARGS,
+	 drgn_get_default_prog_DOC},
+	{"set_default_prog", set_default_prog, METH_O,
+	 drgn_set_default_prog_DOC},
 	{"filename_matches", (PyCFunction)filename_matches,
 	 METH_VARARGS | METH_KEYWORDS, drgn_filename_matches_DOC},
 	{"NULL", (PyCFunction)DrgnObject_NULL, METH_VARARGS | METH_KEYWORDS,
@@ -132,9 +164,9 @@ static PyMethodDef drgn_methods[] = {
 	 (PyCFunction)drgnpy_linux_helper_per_cpu_ptr,
 	 METH_VARARGS | METH_KEYWORDS},
 	{"_linux_helper_cpu_curr", (PyCFunction)drgnpy_linux_helper_cpu_curr,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS},
 	{"_linux_helper_idle_task", (PyCFunction)drgnpy_linux_helper_idle_task,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS},
 	{"_linux_helper_task_cpu", (PyCFunction)drgnpy_linux_helper_task_cpu,
 	 METH_VARARGS | METH_KEYWORDS},
 	{"_linux_helper_xa_load",
@@ -143,17 +175,15 @@ static PyMethodDef drgn_methods[] = {
 	{"_linux_helper_idr_find", (PyCFunction)drgnpy_linux_helper_idr_find,
 	 METH_VARARGS | METH_KEYWORDS},
 	{"_linux_helper_find_pid", (PyCFunction)drgnpy_linux_helper_find_pid,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS},
 	{"_linux_helper_pid_task", (PyCFunction)drgnpy_linux_helper_pid_task,
 	 METH_VARARGS | METH_KEYWORDS},
 	{"_linux_helper_find_task", (PyCFunction)drgnpy_linux_helper_find_task,
-	 METH_VARARGS | METH_KEYWORDS},
-	{"_linux_helper_kaslr_offset",
-	 (PyCFunction)drgnpy_linux_helper_kaslr_offset,
-	 METH_VARARGS | METH_KEYWORDS},
+	 METH_VARARGS},
+	{"_linux_helper_kaslr_offset", drgnpy_linux_helper_kaslr_offset,
+	 METH_O},
 	{"_linux_helper_pgtable_l5_enabled",
-	 (PyCFunction)drgnpy_linux_helper_pgtable_l5_enabled,
-	 METH_VARARGS | METH_KEYWORDS},
+	 drgnpy_linux_helper_pgtable_l5_enabled, METH_O},
 	{},
 };
 
@@ -251,6 +281,7 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	    add_type(m, &TypeParameter_type) ||
 	    add_type(m, &TypeTemplateParameter_type) ||
 	    add_new_exception(m, MissingDebugInfoError) ||
+	    add_new_exception(m, NoDefaultProgramError) ||
 	    add_new_exception(m, ObjectAbsentError) ||
 	    add_new_exception(m, OutOfBoundsError) ||
 	    add_type_aliases(m) ||
