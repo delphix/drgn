@@ -68,6 +68,9 @@
 /** Return whether two types or expressions have compatible types. */
 #define types_compatible(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
 
+/** Return whether an expression is an array. */
+#define is_array(x) (!types_compatible(x, &(x)[0]))
+
 /**
  * `static_assert(assert_expression, message)` as an expression that evaluates
  * to `eval_expression`.
@@ -99,6 +102,33 @@ static inline void *malloc_array(size_t nmemb, size_t size)
 	}
 	return malloc(bytes);
 }
+
+static inline void *malloc_flexible_array_impl(size_t struct_size,
+					       size_t element_size,
+					       size_t count)
+{
+	size_t bytes;
+	if (__builtin_mul_overflow(element_size, count, &bytes)
+	    || __builtin_add_overflow(bytes, struct_size, &bytes)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return malloc(bytes);
+}
+
+/**
+ * Allocate a structure with a flexible array member.
+ *
+ * @param[in] type Structure type.
+ * @param[in] member Name of flexible array member in @p type.
+ * @param[in] count Number of flexible array elements to allocate.
+ */
+#define malloc_flexible_array(type, member, count)						\
+	malloc_flexible_array_impl(sizeof(type),						\
+				   static_assert_expression(is_array(((type *)0)->member),	\
+							    "not an array",			\
+							    sizeof(((type *)0)->member[0])),	\
+				   count)
 
 static inline void *malloc64(uint64_t size)
 {
