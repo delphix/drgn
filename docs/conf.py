@@ -8,6 +8,7 @@ master_doc = "index"
 
 extensions = [
     "drgndoc.ext",
+    "linuxsrc",
     "setuptools_config",
     "sphinx.ext.extlinks",
     "sphinx.ext.intersphinx",
@@ -21,10 +22,6 @@ drgndoc_substitutions = [
 extlinks = {
     "contrib": (
         "https://github.com/osandov/drgn/blob/main/contrib/%s",
-        "%s",
-    ),
-    "linux": (
-        "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/%s",
         "%s",
     ),
 }
@@ -44,6 +41,9 @@ html_theme_options = {
     "logo": "logo.png",
     "logo_name": True,
     "logo_text_align": "center",
+    # Make the page body wider.
+    "page_width": "50%",
+    "body_max_width": "auto",
     "github_user": "osandov",
     "github_repo": "drgn",
     "github_button": True,
