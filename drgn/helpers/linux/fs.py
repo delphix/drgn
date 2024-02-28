@@ -19,8 +19,8 @@ from drgn.helpers.linux.list import (
     hlist_empty,
     hlist_for_each_entry,
     list_for_each_entry,
-    list_for_each_entry_reverse,
 )
+from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
 
 __all__ = (
     "path_lookup",
@@ -44,11 +44,11 @@ def _follow_mount(mnt: Object, dentry: Object) -> Tuple[Object, Object]:
     # hasn't changed since v2.6.38, so let's hardcode it for now.
     DCACHE_MOUNTED = 0x10000
     while dentry.d_flags & DCACHE_MOUNTED:
-        for mounted in list_for_each_entry_reverse(
-            "struct mount", mnt.mnt_ns.list.address_of_(), "mnt_list"
+        for mounted in list_for_each_entry(
+            "struct mount", mnt.mnt_mounts.address_of_(), "mnt_child"
         ):
-            if mounted.mnt_parent == mnt and mounted.mnt_mountpoint == dentry:
-                mnt = mounted.read_()
+            if mounted.mnt_mountpoint == dentry:
+                mnt = mounted
                 dentry = mounted.mnt.mnt_root.read_()
                 break
         else:
@@ -310,7 +310,18 @@ def for_each_mount(
         dst = os.fsencode(dst)
     if fstype:
         fstype = os.fsencode(fstype)
-    for mnt in list_for_each_entry("struct mount", ns.list.address_of_(), "mnt_list"):
+    # Since Linux kernel commit 2eea9ce4310d ("mounts: keep list of mounts in
+    # an rbtree") (in v6.8), the mounts in a namespace are in a red-black tree.
+    # Before that, they're in a list.
+    # The old case is first here because before that commit, struct mount also
+    # had a different member named "mounts".
+    try:
+        mounts = list_for_each_entry("struct mount", ns.list.address_of_(), "mnt_list")
+    except AttributeError:
+        mounts = rbtree_inorder_for_each_entry(
+            "struct mount", ns.mounts.address_of_(), "mnt_node"
+        )
+    for mnt in mounts:
         if (
             (src is None or mount_src(mnt) == src)
             and (dst is None or mount_dst(mnt) == dst)
