@@ -4,8 +4,11 @@
 import contextlib
 import ctypes
 import errno
+from fcntl import ioctl
+import mmap
 import os
 from pathlib import Path
+import pickle
 import re
 import signal
 import socket
@@ -89,6 +92,11 @@ class LinuxKernelTestCase(TestCase):
 
 skip_unless_have_test_kmod = unittest.skipUnless(
     "DRGN_TEST_KMOD" in os.environ, "test requires drgn_test Linux kernel module"
+)
+
+skip_unless_have_test_disk = unittest.skipUnless(
+    "DRGN_TEST_DISK" in os.environ,
+    "test requires disk to overwrite; set DRGN_TEST_DISK environment variable (e.g., DRGN_TEST_DISK=/dev/vda)",
 )
 
 # Please keep this in sync with docs/support_matrix.rst and the module
@@ -182,6 +190,39 @@ def fork_and_sigwait(fn=None, *args, **kwds):
     finally:
         os.kill(pid, signal.SIGKILL)
         os.waitpid(pid, 0)
+
+
+# Context manager that:
+# 1. Forks a process that calls a function, which sends the (pickled) return
+#    value over a pipe to the calling process and then blocks in sigwait()
+#    forever.
+# 2. Reads the return value from the pipe.
+# 3. Returns the PID and return value from __enter__().
+# 4. Kills the process in __exit__().
+@contextlib.contextmanager
+def fork_and_call(fn, *args, **kwds):
+    r, w = os.pipe()
+    with open(r, "rb") as pipe_r, open(w, "wb") as pipe_w:
+        pid = os.fork()
+        try:
+            if pid == 0:
+                try:
+                    pipe_r.close()
+                    ret = fn(*args, **kwds)
+                    pickle.dump(ret, pipe_w)
+                    pipe_w.close()
+                    while True:
+                        signal.sigwait(())
+                finally:
+                    traceback.print_exc()
+                    sys.stderr.flush()
+                    os._exit(1)
+            pipe_w.close()
+            ret = pickle.load(pipe_r)
+            yield pid, ret
+        finally:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
 
 
 def smp_enabled():
@@ -346,6 +387,214 @@ def iter_maps(pid="self"):
 
 def mlock(addr, len):
     _check_ctypes_syscall(_mlock(addr, len))
+
+
+CSIGNAL = 0x000000FF
+CLONE_VM = 0x00000100
+CLONE_FS = 0x00000200
+CLONE_FILES = 0x00000400
+CLONE_SIGHAND = 0x00000800
+CLONE_PIDFD = 0x00001000
+CLONE_PTRACE = 0x00002000
+CLONE_VFORK = 0x00004000
+CLONE_PARENT = 0x00008000
+CLONE_THREAD = 0x00010000
+CLONE_NEWNS = 0x00020000
+CLONE_SYSVSEM = 0x00040000
+CLONE_SETTLS = 0x00080000
+CLONE_PARENT_SETTID = 0x00100000
+CLONE_CHILD_CLEARTID = 0x00200000
+CLONE_DETACHED = 0x00400000
+CLONE_UNTRACED = 0x00800000
+CLONE_CHILD_SETTID = 0x01000000
+CLONE_NEWCGROUP = 0x02000000
+CLONE_NEWUTS = 0x04000000
+CLONE_NEWIPC = 0x08000000
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWPID = 0x20000000
+CLONE_NEWNET = 0x40000000
+CLONE_IO = 0x80000000
+CLONE_CLEAR_SIGHAND = 0x100000000
+CLONE_INTO_CGROUP = 0x200000000
+CLONE_NEWTIME = 0x00000080
+
+
+_unshare = _c.unshare
+_unshare.argtypes = [ctypes.c_int]
+_unshare.restype = ctypes.c_int
+
+
+def unshare(flags):
+    _check_ctypes_syscall(_unshare(flags))
+
+
+_LOOP_SET_FD = 0x4C00
+_LOOP_SET_STATUS64 = 0x4C04
+_LOOP_GET_STATUS64 = 0x4C05
+_LOOP_CONFIGURE = 0x4C0A
+_LOOP_CTL_GET_FREE = 0x4C82
+
+_LO_FLAGS_AUTOCLEAR = 4
+
+
+def losetup(fd):
+    have_loop_configure = True
+    with open("/dev/loop-control", "r") as loop_control:
+        while True:
+            index = ioctl(loop_control.fileno(), _LOOP_CTL_GET_FREE)
+            loop = open(f"/dev/loop{index}", "rb")
+            close_loop = True
+            try:
+                # Since Linux kernel commit 3448914e8cc5 ("loop: Add
+                # LOOP_CONFIGURE ioctl") (in v5.8), we can set the file
+                # descriptor and the autoclear flag atomically with the
+                # LOOP_CONFIGURE ioctl. Before that, we have to use
+                # LOOP_SET_FD, then LOOP_GET_STATUS64 and LOOP_SET_STATUS64.
+                config = bytearray(304)  # sizeof(struct loop_config)
+                config[:4] = fd.to_bytes(4, sys.byteorder)
+                config[60:64] = _LO_FLAGS_AUTOCLEAR.to_bytes(4, sys.byteorder)
+                try:
+                    if have_loop_configure:
+                        ioctl(loop.fileno(), _LOOP_CONFIGURE, config)
+                    else:
+                        ioctl(loop.fileno(), _LOOP_SET_FD, fd)
+                except OSError as e:
+                    if e.errno == errno.EBUSY:
+                        continue
+                    elif have_loop_configure and e.errno == errno.EINVAL:
+                        have_loop_configure = False
+                        continue
+                    raise
+                if not have_loop_configure:
+                    info = bytearray(232)  # sizeof(struct loop_info64)
+                    ioctl(loop.fileno(), _LOOP_GET_STATUS64, info)
+                    lo_flags = int.from_bytes(info[52:56], sys.byteorder)
+                    lo_flags |= _LO_FLAGS_AUTOCLEAR
+                    info[52:56] = lo_flags.to_bytes(4, sys.byteorder)
+                    ioctl(loop.fileno(), _LOOP_SET_STATUS64, info, False)
+                close_loop = False
+                return loop
+            finally:
+                if close_loop:
+                    loop.close()
+
+
+_swapon = _c.swapon
+_swapon.argtypes = [ctypes.c_char_p, ctypes.c_int]
+_swapon.restype = ctypes.c_int
+
+_swapoff = _c.swapoff
+_swapoff.argtypes = [ctypes.c_char_p]
+_swapoff.restype = ctypes.c_int
+
+
+def swapon(path, flags=0):
+    _check_ctypes_syscall(_swapon(os.fsencode(path), flags), path)
+
+
+def swapoff(path):
+    _check_ctypes_syscall(_swapoff(os.fsencode(path)), path)
+
+
+def mkswap(path, size):
+    header = bytearray(mmap.PAGESIZE)
+    header[1024:1028] = (1).to_bytes(4, sys.byteorder)  # version
+    header[1028:1032] = (size // mmap.PAGESIZE - 1).to_bytes(
+        4, sys.byteorder
+    )  # last_page
+    header[1036:1052] = os.urandom(16)  # sws_uuid
+    magic = b"SWAPSPACE2"
+    header[-len(magic) :] = magic
+
+    with open(path, "wb") as f:
+        os.posix_fallocate(f.fileno(), 0, size)
+        f.write(header)
+
+
+class _perf_event_attr_sample_period_or_freq(ctypes.Union):
+    _fields_ = (
+        ("sample_period", ctypes.c_uint64),
+        ("sample_freq", ctypes.c_uint64),
+    )
+
+
+class _perf_event_attr_wakeup_events_or_watermark(ctypes.Union):
+    _fields_ = (
+        ("wakeup_events", ctypes.c_uint32),
+        ("wakeup_watermark", ctypes.c_uint32),
+    )
+
+
+class _perf_event_attr_config1(ctypes.Union):
+    _fields_ = (
+        ("bp_addr", ctypes.c_uint64),
+        ("kprobe_func", ctypes.c_uint64),
+        ("uprobe_path", ctypes.c_uint64),
+        ("config1", ctypes.c_uint64),
+    )
+
+
+class _perf_event_attr_config2(ctypes.Union):
+    _fields_ = (
+        ("bp_len", ctypes.c_uint64),
+        ("kprobe_addr", ctypes.c_uint64),
+        ("probe_offset", ctypes.c_uint64),
+        ("config2", ctypes.c_uint64),
+    )
+
+
+class perf_event_attr(ctypes.Structure):
+    _fields_ = (
+        ("type", ctypes.c_uint32),
+        ("size", ctypes.c_uint32),
+        ("config", ctypes.c_uint64),
+        ("_sample_period_or_freq", _perf_event_attr_sample_period_or_freq),
+        ("sample_type", ctypes.c_uint64),
+        ("read_format", ctypes.c_uint64),
+        ("_bitfields1", ctypes.c_uint64),
+        ("_wakeup_events_or_watermark", _perf_event_attr_wakeup_events_or_watermark),
+        ("bp_type", ctypes.c_uint32),
+        ("_config1", _perf_event_attr_config1),
+        ("_config2", _perf_event_attr_config2),
+        ("branch_sample_type", ctypes.c_uint64),
+        ("sample_regs_user", ctypes.c_uint64),
+        ("sample_stack_user", ctypes.c_uint32),
+        ("clockid", ctypes.c_int32),
+        ("sample_regs_intr", ctypes.c_uint64),
+        ("aux_watermark", ctypes.c_uint32),
+        ("sample_max_stack", ctypes.c_uint16),
+        ("__reserved2", ctypes.c_uint16),
+        ("aux_sample_size", ctypes.c_uint32),
+        ("__reserved3", ctypes.c_uint32),
+        ("sig_data", ctypes.c_uint64),
+        ("config3", ctypes.c_uint64),
+    )
+    _anonymous_ = (
+        "_sample_period_or_freq",
+        "_wakeup_events_or_watermark",
+        "_config1",
+        "_config2",
+    )
+
+
+PERF_FLAG_FD_NO_GROUP = 1 << 0
+PERF_FLAG_FD_OUTPUT = 1 << 1
+PERF_FLAG_PID_CGROUP = 1 << 2
+PERF_FLAG_FD_CLOEXEC = 1 << 3
+
+
+def perf_event_open(attr, pid, cpu, group_fd=-1, flags=PERF_FLAG_FD_CLOEXEC):
+    attr.size = ctypes.sizeof(perf_event_attr)
+    return _check_ctypes_syscall(
+        _syscall(
+            SYS["perf_event_open"],
+            ctypes.byref(attr),
+            ctypes.c_int(pid),
+            ctypes.c_int(cpu),
+            ctypes.c_int(group_fd),
+            ctypes.c_ulong(flags),
+        )
+    )
 
 
 _syscall = _c.syscall

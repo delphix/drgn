@@ -33,6 +33,7 @@ _INIT_TEMPLATE = r"""#!/bin/sh
 set -eu
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export DRGN_TEST_DISK=/dev/vda
 {kdump_needs_nosmp}
 
 # On exit, power off. We don't use the poweroff command because very minimal
@@ -106,6 +107,12 @@ ln -s /proc/self/fd/0 /dev/stdin
 ln -s /proc/self/fd/1 /dev/stdout
 ln -s /proc/self/fd/2 /dev/stderr
 
+# Mount additional filesystems.
+mount -t binfmt_misc -o nosuid,nodev,noexec binfmt_misc /proc/sys/fs/binfmt_misc
+# We currently only enable tracefs if we have uprobes, which AArch64 only
+# supports since Linux 4.10.
+mount -t tracefs -o nosuid,nodev,noexec tracefs /sys/kernel/tracing || true
+
 # Configure networking.
 cat << EOF > /etc/hosts
 127.0.0.1 localhost
@@ -131,7 +138,7 @@ fi
 
 cd {cwd}
 set +e
-sh -c {command}
+setsid -c sh -c {command}
 rc=$?
 set -e
 
