@@ -7,6 +7,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+from typing import Dict, List, TextIO
 
 from util import KernelVersion
 from vmtest.config import (
@@ -14,9 +15,15 @@ from vmtest.config import (
     HOST_ARCHITECTURE,
     KERNEL_FLAVORS,
     SUPPORTED_KERNEL_VERSIONS,
+    Architecture,
     Kernel,
 )
-from vmtest.download import DownloadCompiler, DownloadKernel, download_in_thread
+from vmtest.download import (
+    Download,
+    DownloadCompiler,
+    DownloadKernel,
+    download_in_thread,
+)
 from vmtest.kmod import build_kmod
 from vmtest.rootfsbuild import build_drgn_in_rootfs
 from vmtest.vm import LostVMError, run_in_vm
@@ -25,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class _ProgressPrinter:
-    def __init__(self, file):
+    def __init__(self, file: TextIO) -> None:
         self._file = file
         if hasattr(file, "fileno"):
             try:
@@ -35,8 +42,8 @@ class _ProgressPrinter:
                 columns = 80
                 self._color = False
         self._header = "#" * columns
-        self._passed = {}
-        self._failed = {}
+        self._passed: Dict[str, List[str]] = {}
+        self._failed: Dict[str, List[str]] = {}
 
     def _green(self, s: str) -> str:
         if self._color:
@@ -50,7 +57,7 @@ class _ProgressPrinter:
         else:
             return s
 
-    def update(self, category: str, name: str, passed: bool):
+    def update(self, category: str, name: str, passed: bool) -> None:
         d = self._passed if passed else self._failed
         d.setdefault(category, []).append(name)
 
@@ -83,6 +90,20 @@ class _ProgressPrinter:
 
         print(file=self._file)
         print(header, file=self._file, flush=True)
+
+
+def _kernel_version_is_supported(version: str, arch: Architecture) -> bool:
+    # /proc/kcore is broken on AArch64 and Arm on older versions.
+    if arch.name in ("aarch64", "arm") and KernelVersion(version) <= KernelVersion(
+        "4.19"
+    ):
+        return False
+    # Before 4.11, we need an implementation of the
+    # linux_kernel_live_direct_mapping_fallback architecture callback in
+    # libdrgn, which we only have for x86_64.
+    if KernelVersion(version) <= KernelVersion("4.11") and arch.name != "x86_64":
+        return False
+    return True
 
 
 def _kdump_works(kernel: Kernel) -> bool:
@@ -162,7 +183,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    architecture_names = []
+    if not hasattr(args, "kernels") and not args.local:
+        parser.error("at least one of -k/--kernel or -l/--local is required")
+
+    architecture_names: List[str] = []
     if hasattr(args, "architectures"):
         for name in args.architectures:
             if name == "all":
@@ -181,39 +205,42 @@ if __name__ == "__main__":
             ARCHITECTURES[name] for name in OrderedDict.fromkeys(architecture_names)
         ]
     else:
+        assert HOST_ARCHITECTURE is not None
         architectures = [HOST_ARCHITECTURE]
 
+    seen_arches = set()
+    seen_kernels = set()
+    to_download: List[Download] = []
+    kernels = []
+
+    def add_kernel(arch: Architecture, pattern: str) -> None:
+        key = (arch.name, pattern)
+        if key not in seen_kernels:
+            seen_kernels.add(key)
+            if arch.name not in seen_arches:
+                seen_arches.add(arch.name)
+                to_download.append(DownloadCompiler(arch))
+            kernels.append(DownloadKernel(arch, pattern))
+
     if hasattr(args, "kernels"):
-        kernels = []
         for pattern in args.kernels:
             if pattern == "all":
-                kernels.extend(
-                    [
-                        version + ".*" + flavor
-                        for version in SUPPORTED_KERNEL_VERSIONS
-                        for flavor in KERNEL_FLAVORS
-                    ]
-                )
+                for version in SUPPORTED_KERNEL_VERSIONS:
+                    for arch in architectures:
+                        if _kernel_version_is_supported(version, arch):
+                            for flavor in KERNEL_FLAVORS.values():
+                                add_kernel(arch, version + ".*" + flavor.name)
             elif pattern in KERNEL_FLAVORS:
-                kernels.extend(
-                    [version + ".*" + pattern for version in SUPPORTED_KERNEL_VERSIONS]
-                )
+                flavor = KERNEL_FLAVORS[pattern]
+                for version in SUPPORTED_KERNEL_VERSIONS:
+                    for arch in architectures:
+                        if _kernel_version_is_supported(version, arch):
+                            add_kernel(arch, version + ".*" + flavor.name)
             else:
-                kernels.append(pattern)
-        args.kernels = OrderedDict.fromkeys(kernels)
-    else:
-        args.kernels = []
+                for arch in architectures:
+                    add_kernel(arch, pattern)
 
-    if not args.kernels and not args.local:
-        parser.error("at least one of -k/--kernel or -l/--local is required")
-
-    if args.kernels:
-        to_download = [DownloadCompiler(arch) for arch in architectures]
-        for pattern in args.kernels:
-            for arch in architectures:
-                to_download.append(DownloadKernel(arch, pattern))
-    else:
-        to_download = []
+    to_download.extend(kernels)
 
     progress = _ProgressPrinter(sys.stderr)
 
@@ -270,6 +297,13 @@ chroot "$1" sh -c 'cd /mnt && pytest -v --ignore=tests/linux_kernel'
             if not isinstance(kernel, Kernel):
                 continue
             kmod = build_kmod(args.directory, kernel)
+
+            # Skip excessively slow tests when emulating.
+            if kernel.arch is HOST_ARCHITECTURE:
+                tests_expression = ""
+            else:
+                tests_expression = "-k 'not test_slab_cache_for_each_allocated_object'"
+
             if _kdump_works(kernel):
                 kdump_command = """\
     "$PYTHON" -Bm vmtest.enter_kdump
@@ -278,6 +312,7 @@ chroot "$1" sh -c 'cd /mnt && pytest -v --ignore=tests/linux_kernel'
 """
             else:
                 kdump_command = ""
+
             test_command = rf"""
 set -e
 
@@ -288,7 +323,7 @@ if [ -e /proc/vmcore ]; then
     "$PYTHON" -Bm pytest -v tests/linux_kernel/vmcore
 else
     insmod "$DRGN_TEST_KMOD"
-    "$PYTHON" -Bm pytest -v tests/linux_kernel --ignore=tests/linux_kernel/vmcore
+    "$PYTHON" -Bm pytest -v tests/linux_kernel --ignore=tests/linux_kernel/vmcore {tests_expression}
 {kdump_command}
 fi
 """

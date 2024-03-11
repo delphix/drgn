@@ -12,7 +12,7 @@ KEXEC_FILE_ON_CRASH = 2
 KEXEC_FILE_NO_INITRAMFS = 4
 
 
-def main():
+def main() -> None:
     with open("/proc/cmdline", "rb") as f:
         cmdline = f.read().rstrip(b"\n")
         cmdline = re.sub(rb"(^|\s)crashkernel=\S+", b"", cmdline)
@@ -57,6 +57,13 @@ def main():
 
     with open("/proc/self/comm", "w") as f:
         f.write("selfdestruct")
+
+    # Avoid panicking from CPU 0 on s390x. See _skip_if_cpu0_on_s390x().
+    if NORMALIZED_MACHINE_NAME == "s390x":
+        cpus = os.sched_getaffinity(0)
+        cpus.remove(0)
+        if cpus:
+            os.sched_setaffinity(0, cpus)
 
     with open("/proc/sysrq-trigger", "w") as f:
         f.write("c")
