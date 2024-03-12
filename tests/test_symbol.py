@@ -1,9 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 import tempfile
-from typing import NamedTuple
 
-from drgn import Program, SymbolBinding, SymbolKind
+from drgn import Program, Symbol, SymbolBinding, SymbolKind
 from tests import TestCase
 from tests.dwarfwriter import dwarf_sections
 from tests.elf import ET, PT, SHT, STB, STT
@@ -45,35 +44,13 @@ def elf_symbol_program(*modules):
     return prog
 
 
-# We don't want to support creating drgn.Symbol instances yet, so use this dumb
-# class for testing.
-class Symbol(NamedTuple):
-    name: str
-    address: int
-    size: int
-    binding: SymbolBinding
-    kind: SymbolKind
-
-
 class TestElfSymbol(TestCase):
-    def assert_symbol_equal(self, drgn_symbol, symbol):
-        self.assertEqual(
-            Symbol(
-                drgn_symbol.name,
-                drgn_symbol.address,
-                drgn_symbol.size,
-                drgn_symbol.binding,
-                drgn_symbol.kind,
-            ),
-            symbol,
-        )
-
     def assert_symbols_equal_unordered(self, drgn_symbols, symbols):
         self.assertEqual(len(drgn_symbols), len(symbols))
         drgn_symbols = sorted(drgn_symbols, key=lambda x: (x.address, x.name))
         symbols = sorted(symbols, key=lambda x: (x.address, x.name))
         for drgn_symbol, symbol in zip(drgn_symbols, symbols):
-            self.assert_symbol_equal(drgn_symbol, symbol)
+            self.assertEqual(drgn_symbol, symbol)
 
     def test_by_address(self):
         elf_first = ElfSymbol("first", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL)
@@ -91,13 +68,13 @@ class TestElfSymbol(TestCase):
                 prog = elf_symbol_program(*modules)
                 self.assertRaises(LookupError, prog.symbol, 0xFFFEFFFF)
                 self.assertEqual(prog.symbols(0xFFFEFFFF), [])
-                self.assert_symbol_equal(prog.symbol(0xFFFF0000), first)
+                self.assertEqual(prog.symbol(0xFFFF0000), first)
                 self.assert_symbols_equal_unordered(prog.symbols(0xFFFF0000), [first])
-                self.assert_symbol_equal(prog.symbol(0xFFFF0004), first)
+                self.assertEqual(prog.symbol(0xFFFF0004), first)
                 self.assert_symbols_equal_unordered(prog.symbols(0xFFFF0004), [first])
-                self.assert_symbol_equal(prog.symbol(0xFFFF0008), second)
+                self.assertEqual(prog.symbol(0xFFFF0008), second)
                 self.assert_symbols_equal_unordered(prog.symbols(0xFFFF0008), [second])
-                self.assert_symbol_equal(prog.symbol(0xFFFF000C), second)
+                self.assertEqual(prog.symbol(0xFFFF000C), second)
                 self.assert_symbols_equal_unordered(prog.symbols(0xFFFF000C), [second])
                 self.assertRaises(LookupError, prog.symbol, 0xFFFF0010)
 
@@ -171,8 +148,8 @@ class TestElfSymbol(TestCase):
         for modules in same_module, different_modules:
             with self.subTest(modules=len(modules)):
                 prog = elf_symbol_program(*modules)
-                self.assert_symbol_equal(prog.symbol("first"), first)
-                self.assert_symbol_equal(prog.symbol("second"), second)
+                self.assertEqual(prog.symbol("first"), first)
+                self.assertEqual(prog.symbol("second"), second)
                 self.assertRaises(LookupError, prog.symbol, "third")
 
                 self.assert_symbols_equal_unordered(prog.symbols("first"), [first])
@@ -258,7 +235,7 @@ class TestElfSymbol(TestCase):
                     (ElfSymbol("foo", 0xFFFF0000, 1, elf_type, STB.GLOBAL),)
                 )
                 symbol = Symbol("foo", 0xFFFF0000, 1, SymbolBinding.GLOBAL, drgn_kind)
-                self.assert_symbol_equal(prog.symbol("foo"), symbol)
+                self.assertEqual(prog.symbol("foo"), symbol)
                 symbols = prog.symbols("foo")
                 self.assert_symbols_equal_unordered(symbols, [symbol])
 
@@ -286,3 +263,83 @@ class TestElfSymbol(TestCase):
         ]
         prog = elf_symbol_program(*elf_syms)
         self.assert_symbols_equal_unordered(prog.symbols(), syms)
+
+
+class TestSymbolFinder(TestCase):
+    TEST_SYMS = [
+        Symbol("one", 0xFFFF1000, 16, SymbolBinding.LOCAL, SymbolKind.FUNC),
+        Symbol("two", 0xFFFF2000, 16, SymbolBinding.GLOBAL, SymbolKind.FUNC),
+        Symbol("three", 0xFFFF2008, 8, SymbolBinding.GLOBAL, SymbolKind.FUNC),
+    ]
+
+    def finder(self, arg_name, arg_address, arg_one):
+        self.called = True
+        res = []
+        self.assertEqual(self.expected_name, arg_name)
+        self.assertEqual(self.expected_address, arg_address)
+        self.assertEqual(self.expected_one, arg_one)
+        for sym in self.TEST_SYMS:
+            if arg_name and sym.name == arg_name:
+                res.append(sym)
+            elif arg_address and sym.address <= arg_address < sym.address + sym.size:
+                res.append(sym)
+            elif not arg_name and not arg_address:
+                res.append(sym)
+
+        # This symbol finder intentionally has a bug: it does not respect the
+        # "arg_one" flag: it may return multiple symbols even when "arg_one" is
+        # true.
+        return res
+
+    def setUp(self):
+        self.prog = Program()
+        self.prog.add_symbol_finder(self.finder)
+        self.called = False
+
+    def expect_args(self, name, address, one):
+        self.expected_name = name
+        self.expected_address = address
+        self.expected_one = one
+
+    def test_args_single_string(self):
+        self.expect_args("search_symbol", None, True)
+        with self.assertRaises(LookupError):
+            self.prog.symbol("search_symbol")
+        self.assertTrue(self.called)
+
+    def test_args_single_int(self):
+        self.expect_args(None, 0xFF00, True)
+        with self.assertRaises(LookupError):
+            self.prog.symbol(0xFF00)
+        self.assertTrue(self.called)
+
+    def test_args_single_with_many_results(self):
+        self.expect_args(None, 0xFFFF2008, True)
+        with self.assertRaises(ValueError):
+            self.prog.symbol(0xFFFF2008)
+        self.assertTrue(self.called)
+
+    def test_single_with_result(self):
+        self.expect_args("one", None, True)
+        self.assertEqual(self.prog.symbol("one"), self.TEST_SYMS[0])
+        self.assertTrue(self.called)
+
+    def test_args_many_string(self):
+        self.expect_args("search_symbol", None, False)
+        self.assertEqual(self.prog.symbols("search_symbol"), [])
+        self.assertTrue(self.called)
+
+    def test_args_many_int(self):
+        self.expect_args(None, 0xFF00, False)
+        self.assertEqual(self.prog.symbols(0xFF00), [])
+        self.assertTrue(self.called)
+
+    def test_many_with_result(self):
+        self.expect_args(None, 0xFFFF2004, False)
+        self.assertEqual(self.prog.symbols(0xFFFF2004), [self.TEST_SYMS[1]])
+        self.assertTrue(self.called)
+
+    def test_many_without_filter(self):
+        self.expect_args(None, None, False)
+        self.assertEqual(self.prog.symbols(), self.TEST_SYMS)
+        self.assertTrue(self.called)

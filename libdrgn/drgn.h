@@ -45,7 +45,7 @@
 /** Minor version of drgn. */
 #define DRGN_VERSION_MINOR 0
 /** Patch level of drgn. */
-#define DRGN_VERSION_PATCH 25
+#define DRGN_VERSION_PATCH 26
 
 /**
  * @defgroup ErrorHandling Error handling
@@ -929,6 +929,73 @@ struct drgn_error *drgn_program_find_symbols_by_address(struct drgn_program *pro
 							uint64_t address,
 							struct drgn_symbol ***syms_ret,
 							size_t *count_ret);
+
+/** Flags for @ref drgn_symbol_find_fn() */
+enum drgn_find_symbol_flags {
+	/** Find symbols whose name matches the name argument */
+	DRGN_FIND_SYMBOL_NAME = 1 << 0,
+	/** Find symbols whose address matches the addr argument */
+	DRGN_FIND_SYMBOL_ADDR = 1 << 1,
+	/** Find only one symbol */
+	DRGN_FIND_SYMBOL_ONE = 1 << 2,
+};
+
+/** Result builder for @ref drgn_symbol_find_fn() */
+struct drgn_symbol_result_builder;
+
+/**
+ * Add or set the return value for a symbol search
+ *
+ * Symbol finders should call this with each symbol search result. If the symbol
+ * search was @ref DRGN_FIND_SYMBOL_ONE, then only the most recent symbol added
+ * to the builder will be returned. Otherwise, all symbols added to the builder
+ * are returned. Returns true on success, or false on an allocation failure.
+ */
+bool
+drgn_symbol_result_builder_add(struct drgn_symbol_result_builder *builder,
+			       struct drgn_symbol *symbol);
+
+/** Get the current number of results in a symbol search result. */
+size_t drgn_symbol_result_builder_count(const struct drgn_symbol_result_builder *builder);
+
+/**
+ * Callback for finding one or more symbols.
+ *
+ * The callback should perform a symbol lookup based on the flags given in @a
+ * flags. When multiple flags are provided, the effect should be treated as a
+ * logical AND. Symbol results should be added to the result builder @a builder,
+ * via @ref drgn_symbol_result_builder_add(). When @ref DRGN_FIND_SYMBOL_ONE is
+ * set, then the finding function should only return the single best symbol
+ * result, and short-circuit return.
+ *
+ * When no symbol is found, simply do not add any result to the builder. No
+ * error should be returned in this case.
+ *
+ * @param[in] name Name of the symbol to match
+ * @param[in] addr Address of the symbol to match
+ * @param[in] flags Flags indicating the desired behavior of the search
+ * @param[in] arg Argument passed to @ref drgn_program_add_symbol_finder().
+ * @param[in] builder Used to build the resulting symbol output
+ */
+typedef struct drgn_error *
+(*drgn_symbol_find_fn)(const char *name, uint64_t addr,
+		       enum drgn_find_symbol_flags flags, void *arg,
+		       struct drgn_symbol_result_builder *builder);
+
+/**
+ * Register a symbol finding callback.
+ *
+ * Callbacks are called in reverse order that they were originally added. In
+ * case of a search for multiple symbols, then the results of all callbacks are
+ * concatenated. If the search is for a single symbol, then the first callback
+ * which finds a symbol will short-circuit the search.
+ *
+ * @param[in] fn Symbol search function
+ * @param[in] arg Argument to pass to the callback
+ */
+struct drgn_error *
+drgn_program_add_symbol_finder(struct drgn_program *prog,
+			       drgn_symbol_find_fn fn, void *arg);
 
 /** Element type and size. */
 struct drgn_element_info {
@@ -2881,7 +2948,7 @@ enum drgn_symbol_binding {
 	DRGN_SYMBOL_BINDING_GLOBAL,
 	DRGN_SYMBOL_BINDING_WEAK,
 	DRGN_SYMBOL_BINDING_UNIQUE = 11, /* STB_GNU_UNIQUE + 1 */
-};
+} __attribute__((__packed__));
 
 /** Kind of entity represented by a symbol. */
 enum drgn_symbol_kind {
@@ -2897,7 +2964,45 @@ enum drgn_symbol_kind {
 	DRGN_SYMBOL_KIND_COMMON,
 	DRGN_SYMBOL_KIND_TLS,
 	DRGN_SYMBOL_KIND_IFUNC = 10, /* STT_GNU_IFUNC */
-};
+} __attribute__((__packed__));
+
+/** Describes the lifetime of an object provided to drgn */
+enum drgn_lifetime {
+	/**
+	 * DRGN_LIFETIME_STATIC: the object is guaranteed to outlive the
+	 * drgn_program itself. drgn will not free or copy the object.
+	 */
+	DRGN_LIFETIME_STATIC,
+	/**
+	 * DRGN_LIFETIME_EXTERNAL: the object is externally managed. It will
+	 * live as long as the object it is associated with, but may be freed
+	 * after. drgn will never free the object. If drgn must copy a data
+	 * structure, the object will be duplicated, and drgn will own the new
+	 * object.
+	 */
+	DRGN_LIFETIME_EXTERNAL,
+	/**
+	 * DRGN_LIFETIME_OWNED: the object lifetime is managed by drgn. It
+	 * should be freed when the containing object is freed. If the
+	 * containing object is copied, it must also be copied.
+	 */
+	DRGN_LIFETIME_OWNED,
+} __attribute__((__packed__));
+
+/**
+ * Create a new @ref drgn_symbol with the given values
+ *
+ * All parameters should be self-explanatory, except for @a name_lifetime.
+ * Clients can use this to describe how drgn should treat the string @a name.
+ * Strings with lifetime @c STATIC will never be copied or freed. Strings with
+ * lifetime @c OWNED will always be copied or and freed with the symbol. Strings
+ * with lifetime EXTERNAL will not be freed, but if the Symbol is copied, they
+ * will be copied.
+ */
+struct drgn_error *
+drgn_symbol_create(const char *name, uint64_t address, uint64_t size,
+		   enum drgn_symbol_binding binding, enum drgn_symbol_kind kind,
+		   enum drgn_lifetime name_lifetime, struct drgn_symbol **ret);
 
 /** Destroy a @ref drgn_symbol. */
 void drgn_symbol_destroy(struct drgn_symbol *sym);

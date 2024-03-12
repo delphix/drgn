@@ -27,6 +27,7 @@
 #include "object_index.h"
 #include "platform.h"
 #include "pp.h"
+#include "symbol.h"
 #include "type.h"
 #include "vector.h"
 
@@ -109,6 +110,7 @@ struct drgn_program {
 	 */
 	struct drgn_object_index oindex;
 	struct drgn_debug_info dbinfo;
+	struct drgn_symbol_finder *symbol_finders;
 
 	/*
 	 * Program information.
@@ -364,19 +366,22 @@ struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
 						     uint32_t *ret);
 
 /*
- * Like @ref drgn_program_find_symbol_by_address(), but @p ret is already
- * allocated, we may already know the module, and doesn't return a @ref
- * drgn_error.
+ * Like @ref drgn_program_find_symbol_by_address(), but returns @c NULL rather
+ * than a lookup error if the symbol was not found.
  *
- * @param[in] module Module containing the address. May be @c NULL, in which
- * case this will look it up.
- * @return Whether the symbol was found.
+ * @param[in] address Address to search for.
+ * @param [out] ret The symbol found by the lookup (if found)
+ * @return @c NULL unless an error (unrelated to a lookup error) was encountered
  */
-bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
-						  uint64_t address,
-						  Dwfl_Module *module,
-						  struct drgn_symbol *ret);
+struct drgn_error *
+drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
+					     uint64_t address,
+					     struct drgn_symbol **ret);
 
+struct drgn_error *
+drgn_program_add_symbol_finder_impl(struct drgn_program *prog,
+				    struct drgn_symbol_finder *finder,
+				    drgn_symbol_find_fn fn, void *arg);
 /**
  * Call before a blocking (I/O or long-running) operation.
  *
