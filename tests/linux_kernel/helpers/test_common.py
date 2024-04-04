@@ -4,7 +4,8 @@
 from contextlib import redirect_stdout
 import io
 
-from drgn.helpers.common.memory import identify_address
+from drgn import sizeof
+from drgn.helpers.common.memory import identify_address, print_annotated_memory
 from drgn.helpers.common.stack import print_annotated_stack
 from drgn.helpers.linux.mm import pfn_to_virt
 from tests.linux_kernel import (
@@ -49,6 +50,23 @@ class TestIdentifyAddress(LinuxKernelTestCase):
                             f"slab object: drgn_test_{size}+0x0",
                         )
 
+    @skip_unless_have_test_kmod
+    def test_identify_vmap(self):
+        self.assertTrue(
+            identify_address(self.prog["drgn_test_vmalloc_va"]).startswith("vmap: 0x")
+        )
+
+    @skip_unless_have_test_kmod
+    def test_identify_vmap_stack(self):
+        if not self.prog["drgn_test_vmap_stack_enabled"]:
+            self.skipTest("kernel does not use vmap stacks (CONFIG_VMAP_STACK)")
+        self.assertEqual(
+            identify_address(
+                self.prog, self.prog["drgn_test_kthread"].stack.value_() + 1234
+            ),
+            f"vmap stack: {self.prog['drgn_test_kthread'].pid.value_()} (drgn_test_kthre) +0x4d2",
+        )
+
     @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
     def test_identify_unrecognized(self):
@@ -61,6 +79,19 @@ class TestIdentifyAddress(LinuxKernelTestCase):
             self.assertIsNone(identify_address(self.prog, start_addr - 1))
         self.assertIsNone(identify_address(self.prog, end_addr))
         self.assertIsNone(identify_address(self.prog, self.prog["drgn_test_va"]))
+
+
+class TestPrintAnnotatedMemory(LinuxKernelTestCase):
+    @skip_unless_have_test_kmod
+    def test_print_annotated_memory(self):
+        f = io.StringIO()
+        with redirect_stdout(f):
+            print_annotated_memory(
+                self.prog,
+                self.prog["drgn_test_small_slab_objects"].address_,
+                sizeof(self.prog["drgn_test_small_slab_objects"]),
+            )
+        self.assertIn("slab object: drgn_test_small+0x0", f.getvalue())
 
 
 class TestPrintAnnotatedStack(LinuxKernelTestCase):
