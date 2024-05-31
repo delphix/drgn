@@ -10,6 +10,7 @@
 #include "../string_builder.h"
 #include "../util.h"
 #include "../vector.h"
+#include "../linux_kernel.h"
 
 DEFINE_HASH_SET_FUNCTIONS(pyobjectp_set, ptr_key_hash_pair, scalar_key_eq);
 
@@ -174,6 +175,8 @@ int Program_hold_object(Program *prog, PyObject *obj)
 	if (ret > 0) {
 		Py_INCREF(obj);
 		ret = 0;
+	} else if (ret < 0) {
+		PyErr_NoMemory();
 	}
 	return ret;
 }
@@ -238,10 +241,13 @@ static void drgnpy_end_blocking(struct drgn_program *prog, void *arg, void *stat
 static Program *Program_new(PyTypeObject *subtype, PyObject *args,
 			    PyObject *kwds)
 {
-	static char *keywords[] = { "platform", NULL };
+	static char *keywords[] = { "platform", "vmcoreinfo", NULL };
 	PyObject *platform_obj = NULL;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O:Program", keywords,
-					 &platform_obj))
+	const char *vmcoreinfo = NULL;
+	Py_ssize_t vmcoreinfo_size;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O$z#:Program", keywords,
+					 &platform_obj, &vmcoreinfo,
+					 &vmcoreinfo_size))
 		return NULL;
 
 	struct drgn_platform *platform;
@@ -267,6 +273,12 @@ static Program *Program_new(PyTypeObject *subtype, PyObject *args,
 	drgn_program_init(&prog->prog, platform);
 	drgn_program_set_blocking_callback(&prog->prog, drgnpy_begin_blocking,
 					   drgnpy_end_blocking, NULL);
+	if (vmcoreinfo) {
+		struct drgn_error *err = drgn_program_parse_vmcoreinfo(
+			&prog->prog, vmcoreinfo, vmcoreinfo_size);
+		if (err)
+			return set_drgn_error(err);
+	}
 	if (Program_init_logging(prog))
 		return NULL;
 	return_ptr(prog);
@@ -465,9 +477,9 @@ static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
 	if (!flags_obj)
 		return drgn_error_from_python();
 	_cleanup_pydecref_ PyObject *obj =
-		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOs",
-				      PyTuple_GET_ITEM(arg, 0), name_obj,
-				      flags_obj, filename);
+		PyObject_CallFunction(arg, "OOOs",
+				      container_of(drgn_object_program(ret), Program, prog),
+				      name_obj, flags_obj, filename);
 	if (!obj)
 		return drgn_error_from_python();
 	if (obj == Py_None)
@@ -561,14 +573,11 @@ static PyObject *Program_add_object_finder(Program *self, PyObject *args,
 		return NULL;
 	}
 
-	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
-	if (!arg)
-		return NULL;
-	if (Program_hold_object(self, arg))
+	if (Program_hold_object(self, fn))
 		return NULL;
 
 	err = drgn_program_add_object_finder(&self->prog, py_object_find_fn,
-					     arg);
+					     fn);
 	if (err)
 		return set_drgn_error(err);
 	Py_RETURN_NONE;
