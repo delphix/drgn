@@ -7,6 +7,7 @@ libdrgn bindings
 Don't use this module directly. Instead, use the drgn package.
 """
 
+import collections.abc
 import enum
 import os
 import sys
@@ -21,6 +22,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
     overload,
@@ -435,20 +437,168 @@ class Program:
             another :ref:`buffer <python:binaryseq>` type.
         """
         ...
-    def add_type_finder(
-        self, fn: Callable[[TypeKind, str, Optional[str]], Optional[Type]]
+    def register_type_finder(
+        self,
+        name: str,
+        fn: Callable[[Program, TypeKindSet, str, Optional[str]], Optional[Type]],
+        *,
+        enable_index: Optional[int] = None,
     ) -> None:
         """
         Register a callback for finding types in the program.
 
-        Callbacks are called in reverse order of the order they were added
-        until the type is found. So, more recently added callbacks take
-        precedence.
+        This does not enable the finder unless *enable_index* is given.
 
-        :param fn: Callable taking a :class:`TypeKind`, name, and filename:
-            ``(kind, name, filename)``. The filename should be matched with
-            :func:`filename_matches()`. This should return a :class:`Type`
-            or ``None`` if not found.
+        :param name: Finder name.
+        :param fn: Callable taking the program, a :class:`TypeKindSet`, name,
+            and filename: ``(prog, kinds, name, filename)``. The filename
+            should be matched with :func:`filename_matches()`. This should
+            return a :class:`Type` or ``None`` if not found.
+        :param enable_index: Insert the finder into the list of enabled type
+            finders at the given index. If -1 or greater than the number of
+            enabled finders, insert it at the end. If ``None`` or not given,
+            don't enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+    def registered_type_finders(self) -> Set[str]:
+        """Return the names of all registered type finders."""
+        ...
+    def set_enabled_type_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled type finders.
+
+        Finders are called in the same order as the list until a type is found.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+    def enabled_type_finders(self) -> List[str]:
+        """Return the names of enabled type finders, in order."""
+        ...
+    def register_object_finder(
+        self,
+        name: str,
+        fn: Callable[[Program, str, FindObjectFlags, Optional[str]], Optional[Object]],
+        *,
+        enable_index: Optional[int] = None,
+    ) -> None:
+        """
+        Register a callback for finding objects in the program.
+
+        This does not enable the finder unless *enable_index* is given.
+
+        :param name: Finder name.
+        :param fn: Callable taking the program, name, :class:`FindObjectFlags`,
+            and filename: ``(prog, name, flags, filename)``. The filename
+            should be matched with :func:`filename_matches()`. This should
+            return an :class:`Object` or ``None`` if not found.
+        :param enable_index: Insert the finder into the list of enabled object
+            finders at the given index. If -1 or greater than the number of
+            enabled finders, insert it at the end. If ``None`` or not given,
+            don't enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+    def registered_object_finders(self) -> Set[str]:
+        """Return the names of all registered object finders."""
+        ...
+    def set_enabled_object_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled object finders.
+
+        Finders are called in the same order as the list until an object is found.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+    def enabled_object_finders(self) -> List[str]:
+        """Return the names of enabled object finders, in order."""
+        ...
+    def register_symbol_finder(
+        self,
+        name: str,
+        fn: Callable[[Program, Optional[str], Optional[int], bool], Sequence[Symbol]],
+        *,
+        enable_index: Optional[int] = None,
+    ) -> None:
+        """
+        Register a callback for finding symbols in the program.
+
+        This does not enable the finder unless *enable_index* is given.
+
+        The callback should take four arguments: the program, a *name*, an
+        *address*, and a boolean flag *one*. It should return a list of symbols
+        or an empty list if no matches are found.
+
+        If *name* is not ``None``, then only symbols with that name should be
+        returned. If *address* is not ``None``, then only symbols containing
+        that address should be returned. If neither is ``None``, then the
+        returned symbols must match both. If both are ``None``, then all
+        symbols should be considered matching.
+
+        When the *one* flag is ``False``, the callback should return a list of
+        all matching symbols. When it is ``True``, it should return a list with
+        at most one symbol which is the best match.
+
+        :param name: Finder name.
+        :param fn: Callable taking ``(prog, name, address, one)`` and returning
+            a sequence of :class:`Symbol`\\ s.
+        :param enable_index: Insert the finder into the list of enabled finders
+            at the given index. If -1 or greater than the number of enabled
+            finders, insert it at the end. If ``None`` or not given, don't
+            enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+    def registered_symbol_finders(self) -> Set[str]:
+        """Return the names of all registered symbol finders."""
+        ...
+    def set_enabled_symbol_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled symbol finders.
+
+        Finders are called in the same order as the list. When the *one* flag
+        is set, the search will short-circuit after the first finder which
+        returns a result, and subsequent finders will not be called. Otherwise,
+        all callbacks will be called, and all results will be returned.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+    def enabled_symbol_finders(self) -> List[str]:
+        """Return the names of enabled symbol finders, in order."""
+        ...
+    def add_type_finder(
+        self, fn: Callable[[TypeKind, str, Optional[str]], Optional[Type]]
+    ) -> None:
+        """
+        Deprecated method to register and enable a callback for finding types
+        in the program.
+
+        .. deprecated:: 0.0.27
+            Use :meth:`register_type_finder()` instead.
+
+        The differences from :meth:`register_type_finder()` are:
+
+        1. *fn* is not passed *prog*.
+        2. *fn* is passed a :class:`TypeKind` instead of a
+           :class:`TypeKindSet`. If multiple kinds are being searched for, *fn*
+           will be called multiple times.
+        3. A name for the finder is generated from *fn*.
+        4. The finder is always enabled before any existing finders.
         """
         ...
     def add_object_finder(
@@ -456,43 +606,16 @@ class Program:
         fn: Callable[[Program, str, FindObjectFlags, Optional[str]], Optional[Object]],
     ) -> None:
         """
-        Register a callback for finding objects in the program.
+        Deprecated method to register and enable a callback for finding objects
+        in the program.
 
-        Callbacks are called in reverse order of the order they were added
-        until the object is found. So, more recently added callbacks take
-        precedence.
+        .. deprecated:: 0.0.27
+            Use :meth:`register_object_finder()` instead.
 
-        :param fn: Callable taking a program, name, :class:`FindObjectFlags`,
-            and filename: ``(prog, name, flags, filename)``. The filename
-            should be matched with :func:`filename_matches()`. This should
-            return an :class:`Object` or ``None`` if not found.
-        """
-        ...
-    def add_symbol_finder(
-        self, fn: Callable[[Optional[str], Optional[int], bool], Sequence[Symbol]]
-    ) -> None:
-        """
-        Register a callback for finding symbols in the program.
+        The differences from :meth:`register_object_finder()` are:
 
-        The callback should take three arguments: a search name, a search
-        address, and a boolean flag 'one' indicating whether to return only
-        the single best match. When the 'one' flag is True, the callback should
-        return a list containing at most one :class:`Symbol`. When the flag is
-        False, the callback should return a list of all matching
-        :class:`Symbol`\\ s. Both the name and address arguments are optional.
-        If both are provided, then the result(s) should match both. If neither
-        are provided, the finder should return all available symbols. If no
-        result is found, the return should be an empty list.
-
-        Callbacks are called in reverse order of the order they were added
-        (i.e,, the most recently added callback is called first). When the
-        'one' flag is set, the search will short-circuit after the first
-        finder which returns a result, and subsequent finders will not be
-        called. Otherwise, all callbacks will be called, and all results will be
-        returned.
-
-        :param fn: Callable taking name, address, and 'one' flag, and
-            returning a sequence of :class:`Symbol`\\ s.
+        1. A name for the finder is generated from *fn*.
+        2. The finder is always enabled before any existing finders.
         """
         ...
     def set_core_dump(self, path: Union[Path, int]) -> None:
@@ -2296,6 +2419,26 @@ class TypeKind(enum.Enum):
 
     FUNCTION = ...
     """Function type."""
+
+class TypeKindSet(collections.abc.Set[TypeKind]):
+    """
+    Immutable set of :class:`TypeKind`\\ s.
+
+    >>> kinds = TypeKindSet({TypeKind.STRUCT, TypeKind.CLASS})
+    >>> TypeKind.STRUCT in kinds
+    True
+    >>> TypeKind.INT in kinds
+    False
+    >>> for kind in kinds:
+    ...     print(kind)
+    ...
+    TypeKind.STRUCT
+    TypeKind.CLASS
+    """
+
+    def __contains__(self, __x: object) -> bool: ...
+    def __iter__(self) -> Iterator[TypeKind]: ...
+    def __len__(self) -> int: ...
 
 class PrimitiveType(enum.Enum):
     """A ``PrimitiveType`` represents a primitive type known to drgn."""

@@ -381,6 +381,20 @@ static struct drgn_error *linux_kernel_get_vmemmap(struct drgn_program *prog,
 
 #include "linux_kernel_object_find.inc" // IWYU pragma: keep
 
+struct drgn_error *drgn_program_finish_set_kernel(struct drgn_program *prog)
+{
+	struct drgn_error *err;
+	const struct drgn_object_finder_ops ops = {
+		.find = linux_kernel_object_find,
+	};
+	err = drgn_program_register_object_finder(prog, "linux", &ops, prog, 0);
+	if (err)
+		return err;
+	if (!prog->lang)
+		prog->lang = &drgn_language_c;
+	return NULL;
+}
+
 struct kernel_module_iterator {
 	char *name;
 	uint64_t start, end;

@@ -385,10 +385,60 @@ static PyObject *Program_add_memory_segment(Program *self, PyObject *args,
 	Py_RETURN_NONE;
 }
 
+static inline struct drgn_error *
+py_type_find_fn_common(PyObject *type_obj, void *arg,
+		       struct drgn_qualified_type *ret)
+{
+	if (!PyObject_TypeCheck(type_obj, &DrgnType_type)) {
+		PyErr_SetString(PyExc_TypeError,
+				"type find callback must return Type or None");
+		return drgn_error_from_python();
+	}
+	// This check is also done in libdrgn, but we need it here because if
+	// the type isn't from this program, then there's no guarantee that it
+	// will remain valid after we decrement its reference count.
+	if (DrgnType_prog((DrgnType *)type_obj)
+	    != (Program *)PyTuple_GET_ITEM(arg, 0)) {
+		PyErr_SetString(PyExc_ValueError,
+				"type find callback returned type from wrong program");
+		return drgn_error_from_python();
+	}
+	ret->type = ((DrgnType *)type_obj)->type;
+	ret->qualifiers = ((DrgnType *)type_obj)->qualifiers;
+	return NULL;
+}
+
 static struct drgn_error *py_type_find_fn(uint64_t kinds, const char *name,
 					  size_t name_len, const char *filename,
 					  void *arg,
 					  struct drgn_qualified_type *ret)
+{
+	PyGILState_guard();
+
+	_cleanup_pydecref_ PyObject *name_obj =
+		PyUnicode_FromStringAndSize(name, name_len);
+	if (!name_obj)
+		return drgn_error_from_python();
+
+	_cleanup_pydecref_ PyObject *kinds_obj = TypeKindSet_wrap(kinds);
+	if (!kinds_obj)
+		return drgn_error_from_python();
+	_cleanup_pydecref_ PyObject *type_obj =
+		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOs",
+				      PyTuple_GET_ITEM(arg, 0), kinds_obj,
+				      name_obj, filename);
+	if (!type_obj)
+		return drgn_error_from_python();
+	if (type_obj == Py_None)
+		return &drgn_not_found;
+	return py_type_find_fn_common(type_obj, arg, ret);
+}
+
+// Old version for add_type_finder().
+static struct drgn_error *py_type_find_fn_old(uint64_t kinds, const char *name,
+					      size_t name_len,
+					      const char *filename, void *arg,
+					      struct drgn_qualified_type *ret)
 {
 	PyGILState_guard();
 
@@ -411,54 +461,9 @@ static struct drgn_error *py_type_find_fn(uint64_t kinds, const char *name,
 			return drgn_error_from_python();
 		if (type_obj == Py_None)
 			continue;
-		if (!PyObject_TypeCheck(type_obj, &DrgnType_type)) {
-			PyErr_SetString(PyExc_TypeError,
-					"type find callback must return Type or None");
-			return drgn_error_from_python();
-		}
-		// This check is also done in libdrgn, but we need it here
-		// because if the type isn't from this program, then there's no
-		// guarantee that it will remain valid after we decrement its
-		// reference count.
-		if (DrgnType_prog((DrgnType *)type_obj)
-		    != (Program *)PyTuple_GET_ITEM(arg, 0)) {
-			PyErr_SetString(PyExc_ValueError,
-					"type find callback returned type from wrong program");
-			return drgn_error_from_python();
-		}
-		ret->type = ((DrgnType *)type_obj)->type;
-		ret->qualifiers = ((DrgnType *)type_obj)->qualifiers;
-		return NULL;
+		return py_type_find_fn_common(type_obj, arg, ret);
 	}
 	return &drgn_not_found;
-}
-
-static PyObject *Program_add_type_finder(Program *self, PyObject *args,
-					 PyObject *kwds)
-{
-	struct drgn_error *err;
-
-	static char *keywords[] = {"fn", NULL};
-	PyObject *fn;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_type_finder",
-					 keywords, &fn))
-	    return NULL;
-
-	if (!PyCallable_Check(fn)) {
-		PyErr_SetString(PyExc_TypeError, "fn must be callable");
-		return NULL;
-	}
-
-	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
-	if (!arg)
-		return NULL;
-	if (Program_hold_object(self, arg))
-		return NULL;
-
-	err = drgn_program_add_type_finder(&self->prog, py_type_find_fn, arg);
-	if (err)
-		return set_drgn_error(err);
-	Py_RETURN_NONE;
 }
 
 static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
@@ -493,9 +498,10 @@ static struct drgn_error *py_object_find_fn(const char *name, size_t name_len,
 	return drgn_object_copy(ret, &((DrgnObject *)obj)->obj);
 }
 
-static struct drgn_error *py_symbol_find_fn(const char *name, uint64_t addr,
-					    enum drgn_find_symbol_flags flags,
-					    void *data, struct drgn_symbol_result_builder *builder)
+static struct drgn_error *
+py_symbol_find_fn(const char *name, uint64_t addr,
+		  enum drgn_find_symbol_flags flags, void *arg,
+		  struct drgn_symbol_result_builder *builder)
 {
 	PyGILState_guard();
 
@@ -521,8 +527,10 @@ static struct drgn_error *py_symbol_find_fn(const char *name, uint64_t addr,
 
 	_cleanup_pydecref_ PyObject *one_obj = PyBool_FromLong(flags & DRGN_FIND_SYMBOL_ONE);
 
-	_cleanup_pydecref_ PyObject *tmp = PyObject_CallFunction(data, "OOO", name_obj,
-								 address_obj, one_obj);
+	_cleanup_pydecref_ PyObject *tmp =
+		PyObject_CallFunction(PyTuple_GET_ITEM(arg, 1), "OOOO",
+				      PyTuple_GET_ITEM(arg, 0), name_obj,
+				      address_obj, one_obj);
 	if (!tmp)
 		return drgn_error_from_python();
 
@@ -557,6 +565,210 @@ static struct drgn_error *py_symbol_find_fn(const char *name, uint64_t addr,
 	return NULL;
 }
 
+#define type_finder_arg(self, fn)						\
+	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);	\
+	if (!arg)								\
+		return NULL;
+#define object_finder_arg(self, fn) PyObject *arg = fn;
+#define symbol_finder_arg type_finder_arg
+
+#define DEFINE_PROGRAM_FINDER_METHODS(which)					\
+static PyObject *Program_register_##which##_finder(Program *self,		\
+						   PyObject *args,		\
+						   PyObject *kwds)		\
+{										\
+	struct drgn_error *err;							\
+	static char *keywords[] = {"name", "fn", "enable_index", NULL};		\
+	const char *name;							\
+	PyObject *fn;								\
+	PyObject *enable_index_obj = Py_None;					\
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,				\
+					 "sO|$O:register_" #which "_finder",	\
+					 keywords, &name, &fn,			\
+					 &enable_index_obj))			\
+		return NULL;							\
+										\
+	if (!PyCallable_Check(fn)) {						\
+		PyErr_SetString(PyExc_TypeError, "fn must be callable");	\
+		return NULL;							\
+	}									\
+										\
+	size_t enable_index;							\
+	if (enable_index_obj == Py_None) {					\
+		enable_index = DRGN_HANDLER_REGISTER_DONT_ENABLE;		\
+	} else {								\
+		_cleanup_pydecref_ PyObject *negative_one = PyLong_FromLong(-1);\
+		if (!negative_one)						\
+			return NULL;						\
+		int eq = PyObject_RichCompareBool(enable_index_obj,		\
+						  negative_one, Py_EQ);		\
+		if (eq < 0)							\
+			return NULL;						\
+		if (eq) {							\
+			enable_index = DRGN_HANDLER_REGISTER_ENABLE_LAST;	\
+		} else {							\
+			enable_index = PyLong_AsSize_t(enable_index_obj);	\
+			if (enable_index == (size_t)-1 && PyErr_Occurred())	\
+				return NULL;					\
+			/*							\
+			 * If the index happens to be the			\
+			 * DRGN_HANDLER_REGISTER_DONT_ENABLE sentinel		\
+			 * (SIZE_MAX - 1), set it to something else; it's	\
+			 * impossible to have this many finders anyways.	\
+			 */							\
+			if (enable_index == DRGN_HANDLER_REGISTER_DONT_ENABLE)	\
+				enable_index--;					\
+		}								\
+	}									\
+										\
+	which##_finder_arg(self, fn)						\
+	if (!Program_hold_reserve(self, 1))					\
+		return NULL;							\
+	const struct drgn_##which##_finder_ops ops = {				\
+		.find = py_##which##_find_fn,					\
+	};									\
+	err = drgn_program_register_##which##_finder(&self->prog, name, &ops,	\
+						     arg, enable_index);	\
+	if (err)								\
+		return set_drgn_error(err);					\
+	Program_hold_object(self, arg);						\
+	Py_RETURN_NONE;								\
+										\
+}										\
+										\
+static PyObject *Program_registered_##which##_finders(Program *self)		\
+{										\
+	struct drgn_error *err;							\
+	_cleanup_free_ const char **names = NULL;				\
+	size_t count;								\
+	err = drgn_program_registered_##which##_finders(&self->prog, &names,	\
+							&count);		\
+	if (err)								\
+		return set_drgn_error(err);					\
+	_cleanup_pydecref_ PyObject *res = PySet_New(NULL);			\
+	if (!res)								\
+		return NULL;							\
+	for (size_t i = 0; i < count; i++) {					\
+		_cleanup_pydecref_ PyObject *name =				\
+			PyUnicode_FromString(names[i]);				\
+		if (!name)							\
+			return NULL;						\
+		if (PySet_Add(res, name))					\
+			return NULL;						\
+	}									\
+	return_ptr(res);							\
+}										\
+										\
+static PyObject *Program_set_enabled_##which##_finders(Program *self,		\
+						       PyObject *args,		\
+						       PyObject *kwds)		\
+{										\
+	struct drgn_error *err;							\
+	static char *keywords[] = {"names", NULL};				\
+	PyObject *names_obj;							\
+	if (!PyArg_ParseTupleAndKeywords(args, kwds,				\
+					 "O:set_enabled_" #which "_finders",	\
+					 keywords, &names_obj))			\
+		return NULL;							\
+	_cleanup_pydecref_ PyObject *names_seq =				\
+		PySequence_Fast(names_obj, "names must be sequence");		\
+	if (!names_seq)								\
+		return NULL;							\
+	size_t count = PySequence_Fast_GET_SIZE(names_seq);			\
+	_cleanup_free_ const char **names =					\
+		malloc_array(count, sizeof(names[0]));				\
+	if (!names)								\
+		return NULL;							\
+	for (size_t i = 0; i < count; i++) {					\
+		names[i] = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(names_seq, i));\
+		if (!names[i])							\
+			return NULL;						\
+	}									\
+	err = drgn_program_set_enabled_##which##_finders(&self->prog, names,	\
+							 count);		\
+	if (err)								\
+		return set_drgn_error(err);					\
+	Py_RETURN_NONE;								\
+}										\
+										\
+static PyObject *Program_enabled_##which##_finders(Program *self)		\
+{										\
+	struct drgn_error *err;							\
+	_cleanup_free_ const char **names = NULL;				\
+	size_t count;								\
+	err = drgn_program_enabled_##which##_finders(&self->prog, &names,	\
+						     &count);			\
+	if (err)								\
+		return set_drgn_error(err);					\
+	_cleanup_pydecref_ PyObject *res = PyList_New(count);			\
+	if (!res)								\
+		return NULL;							\
+	for (size_t i = 0; i < count; i++) {					\
+		PyObject *name = PyUnicode_FromString(names[i]);		\
+		if (!name)							\
+			return NULL;						\
+		PyList_SET_ITEM(res, i, name);					\
+	}									\
+	return_ptr(res);							\
+}
+
+DEFINE_PROGRAM_FINDER_METHODS(type)
+DEFINE_PROGRAM_FINDER_METHODS(object)
+DEFINE_PROGRAM_FINDER_METHODS(symbol)
+
+static PyObject *deprecated_finder_name_obj(PyObject *fn)
+{
+	_cleanup_pydecref_ PyObject *name_attr_obj =
+		PyObject_GetAttrString(fn, "__name__");
+	if (name_attr_obj) {
+		return PyUnicode_FromFormat("%S_%lu", name_attr_obj, random());
+	} else if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+		PyErr_Clear();
+		return PyUnicode_FromFormat("%lu", random());
+	} else {
+		return NULL;
+	}
+}
+
+static PyObject *Program_add_type_finder(Program *self, PyObject *args,
+					 PyObject *kwds)
+{
+	struct drgn_error *err;
+	static char *keywords[] = {"fn", NULL};
+	PyObject *fn;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_type_finder",
+					 keywords, &fn))
+	    return NULL;
+
+	if (!PyCallable_Check(fn)) {
+		PyErr_SetString(PyExc_TypeError, "fn must be callable");
+		return NULL;
+	}
+
+	_cleanup_pydecref_ PyObject *arg = Py_BuildValue("OO", self, fn);
+	if (!arg)
+		return NULL;
+
+	_cleanup_pydecref_ PyObject *name_obj = deprecated_finder_name_obj(fn);
+	if (!name_obj)
+		return NULL;
+	const char *name = PyUnicode_AsUTF8(name_obj);
+	if (!name)
+		return NULL;
+
+	if (!Program_hold_reserve(self, 1))
+		return NULL;
+	const struct drgn_type_finder_ops ops = {
+		.find = py_type_find_fn_old,
+	};
+	err = drgn_program_register_type_finder(&self->prog, name, &ops, arg,
+						0);
+	if (err)
+		return set_drgn_error(err);
+	Program_hold_object(self, arg);
+	Py_RETURN_NONE;
+}
+
 static PyObject *Program_add_object_finder(Program *self, PyObject *args,
 					   PyObject *kwds)
 {
@@ -573,41 +785,23 @@ static PyObject *Program_add_object_finder(Program *self, PyObject *args,
 		return NULL;
 	}
 
-	if (Program_hold_object(self, fn))
+	_cleanup_pydecref_ PyObject *name_obj = deprecated_finder_name_obj(fn);
+	if (!name_obj)
+		return NULL;
+	const char *name = PyUnicode_AsUTF8(name_obj);
+	if (!name)
 		return NULL;
 
-	err = drgn_program_add_object_finder(&self->prog, py_object_find_fn,
-					     fn);
+	if (!Program_hold_reserve(self, 1))
+		return NULL;
+	const struct drgn_object_finder_ops ops = {
+		.find = py_object_find_fn,
+	};
+	err = drgn_program_register_object_finder(&self->prog, name, &ops, fn,
+						  0);
 	if (err)
 		return set_drgn_error(err);
-	Py_RETURN_NONE;
-}
-
-static PyObject *Program_add_symbol_finder(Program *self, PyObject *args,
-					   PyObject *kwds)
-{
-	static char *keywords[] = {"fn", NULL};
-	struct drgn_error *err;
-	PyObject *fn;
-	int ret;
-
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O:add_symbol_finder",
-					 keywords, &fn))
-	    return NULL;
-
-	if (!PyCallable_Check(fn)) {
-		PyErr_SetString(PyExc_TypeError, "fn must be callable");
-		return NULL;
-	}
-
-	ret = Program_hold_object(self, fn);
-	if (ret == -1)
-		return NULL;
-
-	err = drgn_program_add_symbol_finder(&self->prog, py_symbol_find_fn,
-					     fn);
-	if (err)
-		return set_drgn_error(err);
+	Program_hold_object(self, fn);
 	Py_RETURN_NONE;
 }
 
@@ -1255,15 +1449,32 @@ static int Program_set_language(Program *self, PyObject *value, void *arg)
 	return 0;
 }
 
+#define PROGRAM_FINDER_METHOD_DEFS(which)					\
+	{"register_" #which "_finder",						\
+	 (PyCFunction)Program_register_##which##_finder,			\
+	 METH_VARARGS | METH_KEYWORDS,						\
+	 drgn_Program_register_##which##_finder_DOC},				\
+	{"registered_" #which "_finders",					\
+	 (PyCFunction)Program_registered_##which##_finders, METH_NOARGS,	\
+	 drgn_Program_registered_##which##_finders_DOC},			\
+	{"set_enabled_" #which "_finders",					\
+	 (PyCFunction)Program_set_enabled_##which##_finders,			\
+	 METH_VARARGS | METH_KEYWORDS,						\
+	 drgn_Program_set_enabled_##which##_finders_DOC},			\
+	{"enabled_" #which "_finders",						\
+	 (PyCFunction)Program_enabled_##which##_finders, METH_NOARGS,		\
+	 drgn_Program_enabled_##which##_finders_DOC}
+
 static PyMethodDef Program_methods[] = {
 	{"add_memory_segment", (PyCFunction)Program_add_memory_segment,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_memory_segment_DOC},
+	PROGRAM_FINDER_METHOD_DEFS(type),
+	PROGRAM_FINDER_METHOD_DEFS(object),
+	PROGRAM_FINDER_METHOD_DEFS(symbol),
 	{"add_type_finder", (PyCFunction)Program_add_type_finder,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_type_finder_DOC},
 	{"add_object_finder", (PyCFunction)Program_add_object_finder,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_object_finder_DOC},
-	{"add_symbol_finder", (PyCFunction)Program_add_symbol_finder,
-	 METH_VARARGS | METH_KEYWORDS, drgn_Program_add_symbol_finder_DOC},
 	{"set_core_dump", (PyCFunction)Program_set_core_dump,
 	 METH_VARARGS | METH_KEYWORDS, drgn_Program_set_core_dump_DOC},
 	{"set_kernel", (PyCFunction)Program_set_kernel, METH_NOARGS,

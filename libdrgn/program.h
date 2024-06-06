@@ -21,15 +21,19 @@
 
 #include "debug_info.h"
 #include "drgn.h"
+#include "handler.h"
 #include "hash_table.h"
 #include "language.h"
 #include "memory_reader.h"
-#include "object_index.h"
 #include "platform.h"
 #include "pp.h"
 #include "symbol.h"
 #include "type.h"
 #include "vector.h"
+
+struct drgn_type_finder;
+struct drgn_object_finder;
+struct drgn_symbol_finder;
 
 /**
  * @defgroup Internals Internals
@@ -79,7 +83,7 @@ struct drgn_program {
 	 * Types.
 	 */
 	/** Callbacks for finding types. */
-	struct drgn_type_finder *type_finders;
+	struct drgn_handler_list type_finders;
 	/** Void type for each language. */
 	struct drgn_type void_types[DRGN_NUM_LANGUAGES];
 	/** Cache of primitive types. */
@@ -108,9 +112,9 @@ struct drgn_program {
 	/*
 	 * Debugging information.
 	 */
-	struct drgn_object_index oindex;
+	struct drgn_handler_list object_finders;
 	struct drgn_debug_info dbinfo;
-	struct drgn_symbol_finder *symbol_finders;
+	struct drgn_handler_list symbol_finders;
 
 	/*
 	 * Program information.
@@ -249,11 +253,6 @@ struct drgn_error *drgn_program_init_kernel(struct drgn_program *prog);
  */
 struct drgn_error *drgn_program_init_pid(struct drgn_program *prog, pid_t pid);
 
-struct drgn_error *
-drgn_program_add_object_finder_impl(struct drgn_program *prog,
-				    struct drgn_object_finder *finder,
-				    drgn_object_find_fn fn, void *arg);
-
 static inline struct drgn_error *
 drgn_program_is_little_endian(struct drgn_program *prog, bool *ret)
 {
@@ -381,9 +380,26 @@ drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
 					     struct drgn_symbol **ret);
 
 struct drgn_error *
-drgn_program_add_symbol_finder_impl(struct drgn_program *prog,
-				    struct drgn_symbol_finder *finder,
-				    drgn_symbol_find_fn fn, void *arg);
+drgn_program_register_type_finder_impl(struct drgn_program *prog,
+				       struct drgn_type_finder *finder,
+				       const char *name,
+				       const struct drgn_type_finder_ops *ops,
+				       void *arg, size_t enable_index);
+
+struct drgn_error *
+drgn_program_register_object_finder_impl(struct drgn_program *prog,
+					 struct drgn_object_finder *finder,
+					 const char *name,
+					 const struct drgn_object_finder_ops *ops,
+					 void *arg, size_t enable_index);
+
+struct drgn_error *
+drgn_program_register_symbol_finder_impl(struct drgn_program *prog,
+					 struct drgn_symbol_finder *finder,
+					 const char *name,
+					 const struct drgn_symbol_finder_ops *ops,
+					 void *arg, size_t enable_index);
+
 /**
  * Call before a blocking (I/O or long-running) operation.
  *

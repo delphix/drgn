@@ -580,41 +580,98 @@ drgn_program_add_memory_segment(struct drgn_program *prog, uint64_t address,
  */
 bool drgn_filename_matches(const char *haystack, const char *needle);
 
-/**
- * Callback for finding a type.
- *
- * @param[in] kinds Kinds of types to find, as a bitmask of bits shifted by @ref
- * drgn_type_kind. E.g., `(1 << DRGN_TYPE_STRUCT) | (1 << DRGN_TYPE_CLASS)`
- * means to find a structure or class type.
- * @param[in] name Name of type (or tag, for structs, unions, and enums). This
- * is @em not null-terminated.
- * @param[in] name_len Length of @p name.
- * @param[in] filename Filename containing the type definition or @c NULL. This
- * should be matched with @ref drgn_filename_matches().
- * @param[in] arg Argument passed to @ref drgn_program_add_type_finder().
- * @param[out] ret Returned type.
- * @return @c NULL on success, non-@c NULL on error. In particular, if the type
- * is not found, this should return &@ref drgn_not_found; any other errors are
- * considered fatal.
- */
-typedef struct drgn_error *
-(*drgn_type_find_fn)(uint64_t kinds, const char *name, size_t name_len,
-		     const char *filename, void *arg,
-		     struct drgn_qualified_type *ret);
+enum {
+	/** Enable a handler after all enabled handlers. */
+	DRGN_HANDLER_REGISTER_ENABLE_LAST = SIZE_MAX,
+	/** Don't enable a handler. */
+	DRGN_HANDLER_REGISTER_DONT_ENABLE = SIZE_MAX - 1,
+};
+
+/** Type finder callback table. */
+struct drgn_type_finder_ops {
+	/**
+	 * Callback to destroy the type finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_type_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding a type.
+	 *
+	 * @param[in] kinds Kinds of types to find, as a bitmask of bits shifted
+	 * by @ref drgn_type_kind. E.g., `(1 << DRGN_TYPE_STRUCT) | (1 <<
+	 * DRGN_TYPE_CLASS)` means to find a structure or class type.
+	 * @param[in] name Name of type (or tag, for structs, unions, and
+	 * enums). This is @em not null-terminated.
+	 * @param[in] name_len Length of @p name.
+	 * @param[in] filename Filename containing the type definition or @c
+	 * NULL. This should be matched with @ref drgn_filename_matches().
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_type_finder().
+	 * @param[out] ret Returned type.
+	 * @return @c NULL on success, non-@c NULL on error. In particular, if
+	 * the type is not found, this should return &@ref drgn_not_found; any
+	 * other errors are considered fatal.
+	 */
+	struct drgn_error *(*find)(uint64_t kinds, const char *name,
+				   size_t name_len, const char *filename,
+				   void *arg, struct drgn_qualified_type *ret);
+};
 
 /**
  * Register a type finding callback.
  *
- * Callbacks are called in reverse order of the order they were added until the
- * type is found. So, more recently added callbacks take precedence.
- *
- * @param[in] fn The callback.
- * @param[in] arg Argument to pass to @p fn.
- * @return @c NULL on success, non-@c NULL on error.
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
  */
 struct drgn_error *
-drgn_program_add_type_finder(struct drgn_program *prog, drgn_type_find_fn fn,
-			     void *arg);
+drgn_program_register_type_finder(struct drgn_program *prog, const char *name,
+				  const struct drgn_type_finder_ops *ops,
+				  void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered type finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_type_finders(struct drgn_program *prog,
+				     const char ***names_ret,
+				     size_t *count_ret);
+
+/**
+ * Set the list of enabled type finders.
+ *
+ * Finders are called in the same order as the list until a type is found.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_type_finders(struct drgn_program *prog,
+				      const char * const *names,
+				      size_t count);
+
+/**
+ * Get the names of enabled type finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *drgn_program_enabled_type_finders(struct drgn_program *prog,
+						     const char ***names_ret,
+						     size_t *count_ret);
 
 /** Flags for @ref drgn_program_find_object(). */
 enum drgn_find_object_flags {
@@ -628,38 +685,90 @@ enum drgn_find_object_flags {
 	DRGN_FIND_OBJECT_ANY = (1 << 3) - 1,
 };
 
-/**
- * Callback for finding an object.
- *
- * @param[in] name Name of object. This is @em not null-terminated.
- * @param[in] name_len Length of @p name.
- * @param[in] filename Filename containing the object definition or @c NULL.
- * This should be matched with @ref drgn_filename_matches().
- * @param[in] flags Flags indicating what kind of object to look for.
- * @param[in] arg Argument passed to @ref drgn_program_add_object_finder().
- * @param[out] ret Returned object. This must only be modified on success.
- * @return @c NULL on success, non-@c NULL on error. In particular, if the
- * object is not found, this should return &@ref drgn_not_found; any other
- * errors are considered fatal.
- */
-typedef struct drgn_error *
-(*drgn_object_find_fn)(const char *name, size_t name_len, const char *filename,
-		       enum drgn_find_object_flags flags, void *arg,
-		       struct drgn_object *ret);
+/** Object finder callback table. */
+struct drgn_object_finder_ops {
+	/**
+	 * Callback to destroy the object finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_object_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding an object.
+	 *
+	 * @param[in] name Name of object. This is @em not null-terminated.
+	 * @param[in] name_len Length of @p name.
+	 * @param[in] filename Filename containing the object definition or @c
+	 * NULL. This should be matched with @ref drgn_filename_matches().
+	 * @param[in] flags Flags indicating what kind of object to look for.
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_object_finder().
+	 * @param[out] ret Returned object. This must only be modified on
+	 * success.
+	 * @return @c NULL on success, non-@c NULL on error. In particular, if
+	 * the object is not found, this should return &@ref drgn_not_found; any
+	 * other errors are considered fatal.
+	 */
+	struct drgn_error *(*find)(const char *name, size_t name_len,
+				   const char *filename,
+				   enum drgn_find_object_flags flags,
+				   void *arg, struct drgn_object *ret);
+};
 
 /**
- * Register a object finding callback.
+ * Register an object finding callback.
  *
- * Callbacks are called in reverse order of the order they were added until the
- * object is found. So, more recently added callbacks take precedence.
- *
- * @param[in] fn The callback.
- * @param[in] arg Argument to pass to @p fn.
- * @return @c NULL on success, non-@c NULL on error.
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
  */
 struct drgn_error *
-drgn_program_add_object_finder(struct drgn_program *prog,
-			       drgn_object_find_fn fn, void *arg);
+drgn_program_register_object_finder(struct drgn_program *prog, const char *name,
+				    const struct drgn_object_finder_ops *ops,
+				    void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered object finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_object_finders(struct drgn_program *prog,
+				       const char ***names_ret,
+				       size_t *count_ret);
+
+/**
+ * Set the list of enabled object finders.
+ *
+ * Finders are called in the same order as the list until a object is found.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_object_finders(struct drgn_program *prog,
+					const char * const *names,
+					size_t count);
+
+/**
+ * Get the names of enabled object finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_enabled_object_finders(struct drgn_program *prog,
+				    const char ***names_ret, size_t *count_ret);
 
 /**
  * Set a @ref drgn_program to a core dump.
@@ -930,7 +1039,7 @@ struct drgn_error *drgn_program_find_symbols_by_address(struct drgn_program *pro
 							struct drgn_symbol ***syms_ret,
 							size_t *count_ret);
 
-/** Flags for @ref drgn_symbol_find_fn() */
+/** Flags for @ref drgn_symbol_finder_ops::find() */
 enum drgn_find_symbol_flags {
 	/** Find symbols whose name matches the name argument */
 	DRGN_FIND_SYMBOL_NAME = 1 << 0,
@@ -940,7 +1049,7 @@ enum drgn_find_symbol_flags {
 	DRGN_FIND_SYMBOL_ONE = 1 << 2,
 };
 
-/** Result builder for @ref drgn_symbol_find_fn() */
+/** Result builder for @ref drgn_symbol_finder_ops::find() */
 struct drgn_symbol_result_builder;
 
 /**
@@ -958,44 +1067,97 @@ drgn_symbol_result_builder_add(struct drgn_symbol_result_builder *builder,
 /** Get the current number of results in a symbol search result. */
 size_t drgn_symbol_result_builder_count(const struct drgn_symbol_result_builder *builder);
 
-/**
- * Callback for finding one or more symbols.
- *
- * The callback should perform a symbol lookup based on the flags given in @a
- * flags. When multiple flags are provided, the effect should be treated as a
- * logical AND. Symbol results should be added to the result builder @a builder,
- * via @ref drgn_symbol_result_builder_add(). When @ref DRGN_FIND_SYMBOL_ONE is
- * set, then the finding function should only return the single best symbol
- * result, and short-circuit return.
- *
- * When no symbol is found, simply do not add any result to the builder. No
- * error should be returned in this case.
- *
- * @param[in] name Name of the symbol to match
- * @param[in] addr Address of the symbol to match
- * @param[in] flags Flags indicating the desired behavior of the search
- * @param[in] arg Argument passed to @ref drgn_program_add_symbol_finder().
- * @param[in] builder Used to build the resulting symbol output
- */
-typedef struct drgn_error *
-(*drgn_symbol_find_fn)(const char *name, uint64_t addr,
-		       enum drgn_find_symbol_flags flags, void *arg,
-		       struct drgn_symbol_result_builder *builder);
+/** Symbol finder callback table. */
+struct drgn_symbol_finder_ops {
+	/**
+	 * Callback to destroy the symbol finder.
+	 *
+	 * This may be @c NULL.
+	 *
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_symbol_finder().
+	 */
+	void (*destroy)(void *arg);
+	/**
+	 * Callback for finding one or more symbols.
+	 *
+	 * The callback should perform a symbol lookup based on the flags given
+	 * in @p flags. When multiple flags are provided, the effect should be
+	 * treated as a logical AND. Symbol results should be added to the
+	 * result builder @p builder, via @ref drgn_symbol_result_builder_add().
+	 * When @ref DRGN_FIND_SYMBOL_ONE is set, then the finding function
+	 * should only return the single best symbol result, and short-circuit
+	 * return.
+	 *
+	 * When no symbol is found, simply do not add any result to the builder.
+	 * No error should be returned in this case.
+	 *
+	 * @param[in] name Name of the symbol to match
+	 * @param[in] addr Address of the symbol to match
+	 * @param[in] flags Flags indicating the desired behavior of the search
+	 * @param[in] arg Argument passed to @ref
+	 * drgn_program_register_symbol_finder().
+	 * @param[in] builder Used to build the resulting symbol output
+	 */
+	struct drgn_error *(*find)(const char *name, uint64_t addr,
+				   enum drgn_find_symbol_flags flags, void *arg,
+				   struct drgn_symbol_result_builder *builder);
+};
 
 /**
  * Register a symbol finding callback.
  *
- * Callbacks are called in reverse order that they were originally added. In
- * case of a search for multiple symbols, then the results of all callbacks are
- * concatenated. If the search is for a single symbol, then the first callback
- * which finds a symbol will short-circuit the search.
- *
- * @param[in] fn Symbol search function
- * @param[in] arg Argument to pass to the callback
+ * @param[in] name Finder name. This is copied.
+ * @param[in] ops Callback table. This is copied.
+ * @param[in] arg Argument to pass to callbacks.
+ * @param[in] enable_index Insert the finder into the list of enabled finders at
+ * the given index. If @ref DRGN_HANDLER_REGISTER_ENABLE_LAST or greater than
+ * the number of enabled finders, insert it at the end. If @ref
+ * DRGN_HANDLER_REGISTER_DONT_ENABLE, don’t enable the finder.
  */
 struct drgn_error *
-drgn_program_add_symbol_finder(struct drgn_program *prog,
-			       drgn_symbol_find_fn fn, void *arg);
+drgn_program_register_symbol_finder(struct drgn_program *prog, const char *name,
+				    const struct drgn_symbol_finder_ops *ops,
+				    void *arg, size_t enable_index);
+
+/**
+ * Get the names of all registered symbol finders.
+ *
+ * The order of the names is arbitrary.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_registered_symbol_finders(struct drgn_program *prog,
+				       const char ***names_ret,
+				       size_t *count_ret);
+
+/**
+ * Set the list of enabled symbol finders.
+ *
+ * Finders are called in the same order as the list. In case of a search for
+ * multiple symbols, then the results of all callbacks are concatenated. If the
+ * search is for a single symbol, then the first callback which finds a symbol
+ * will short-circuit the search.
+ *
+ * @param[in] names Names of finders to enable, in order.
+ * @param[in] count Number of names in @p names.
+ */
+struct drgn_error *
+drgn_program_set_enabled_symbol_finders(struct drgn_program *prog,
+					const char * const *names,
+					size_t count);
+
+/**
+ * Get the names of enabled symbol finders, in order.
+ *
+ * @param[out] names_ret Returned array of names.
+ * @param[out] count_ret Returned number of names in @p names_ret.
+ */
+struct drgn_error *
+drgn_program_enabled_symbol_finders(struct drgn_program *prog,
+				    const char ***names_ret, size_t *count_ret);
 
 /** Element type and size. */
 struct drgn_element_info {

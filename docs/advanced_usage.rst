@@ -82,8 +82,8 @@ program "memory":
     print(drgn.Object(prog, 'struct btrfs_super_block', address=65536))
     run_interactive(prog, banner_func=lambda _: "BTRFS debugger")
 
-:meth:`drgn.Program.add_type_finder()` and
-:meth:`drgn.Program.add_object_finder()` are the equivalent methods for
+:meth:`drgn.Program.register_type_finder()` and
+:meth:`drgn.Program.register_object_finder()` are the equivalent methods for
 plugging in types and objects.
 
 Environment Variables

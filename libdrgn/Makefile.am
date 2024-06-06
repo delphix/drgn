@@ -63,6 +63,8 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 error.c \
 			 error.h \
 			 generics.h \
+			 handler.c \
+			 handler.h \
 			 hash_table.c \
 			 hash_table.h \
 			 helpers.h \
@@ -86,8 +88,6 @@ libdrgnimpl_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			 nstring.h \
 			 object.c \
 			 object.h \
-			 object_index.c \
-			 object_index.h \
 			 openmp.c \
 			 openmp.h \
 			 orc.h \
@@ -170,6 +170,7 @@ _drgn_la_SOURCES = python/constants.c \
 		   python/test.c \
 		   python/thread.c \
 		   python/type.c \
+		   python/type_kind_set.c \
 		   python/util.c
 
 _drgn_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden
