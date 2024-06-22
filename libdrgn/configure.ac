@@ -122,6 +122,8 @@ AS_IF([test "x$enable_compiler_warnings" != xno],
        -Wformat-truncation=2 dnl
        -Wimplicit-fallthrough dnl
        -Wmissing-prototypes dnl
+       -Wpointer-arith dnl
+       -Wshadow dnl
        -Wvla dnl
        -Wno-format-zero-length dnl
        ], [WARN_CFLAGS], [$compiler_flags_test])])
