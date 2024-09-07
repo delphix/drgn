@@ -372,7 +372,7 @@ static struct drgn_error *
 drgn_byte_order_to_little_endian(struct drgn_program *prog,
 				 enum drgn_byte_order byte_order, bool *ret)
 {
-	SWITCH_ENUM_DEFAULT(byte_order,
+	SWITCH_ENUM(byte_order) {
 	case DRGN_BIG_ENDIAN:
 		*ret = false;
 		return NULL;
@@ -384,7 +384,7 @@ drgn_byte_order_to_little_endian(struct drgn_program *prog,
 	default:
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "invalid byte order");
-	)
+	}
 }
 
 struct drgn_error *drgn_int_type_create(struct drgn_program *prog,
@@ -1156,7 +1156,7 @@ LIBDRGN_PUBLIC struct drgn_error *drgn_type_sizeof(struct drgn_type *type,
 					 "cannot get size of incomplete %s type",
 					 drgn_type_kind_spelling[kind]);
 	}
-	SWITCH_ENUM(kind,
+	SWITCH_ENUM(kind) {
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
 	case DRGN_TYPE_FLOAT:
@@ -1186,7 +1186,9 @@ LIBDRGN_PUBLIC struct drgn_error *drgn_type_sizeof(struct drgn_type *type,
 	case DRGN_TYPE_FUNCTION:
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "cannot get size of function type");
-	)
+	default:
+		UNREACHABLE();
+	}
 }
 
 struct drgn_error *drgn_type_bit_size(struct drgn_type *type, uint64_t *ret)
@@ -1220,6 +1222,23 @@ drgn_qualified_type_error(const char *format,
 	if (err)
 		return err;
 	return drgn_error_format(DRGN_ERROR_TYPE, format, name);
+}
+
+struct drgn_error *
+drgn_2_qualified_types_error(const char *format,
+			     struct drgn_qualified_type qualified_type1,
+			     struct drgn_qualified_type qualified_type2)
+{
+	struct drgn_error *err;
+	_cleanup_free_ char *name1 = NULL;
+	err = drgn_format_type_name(qualified_type1, &name1);
+	if (err)
+		return err;
+	_cleanup_free_ char *name2 = NULL;
+	err = drgn_format_type_name(qualified_type2, &name2);
+	if (err)
+		return err;
+	return drgn_error_format(DRGN_ERROR_TYPE, format, name1, name2);
 }
 
 struct drgn_error *drgn_error_incomplete_type(const char *format,
