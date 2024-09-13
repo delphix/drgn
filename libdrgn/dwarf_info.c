@@ -13,6 +13,7 @@
 
 #include "array.h"
 #include "binary_buffer.h"
+#include "binary_search.h"
 #include "cleanup.h"
 #include "debug_info.h" // IWYU pragma: associated
 #include "dwarf_constants.h"
@@ -186,7 +187,6 @@ void drgn_dwarf_info_init(struct drgn_debug_info *dbinfo)
 	drgn_dwarf_index_cu_vector_init(&dbinfo->dwarf.index_cus);
 	drgn_dwarf_type_map_init(&dbinfo->dwarf.types);
 	drgn_dwarf_type_map_init(&dbinfo->dwarf.cant_be_incomplete_array_types);
-	dbinfo->dwarf.depth = 0;
 }
 
 static void drgn_dwarf_index_cu_deinit(struct drgn_dwarf_index_cu *cu)
@@ -1682,24 +1682,20 @@ static inline int drgn_dwarf_index_cu_cmp(const void *_a, const void *_b)
 	return (a > b) - (a < b);
 }
 
-// die_addr must be from an indexed CU.
+// Returns NULL if die_addr is not from an indexed CU.
 static struct drgn_dwarf_index_cu *
 drgn_dwarf_index_find_cu(struct drgn_debug_info *dbinfo, uintptr_t die_addr)
 {
 	struct drgn_dwarf_index_cu *cus =
 		drgn_dwarf_index_cu_vector_begin(&dbinfo->dwarf.index_cus);
-	size_t lo = 0;
-	size_t hi = drgn_dwarf_index_cu_vector_size(&dbinfo->dwarf.index_cus);
-	while (lo < hi) {
-		size_t mid = lo + (hi - lo) / 2;
-		if (die_addr < (uintptr_t)cus[mid].buf)
-			hi = mid;
-		else
-			lo = mid + 1;
-	}
-	// We don't check that the address is within bounds because this can
-	// only be called with a valid address.
-	return &cus[lo - 1];
+	#define less_than_cu_buf(a, b) (*(a) < (uintptr_t)(b)->buf)
+	size_t i = binary_search_gt(cus,
+				    drgn_dwarf_index_cu_vector_size(&dbinfo->dwarf.index_cus),
+				    &die_addr, less_than_cu_buf);
+	#undef less_than_cu_buf
+	if (i == 0 || die_addr - (uintptr_t)cus[i - 1].buf >= cus[i - 1].len)
+		return NULL;
+	return &cus[i - 1];
 }
 
 // If there wasn't already an error, merge src into dst, and return an error if
@@ -3986,6 +3982,35 @@ static int dwarf_flag_integrate(Dwarf_Die *die, unsigned int name, bool *ret)
 	return dwarf_formflag(attr, ret);
 }
 
+struct drgn_error *drgn_dwarf_type_alignment(struct drgn_type *type,
+					     uint64_t *ret)
+{
+	uintptr_t die_addr = drgn_type_die_addr(type);
+	if (!die_addr)
+		return &drgn_not_found;
+	struct drgn_dwarf_index_cu *cu =
+		drgn_dwarf_index_find_cu(&drgn_type_program(type)->dbinfo,
+					 die_addr);
+	if (!cu) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "DIE from unknown DWARF CU");
+	}
+	Dwarf_Die die = {
+		.addr = (void *)die_addr,
+		.cu = cu->libdw_cu,
+	};
+	Dwarf_Attribute attr_mem, *attr;
+	if (!(attr = dwarf_attr_integrate(&die, DW_AT_alignment, &attr_mem)))
+		return &drgn_not_found;
+	Dwarf_Word alignment;
+	if (dwarf_formudata(attr, &alignment) || alignment <= 0) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "invalid DW_AT_alignment");
+	}
+	*ret = alignment;
+	return NULL;
+}
+
 /**
  * Parse a type from a DWARF debugging information entry.
  *
@@ -5942,10 +5967,7 @@ drgn_type_from_dwarf_internal(struct drgn_debug_info *dbinfo,
 			      bool *is_incomplete_array_ret,
 			      struct drgn_qualified_type *ret)
 {
-	if (dbinfo->dwarf.depth >= 1000) {
-		return drgn_error_create(DRGN_ERROR_RECURSION,
-					 "maximum DWARF type parsing depth exceeded");
-	}
+	drgn_recursion_guard(1000, "maximum DWARF type parsing depth exceeded");
 
 	/* If the DIE has a type unit signature, follow it. */
 	Dwarf_Die definition_die;
@@ -6004,7 +6026,6 @@ drgn_type_from_dwarf_internal(struct drgn_debug_info *dbinfo,
 		return err;
 
 	ret->qualifiers = 0;
-	dbinfo->dwarf.depth++;
 	entry.value.is_incomplete_array = false;
 	switch (dwarf_tag(die)) {
 	case DW_TAG_const_type:
@@ -6085,9 +6106,10 @@ drgn_type_from_dwarf_internal(struct drgn_debug_info *dbinfo,
 					dwarf_tag(die));
 		break;
 	}
-	dbinfo->dwarf.depth--;
 	if (err)
 		return err;
+	if (drgn_type_has_die_addr(ret->type))
+		drgn_type_init_die_addr(ret->type, (uintptr_t)die->addr);
 
 	entry.value.type = ret->type;
 	entry.value.qualifiers = ret->qualifiers;
@@ -6728,20 +6750,16 @@ static struct drgn_error *drgn_parse_dwarf_cfi(struct drgn_dwarf_cfi *cfi,
 static struct drgn_dwarf_fde *drgn_find_dwarf_fde(struct drgn_dwarf_cfi *cfi,
 						  uint64_t unbiased_pc)
 {
-	/* Binary search for the containing FDE. */
-	size_t lo = 0, hi = cfi->num_fdes;
-	while (lo < hi) {
-		size_t mid = lo + (hi - lo) / 2;
-		struct drgn_dwarf_fde *fde = &cfi->fdes[mid];
-		if (unbiased_pc < fde->initial_location)
-			hi = mid;
-		else if (unbiased_pc - fde->initial_location >=
-			 fde->address_range)
-			lo = mid + 1;
-		else
-			return fde;
-	}
-	return NULL;
+	#define less_than_initial_location(a, b) (*(a) < (b)->initial_location)
+	size_t i = binary_search_gt(cfi->fdes, cfi->num_fdes, &unbiased_pc,
+				    less_than_initial_location);
+	#undef less_than_initial_location
+	if (i == 0
+	    || (unbiased_pc - cfi->fdes[i - 1].initial_location
+		>= cfi->fdes[i - 1].address_range))
+		return NULL;
+	return &cfi->fdes[i - 1];
+
 }
 
 static struct drgn_error *

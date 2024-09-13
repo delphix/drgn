@@ -21,7 +21,7 @@
 #include <elfutils/libdw.h>
 
 #include "cfi.h"
-#include "drgn.h"
+#include "drgn_internal.h"
 #include "hash_table.h"
 #include "vector.h"
 
@@ -212,9 +212,6 @@ struct drgn_dwarf_info {
 	 * See @ref drgn_type_from_dwarf_internal().
 	 */
 	struct drgn_dwarf_type_map cant_be_incomplete_array_types;
-
-	/** Current parsing recursion depth. */
-	int depth;
 };
 
 void drgn_dwarf_info_init(struct drgn_debug_info *dbinfo);

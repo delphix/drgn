@@ -14,7 +14,7 @@
 
 #include <assert.h>
 
-#include "drgn.h"
+#include "drgn_internal.h"
 #include "handler.h"
 #include "hash_table.h"
 #include "vector.h"
@@ -500,8 +500,8 @@ static inline struct drgn_type *drgn_underlying_type(struct drgn_type *type)
  */
 static inline bool drgn_enum_type_is_signed(struct drgn_type *type)
 {
-	assert(type->_private.type);
-	return drgn_type_is_signed(type->_private.type);
+	assert(type->_type);
+	return drgn_type_is_signed(type->_type);
 }
 
 /**
@@ -555,6 +555,9 @@ bool drgn_type_is_scalar(struct drgn_type *type);
  */
 struct drgn_error *drgn_type_bit_size(struct drgn_type *type,
 				      uint64_t *ret);
+
+struct drgn_error *drgn_dwarf_type_alignment(struct drgn_type *type,
+					     uint64_t *ret);
 
 /** Initialize type-related fields in a @ref drgn_program. */
 void drgn_program_init_types(struct drgn_program *prog);
