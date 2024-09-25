@@ -27,12 +27,10 @@ from drgndoc.visitor import NodeVisitor
 class _PreTransformer(ast.NodeTransformer):
     # Replace string forward references with the parsed expression.
     @overload
-    def _visit_annotation(self, node: ast.expr) -> ast.expr:
-        ...
+    def _visit_annotation(self, node: ast.expr) -> ast.expr: ...
 
     @overload
-    def _visit_annotation(self, node: None) -> None:
-        ...
+    def _visit_annotation(self, node: None) -> None: ...
 
     def _visit_annotation(self, node: Optional[ast.expr]) -> Optional[ast.expr]:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -111,7 +109,10 @@ class Class:
         self.attrs = attrs
 
     def has_docstring(self) -> bool:
-        return self.docstring is not None
+        if self.docstring is not None:
+            return True
+        init = self.attrs.get("__init__")
+        return isinstance(init, Function) and init.has_docstring()
 
 
 class FunctionSignature:
