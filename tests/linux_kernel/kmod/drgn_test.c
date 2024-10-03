@@ -714,7 +714,8 @@ static int drgn_test_slab_init(void)
 
 // kthread for stack trace
 
-static struct task_struct *drgn_test_kthread;
+struct task_struct *drgn_test_kthread;
+struct thread_info *drgn_test_kthread_info;
 
 const int drgn_test_have_stacktrace = IS_ENABLED(CONFIG_STACKTRACE);
 #ifdef CONFIG_STACKTRACE
@@ -722,10 +723,13 @@ unsigned long drgn_test_stack_entries[16];
 unsigned int drgn_test_num_stack_entries;
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 2, 0)
-// Wrapper providing the newer interface and working around the caller of
-// save_stack_trace() not being included in the returned trace.
+// stack_trace_save() was added in Linux kernel commit 214d8ca6ee85
+// ("stacktrace: Provide common infrastructure") (in v5.2). Wrap the old
+// save_stack_trace() interface. save_stack_trace() skips the caller, so we also
+// need the extra frame.
 static noinline unsigned int
-stack_trace_save(unsigned long *store, unsigned int size, unsigned int skipnr)
+drgn_test_stack_trace_save(unsigned long *store, unsigned int size,
+			   unsigned int skipnr)
 {
 	struct stack_trace trace = {
 		.entries = store,
@@ -735,6 +739,20 @@ stack_trace_save(unsigned long *store, unsigned int size, unsigned int skipnr)
 	save_stack_trace(&trace);
 	return trace.nr_entries;
 }
+#elif defined(__arm__) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+// Before Linux kernel commit 9fbed16c3f4f ("ARM: 9259/1: stacktrace: Convert
+// stacktrace to generic ARCH_STACKWALK") (in v6.2), stack_trace_save() skips
+// the caller on Arm. Wrap it in an extra frame.
+static noinline unsigned int
+drgn_test_stack_trace_save(unsigned long *store, unsigned int size,
+			   unsigned int skipnr)
+{
+	unsigned int ret = stack_trace_save(store, size, skipnr);
+	barrier(); // Prevent tail call optimization.
+	return ret;
+}
+#else
+#define drgn_test_stack_trace_save stack_trace_save
 #endif
 #endif
 
@@ -787,6 +805,23 @@ static inline void drgn_test_get_pt_regs(struct pt_regs *regs)
 		"stp	 %1, %0,   [%2, #16 * 16]\n"
 		: "=&r" (tmp1), "=&r" (tmp2)
 		: "r" (regs)
+		: "memory"
+	);
+#elif defined(__arm__)
+	// Copied from crash_setup_regs() in arch/arm/include/asm/kexec.h as of
+	// Linux v6.11.
+	__asm__ __volatile__ (
+		"stmia	%[regs_base], {r0-r12}\n\t"
+		"mov	%[_ARM_sp], sp\n\t"
+		"str	lr, %[_ARM_lr]\n\t"
+		"adr	%[_ARM_pc], 1f\n\t"
+		"mrs	%[_ARM_cpsr], cpsr\n\t"
+	"1:"
+		: [_ARM_pc] "=r" (regs->ARM_pc),
+		  [_ARM_cpsr] "=r" (regs->ARM_cpsr),
+		  [_ARM_sp] "=r" (regs->ARM_sp),
+		  [_ARM_lr] "=o" (regs->ARM_lr)
+		: [regs_base] "r" (&regs->ARM_r0)
 		: "memory"
 	);
 #elif defined(__powerpc64__)
@@ -866,14 +901,21 @@ static void drgn_test_kthread_fn3(void)
 	// Create some local variables for the test cases to use. Use volatile
 	// to make doubly sure that they aren't optimized out.
 	volatile int a, b, c;
+	volatile struct drgn_test_small_slab_object *slab_object;
+
 	a = 1;
 	b = 2;
 	c = 3;
+	slab_object = drgn_test_small_slab_objects[0];
+
+	// Force slab_object onto the stack.
+	__asm__ __volatile__ ("" : : "r" (&slab_object) : "memory");
 
 #ifdef CONFIG_STACKTRACE
-	drgn_test_num_stack_entries = stack_trace_save(drgn_test_stack_entries,
-						       ARRAY_SIZE(drgn_test_stack_entries),
-						       0);
+	drgn_test_num_stack_entries =
+		drgn_test_stack_trace_save(drgn_test_stack_entries,
+					   ARRAY_SIZE(drgn_test_stack_entries),
+					   0);
 #endif
 #ifdef CONFIG_STACKDEPOT
 	stack_depot_init();
@@ -898,6 +940,9 @@ static void drgn_test_kthread_fn3(void)
 		schedule();
 		__set_current_state(TASK_RUNNING);
 	}
+
+	// Make sure slab_object stays on the stack.
+	__asm__ __volatile__ ("" : : "r" (&slab_object) : "memory");
 }
 
  __attribute__((__optimize__("O0")))
@@ -927,6 +972,7 @@ static int drgn_test_stack_trace_init(void)
 					   "drgn_test_kthread");
 	if (!drgn_test_kthread)
 		return -1;
+	drgn_test_kthread_info = task_thread_info(drgn_test_kthread);
 	wake_up_process(drgn_test_kthread);
 	wait_for_completion(&drgn_test_kthread_ready);
 	return kthread_park(drgn_test_kthread);
@@ -1184,6 +1230,7 @@ int drgn_test_function(int x)
 
 // kmodify
 
+#ifdef __x86_64__
 enum drgn_kmodify_enum {
 	DRGN_KMODIFY_ONE = 1,
 	DRGN_KMODIFY_TWO,
@@ -1336,6 +1383,7 @@ DEFINE_KMODIFY_TEST_ARGS(
 		match;
 	})
 )
+#endif
 
 static void drgn_test_exit(void)
 {

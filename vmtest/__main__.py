@@ -94,14 +94,14 @@ class _ProgressPrinter:
 
 def _kernel_version_is_supported(version: str, arch: Architecture) -> bool:
     # /proc/kcore is broken on AArch64 and Arm on older versions.
-    if arch.name in ("aarch64", "arm") and KernelVersion(version) <= KernelVersion(
+    if arch.name in ("aarch64", "arm") and KernelVersion(version) < KernelVersion(
         "4.19"
     ):
         return False
     # Before 4.11, we need an implementation of the
     # linux_kernel_live_direct_mapping_fallback architecture callback in
     # libdrgn, which we only have for x86_64.
-    if KernelVersion(version) <= KernelVersion("4.11") and arch.name != "x86_64":
+    if KernelVersion(version) < KernelVersion("4.11") and arch.name != "x86_64":
         return False
     return True
 
@@ -113,9 +113,8 @@ def _kdump_works(kernel: Kernel) -> bool:
         # http://lists.infradead.org/pipermail/kexec/2020-November/021740.html.
         return KernelVersion(kernel.release) >= KernelVersion("5.10")
     elif kernel.arch.name == "arm":
-        # Without virtual address translation, we can't debug vmcores. Besides,
-        # kexec fails with "Could not find a free area of memory of 0xXXX
-        # bytes...".
+        # /proc/vmcore fails to initialize. See
+        # https://lore.kernel.org/linux-debuggers/ZvxT9EmYkyFuFBH9@telecaster/T/.
         return False
     elif kernel.arch.name == "ppc64":
         # Before 6.1, sysrq-c hangs.

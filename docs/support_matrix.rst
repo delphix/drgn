@@ -7,6 +7,8 @@ Architectures
 Some features in drgn require architecture-specific support. The current status
 of this support is:
 
+.. _architecture support matrix:
+
 .. list-table::
     :header-rows: 1
 
@@ -25,7 +27,7 @@ of this support is:
     * - s390x
       - ✓
       - ✓
-      - ✓ (currently broken on Linux ≥ 6.10)
+      - ✓ (`currently broken on Linux ≥ 6.10 <https://github.com/osandov/drgn/issues/433>`_)
     * - ppc64
       - ✓
       - ✓
@@ -36,8 +38,8 @@ of this support is:
       -
     * - Arm
       - ✓
-      -
-      -
+      - ✓
+      - ✓
     * - RISC-V
       - ✓
       -
@@ -70,7 +72,7 @@ currently fully supported are:
 
 .. Keep this in sync with vmtest/config.py.
 
-- 6.0-6.11
+- 6.0-6.12
 - 5.10-5.19
 - 5.4
 - 4.19

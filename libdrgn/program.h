@@ -140,6 +140,7 @@ struct drgn_program {
 	uint64_t aarch64_insn_pac_mask;
 	bool core_dump_notes_cached;
 	bool prefer_orc_unwinder;
+	const char *core_dump_fname_cached;
 
 	/*
 	 * Linux kernel-specific.
@@ -164,10 +165,14 @@ struct drgn_program {
 		uint64_t mem_section_length;
 		/** VA_BITS on AArch64. */
 		uint64_t va_bits;
+		/** TCR_EL1_T1SZ on AArch64. */
+		uint64_t tcr_el1_t1sz;
 		/** phys_base on x86_64 */
 		uint64_t phys_base;
 		/** Whether 5-level paging was enabled on x86-64. */
 		bool pgtable_l5_enabled;
+		/** Whether LPAE was enabled on Arm. */
+		bool arm_lpae;
 		/** Whether CRASHTIME was in the VMCOREINFO. */
 		bool have_crashtime;
 		/** PAGE_SHIFT of the kernel (derived from PAGE_SIZE). */

@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Dict, Mapping, NamedTuple, Sequence
 
 from _drgn_util.platform import NORMALIZED_MACHINE_NAME
+from util import KernelVersion
 
 # Kernel versions that we run tests on and therefore support. Keep this in sync
 # with docs/support_matrix.rst.
 SUPPORTED_KERNEL_VERSIONS = (
+    "6.12",
     "6.11",
     "6.10",
     "6.9",
@@ -42,7 +44,6 @@ SUPPORTED_KERNEL_VERSIONS = (
 )
 
 KERNEL_ORG_COMPILER_VERSION = "12.2.0"
-VMTEST_KERNEL_VERSION = 30
 
 
 BASE_KCONFIG = """
@@ -271,12 +272,9 @@ ARCHITECTURES = {
             kernel_flavor_configs={
                 "default": """
                     CONFIG_ARM64_4K_PAGES=y
-                    CONFIG_ARM64_VA_BITS_48=y
                 """,
                 "alternative": """
                     CONFIG_ARM64_64K_PAGES=y
-                    CONFIG_ARM64_VA_BITS_52=y
-                    CONFIG_ARM64_PA_BITS_52=y
                 """,
                 "tiny": """
                     CONFIG_ARM64_16K_PAGES=y
@@ -293,8 +291,6 @@ ARCHITECTURES = {
             debian_arch="armhf",
             kernel_config="""
                 CONFIG_NR_CPUS=8
-                CONFIG_HIGHMEM=y
-                CONFIG_ARM_LPAE=n
                 # Debian armhf userspace assumes EABI and VFP.
                 CONFIG_AEABI=y
                 CONFIG_VFP=y
@@ -312,8 +308,20 @@ ARCHITECTURES = {
                 CONFIG_STACKPROTECTOR_PER_TASK=n
             """,
             kernel_flavor_configs={
+                "default": """
+                    CONFIG_VMSPLIT_2G=y
+                    CONFIG_HIGHMEM=n
+                    CONFIG_ARM_LPAE=n
+                """,
                 "alternative": """
+                    CONFIG_VMSPLIT_2G=y
+                    CONFIG_HIGHMEM=n
                     CONFIG_ARM_LPAE=y
+                """,
+                "tiny": """
+                    CONFIG_VMSPLIT_3G=y
+                    CONFIG_HIGHMEM=y
+                    CONFIG_ARM_LPAE=n
                 """,
             },
             kernel_org_compiler_name="arm-linux-gnueabi",
@@ -411,12 +419,23 @@ class Compiler(NamedTuple):
         }
 
 
-def kconfig_localversion(flavor: KernelFlavor) -> str:
-    localversion = f"-vmtest{VMTEST_KERNEL_VERSION}"
-    # The default flavor should be the "latest" version.
-    localversion += ".1" if flavor.name == "default" else ".0"
-    localversion += flavor.name
-    return localversion
+def kconfig_localversion(arch: Architecture, flavor: KernelFlavor, version: str) -> str:
+    vmtest_kernel_version = [
+        # Increment the major version to rebuild every
+        # architecture/flavor/version combination.
+        32,
+        # The minor version makes the default flavor the "latest" version.
+        1 if flavor.name == "default" else 0,
+    ]
+    patch_level = 0
+    # If only specific architecture/flavor/version combinations need to be
+    # rebuilt, conditionally increment the patch level here.
+    if KernelVersion(version) >= KernelVersion("6.12"):
+        patch_level += 1
+    if patch_level:
+        vmtest_kernel_version.append(patch_level)
+
+    return "-vmtest" + ".".join(str(n) for n in vmtest_kernel_version) + flavor.name
 
 
 def kconfig(arch: Architecture, flavor: KernelFlavor) -> str:

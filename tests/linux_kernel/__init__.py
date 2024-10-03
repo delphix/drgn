@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import errno
 from fcntl import ioctl
+import functools
 import mmap
 import os
 from pathlib import Path
@@ -39,6 +40,7 @@ class LinuxKernelTestCase(TestCase):
 
     @classmethod
     def setUpClass(cls):
+        super().setUpClass()
         # We only want to create the Program once for all tests, so it's cached
         # as a class variable (in the base class). If we can't run these tests
         # for whatever reason, we also cache that.
@@ -97,10 +99,10 @@ skip_unless_have_test_disk = unittest.skipUnless(
     "test requires disk to overwrite; set DRGN_TEST_DISK environment variable (e.g., DRGN_TEST_DISK=/dev/vda)",
 )
 
-# Please keep this in sync with docs/support_matrix.rst and the module
-# docstring in drgn/helpers/linux/mm.py.
+# Please keep this in sync with docs/support_matrix.rst.
 HAVE_FULL_MM_SUPPORT = NORMALIZED_MACHINE_NAME in (
     "aarch64",
+    "arm",
     "ppc64",
     "s390x",
     "x86_64",
@@ -111,8 +113,23 @@ skip_unless_have_full_mm_support = unittest.skipUnless(
     f"mm support is not implemented for {NORMALIZED_MACHINE_NAME}",
 )
 
+
+def skip_if_highmem(f):
+    @functools.wraps(f)
+    def wrapper(self, *args, **kwargs):
+        if self.prog["max_low_pfn"] < self.prog["max_pfn"]:
+            self.skipTest("high memory is not supported")
+
+    return wrapper
+
+
+# This is a false positive if CONFIG_HIGHMEM=y and CONFIG_HIGHPTE=n, but it's
+# good enough for now.
+skip_if_highpte = skip_if_highmem
+
+# Please keep this in sync with docs/support_matrix.rst.
 skip_unless_have_stack_tracing = unittest.skipUnless(
-    NORMALIZED_MACHINE_NAME in {"aarch64", "ppc64", "s390x", "x86_64"},
+    NORMALIZED_MACHINE_NAME in {"aarch64", "arm", "ppc64", "s390x", "x86_64"},
     f"stack tracing is not implemented for {NORMALIZED_MACHINE_NAME}",
 )
 
