@@ -825,7 +825,7 @@ static PyObject *Program_set_core_dump(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"path", NULL};
 	struct drgn_error *err;
-	struct path_arg path = { .allow_fd = true };
+	PATH_ARG(path, .allow_fd = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O&:set_core_dump",
 					 keywords, path_converter, &path))
@@ -835,7 +835,6 @@ static PyObject *Program_set_core_dump(Program *self, PyObject *args,
 		err = drgn_program_set_core_dump_fd(&self->prog, path.fd);
 	else
 		err = drgn_program_set_core_dump(&self->prog, path.path);
-	path_cleanup(&path);
 	if (err)
 		return set_drgn_error(err);
 	Py_RETURN_NONE;
@@ -869,6 +868,13 @@ static PyObject *Program_set_pid(Program *self, PyObject *args, PyObject *kwds)
 
 DEFINE_VECTOR(path_arg_vector, struct path_arg);
 
+static void path_arg_vector_cleanup(struct path_arg_vector *path_args)
+{
+	vector_for_each(path_arg_vector, path_arg, path_args)
+		path_cleanup(path_arg);
+	path_arg_vector_deinit(path_args);
+}
+
 static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 					 PyObject *kwds)
 {
@@ -882,19 +888,20 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 					 &load_main))
 		return NULL;
 
-	struct path_arg_vector path_args = VECTOR_INIT;
-	const char **paths = NULL;
+	_cleanup_(path_arg_vector_cleanup)
+		struct path_arg_vector path_args = VECTOR_INIT;
+	_cleanup_free_ const char **paths = NULL;
 	if (paths_obj != Py_None) {
 		_cleanup_pydecref_ PyObject *it = PyObject_GetIter(paths_obj);
 		if (!it)
-			goto out;
+			return NULL;
 
 		Py_ssize_t length_hint = PyObject_LengthHint(paths_obj, 1);
 		if (length_hint == -1)
-			goto out;
+			return NULL;
 		if (!path_arg_vector_reserve(&path_args, length_hint)) {
 			PyErr_NoMemory();
-			goto out;
+			return NULL;
 		}
 
 		for (;;) {
@@ -906,22 +913,22 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 				path_arg_vector_append_entry(&path_args);
 			if (!path_arg) {
 				PyErr_NoMemory();
-				break;
+				return NULL;
 			}
 			memset(path_arg, 0, sizeof(*path_arg));
 			if (!path_converter(item, path_arg)) {
 				path_arg_vector_pop(&path_args);
-				break;
+				return NULL;
 			}
 		}
 		if (PyErr_Occurred())
-			goto out;
+			return NULL;
 
 		paths = malloc_array(path_arg_vector_size(&path_args),
 				     sizeof(*paths));
 		if (!paths) {
 			PyErr_NoMemory();
-			goto out;
+			return NULL;
 		}
 		for (size_t i = 0; i < path_arg_vector_size(&path_args); i++)
 			paths[i] = path_arg_vector_at(&path_args, i)->path;
@@ -929,16 +936,10 @@ static PyObject *Program_load_debug_info(Program *self, PyObject *args,
 	err = drgn_program_load_debug_info(&self->prog, paths,
 					   path_arg_vector_size(&path_args),
 					   load_default, load_main);
-	free(paths);
-	if (err)
+	if (err) {
 		set_drgn_error(err);
-
-out:
-	vector_for_each(path_arg_vector, path_arg, &path_args)
-		path_cleanup(path_arg);
-	path_arg_vector_deinit(&path_args);
-	if (PyErr_Occurred())
 		return NULL;
+	}
 	Py_RETURN_NONE;
 }
 
@@ -1018,31 +1019,29 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 	static char *keywords[] = {"name", "filename", NULL};
 	struct drgn_error *err;
 	PyObject *name_or_type;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O&:type", keywords,
 					 &name_or_type, path_converter,
 					 &filename))
 		return NULL;
 
-	PyObject *ret = NULL;
 	if (PyObject_TypeCheck(name_or_type, &DrgnType_type)) {
 		if (DrgnType_prog((DrgnType *)name_or_type) != self) {
 			PyErr_SetString(PyExc_ValueError,
 					"type is from different program");
-			goto out;
+			return NULL;
 		}
 		Py_INCREF(name_or_type);
-		ret = name_or_type;
-		goto out;
+		return name_or_type;
 	} else if (!PyUnicode_Check(name_or_type)) {
 		PyErr_SetString(PyExc_TypeError,
 				"type() argument 1 must be str or Type");
-		goto out;
+		return NULL;
 	}
 
 	const char *name = PyUnicode_AsUTF8(name_or_type);
 	if (!name)
-		goto out;
+		return NULL;
 	bool clear = set_drgn_in_python();
 	struct drgn_qualified_type qualified_type;
 	err = drgn_program_find_type(&self->prog, name, filename.path,
@@ -1051,12 +1050,9 @@ static PyObject *Program_find_type(Program *self, PyObject *args, PyObject *kwds
 		clear_drgn_in_python();
 	if (err) {
 		set_drgn_error(err);
-		goto out;
+		return NULL;
 	}
-	ret = DrgnType_wrap(qualified_type);
-out:
-	path_cleanup(&filename);
-	return ret;
+	return DrgnType_wrap(qualified_type);
 }
 
 static DrgnObject *Program_find_object(Program *self, const char *name,
@@ -1065,9 +1061,9 @@ static DrgnObject *Program_find_object(Program *self, const char *name,
 {
 	struct drgn_error *err;
 
-	DrgnObject *ret = DrgnObject_alloc(self);
+	_cleanup_pydecref_ DrgnObject *ret = DrgnObject_alloc(self);
 	if (!ret)
-		goto out;
+		return NULL;
 	bool clear = set_drgn_in_python();
 	err = drgn_program_find_object(&self->prog, name, filename->path, flags,
 				       &ret->obj);
@@ -1075,12 +1071,9 @@ static DrgnObject *Program_find_object(Program *self, const char *name,
 		clear_drgn_in_python();
 	if (err) {
 		set_drgn_error(err);
-		Py_DECREF(ret);
-		ret = NULL;
+		return NULL;
 	}
-out:
-	path_cleanup(filename);
-	return ret;
+	return_ptr(ret);
 }
 
 static DrgnObject *Program_object(Program *self, PyObject *args,
@@ -1092,7 +1085,7 @@ static DrgnObject *Program_object(Program *self, PyObject *args,
 		.type = FindObjectFlags_class,
 		.value = DRGN_FIND_OBJECT_ANY,
 	};
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&O&:object", keywords,
 					 &name, enum_converter, &flags,
@@ -1107,7 +1100,7 @@ static DrgnObject *Program_constant(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	const char *name;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:constant", keywords,
 					 &name, path_converter, &filename))
@@ -1122,7 +1115,7 @@ static DrgnObject *Program_function(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	const char *name;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:function", keywords,
 					 &name, path_converter, &filename))
@@ -1137,7 +1130,7 @@ static DrgnObject *Program_variable(Program *self, PyObject *args,
 {
 	static char *keywords[] = {"name", "filename", NULL};
 	const char *name;
-	struct path_arg filename = {.allow_none = true};
+	PATH_ARG(filename, .allow_none = true);
 
 	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s|O&:variable", keywords,
 					 &name, path_converter, &filename))
@@ -1598,7 +1591,7 @@ Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds)
 {
 	static char *keywords[] = {"path", NULL};
 	struct drgn_error *err;
-	struct path_arg path = { .allow_fd = true };
+	PATH_ARG(path, .allow_fd = true);
 	if (!PyArg_ParseTupleAndKeywords(args, kwds,
 					 "O&:program_from_core_dump", keywords,
 					 path_converter, &path))
@@ -1606,16 +1599,13 @@ Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds)
 
 	_cleanup_pydecref_ Program *prog =
 		(Program *)PyObject_CallObject((PyObject *)&Program_type, NULL);
-	if (!prog) {
-		path_cleanup(&path);
+	if (!prog)
 		return NULL;
-	}
 
 	if (path.fd >= 0)
 		err = drgn_program_init_core_dump_fd(&prog->prog, path.fd);
 	else
 		err = drgn_program_init_core_dump(&prog->prog, path.path);
-	path_cleanup(&path);
 	if (err)
 		return set_drgn_error(err);
 	return_ptr(prog);
