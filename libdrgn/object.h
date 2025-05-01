@@ -203,16 +203,18 @@ drgn_object_set_reference_internal(struct drgn_object *res,
  */
 static inline void
 drgn_object_set_absent_internal(struct drgn_object *res,
-				const struct drgn_object_type *type)
+				const struct drgn_object_type *type,
+				enum drgn_absence_reason reason)
 {
 	drgn_object_reinit(res, type, DRGN_OBJECT_ABSENT);
+	res->absence_reason = reason;
 }
 
 struct drgn_error *
-drgn_object_slice_internal(struct drgn_object *res,
-			   const struct drgn_object *obj,
-			   const struct drgn_object_type *type,
-			   uint64_t bit_offset, uint64_t bit_field_size);
+drgn_object_fragment_internal(struct drgn_object *res,
+			      const struct drgn_object *obj,
+			      const struct drgn_object_type *type,
+			      uint64_t bit_offset, uint64_t bit_field_size);
 
 /**
  * Binary operator implementation.

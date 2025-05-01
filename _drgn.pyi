@@ -20,6 +20,8 @@ from typing import (
     Iterator,
     List,
     Mapping,
+    MutableMapping,
+    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -52,6 +54,10 @@ class IntegerLike(Protocol):
 
     Parameters annotated with this type expect an integer which may be given as
     a Python :class:`int` or an :class:`Object` with integer type.
+
+    .. note::
+        This is equivalent to :class:`typing.SupportsIndex` except that it is
+        not runtime-checkable.
     """
 
     def __index__(self) -> int: ...
@@ -691,34 +697,262 @@ class Program:
         """
         ...
 
+    def modules(self) -> Iterator[Module]:
+        """Get an iterator over all of the created modules in the program."""
+
+    def loaded_modules(self) -> Iterator[Tuple[Module, bool]]:
+        """
+        Get an iterator over executables, libraries, etc. that are loaded in
+        the program, creating modules to represent them.
+
+        Modules are created lazily as items are consumed.
+
+        This may automatically load some debugging information necessary to
+        enumerate the modules. Other than that, it does not load debugging
+        information.
+
+        See :meth:`load_debug_info()` for a higher-level interface that does
+        load debugging information.
+
+        :return: Iterator of module and ``True`` if it was newly created
+            or ``False`` if it was previously found.
+        """
+        ...
+
+    def create_loaded_modules(self) -> None:
+        """
+        Determine what executables, libraries, etc. are loaded in the program
+        and create modules to represent them.
+
+        This is a shortcut for exhausting a :meth:`loaded_modules()` iterator.
+        It is equivalent to:
+
+        .. code-block:: python3
+
+            for _ in prog.loaded_modules():
+                pass
+        """
+
+    @overload
+    def main_module(self) -> MainModule:
+        """
+        Find the main module.
+
+        :raises LookupError: if the main module has not been created
+        """
+        ...
+
+    @overload
+    def main_module(self, name: Path, *, create: bool = False) -> MainModule:
+        """
+        Find the main module.
+
+        :param name: :attr:`Module.name`
+        :param create: Create the module if it doesn't exist.
+        :raises LookupError: if the main module has not been created and
+            *create* is ``False``, or if the main module has already been
+            created with a different name
+        """
+        ...
+
+    def shared_library_module(
+        self,
+        name: Path,
+        dynamic_address: IntegerLike,
+        *,
+        create: bool = False,
+    ) -> SharedLibraryModule:
+        """
+        Find a shared library module.
+
+        :param name: :attr:`Module.name`
+        :param dynamic_address: :attr:`SharedLibraryModule.dynamic_address`
+        :param create: Create the module if it doesn't exist.
+        :return: Shared library module with the given name and dynamic address.
+        :raises LookupError: if no matching module has been created and
+            *create* is ``False``
+        """
+        ...
+
+    def vdso_module(
+        self,
+        name: Path,
+        dynamic_address: IntegerLike,
+        *,
+        create: bool = False,
+    ) -> VdsoModule:
+        """
+        Find a vDSO module.
+
+        :param name: :attr:`Module.name`
+        :param dynamic_address: :attr:`VdsoModule.dynamic_address`
+        :param create: Create the module if it doesn't exist.
+        :return: vDSO module with the given name and dynamic address.
+        :raises LookupError: if no matching module has been created and
+            *create* is ``False``
+        """
+        ...
+
+    def relocatable_module(
+        self, name: Path, address: IntegerLike, *, create: bool = False
+    ) -> RelocatableModule:
+        """
+        Find a relocatable module.
+
+        :param name: :attr:`Module.name`
+        :param address: :attr:`RelocatableModule.address`
+        :param create: Create the module if it doesn't exist.
+        :return: Relocatable module with the given name and address.
+        :raises LookupError: if no matching module has been created and
+            *create* is ``False``
+        """
+        ...
+
+    def linux_kernel_loadable_module(
+        self, module_obj: Object, *, create: bool = False
+    ) -> RelocatableModule:
+        """
+        Find a Linux kernel loadable module from a ``struct module *`` object.
+
+        Note that kernel modules are represented as relocatable modules.
+
+        :param module_obj: ``struct module *`` object for the kernel module.
+        :param create: Create the module if it doesn't exist.
+        :return: Relocatable module with a name and address matching
+            *module_obj*.
+        :raises LookupError: if no matching module has been created and
+            *create* is ``False``
+        """
+        ...
+
+    def extra_module(
+        self, name: Path, id: IntegerLike = 0, *, create: bool = False
+    ) -> ExtraModule:
+        """
+        Find an extra module.
+
+        :param name: :attr:`Module.name`
+        :param id: :attr:`ExtraModule.id`
+        :param create: Create the module if it doesn't exist.
+        :return: Extra module with the given name and ID number.
+        :raises LookupError: if no matching module has been created and
+            *create* is ``False``
+        """
+        ...
+
+    def module(self, __address_or_name: Union[IntegerLike, str]) -> Module:
+        """
+        Find the module containing the given address, or the module with the
+        given name.
+
+        Addresses are matched based on :attr:`Module.address_range`.
+
+        If there are multiple modules with the given name, one is returned
+        arbitrarily.
+
+        :param address_or_name: Address or name to search for.
+        :raises LookupError: if no module contains the given address or has the
+            given name
+        """
+        ...
+
+    def register_debug_info_finder(
+        self,
+        name: str,
+        fn: Callable[[Sequence[Module]], None],
+        *,
+        enable_index: Optional[int] = None,
+    ) -> None:
+        """
+        Register a callback for finding debugging information.
+
+        This does not enable the finder unless *enable_index* is given.
+
+        :param name: Finder name.
+        :param fn: Callable taking a list of :class:`Module`\\ s that want
+            debugging information.
+
+            This should check :meth:`Module.wants_loaded_file()` and
+            :meth:`Module.wants_debug_file()` and do one of the following for
+            each module:
+
+            * Obtain and/or locate a file wanted by the module and call
+              :meth:`Module.try_file()`.
+            * Install files for a later finder to use.
+            * Set :attr:`Module.loaded_file_status` or
+              :attr:`Module.debug_file_status` to
+              :attr:`ModuleFileStatus.DONT_NEED` if the finder believes that
+              the file is not needed.
+            * Ignore it, for example if the finder doesn't know how to find the
+              wanted files for the module.
+        :param enable_index: Insert the finder into the list of enabled object
+            finders at the given index. If -1 or greater than the number of
+            enabled finders, insert it at the end. If ``None`` or not given,
+            don't enable the finder.
+        :raises ValueError: if there is already a finder with the given name
+        """
+        ...
+
+    def registered_debug_info_finders(self) -> Set[str]:
+        """Return the names of all registered debugging information finders."""
+        ...
+
+    def set_enabled_debug_info_finders(self, names: Sequence[str]) -> None:
+        """
+        Set the list of enabled debugging information finders.
+
+        Finders are called in the same order as the list until all wanted files
+        have been found.
+
+        Finders that are not in the list are not called.
+
+        :param names: Names of finders to enable, in order.
+        :raises ValueError: if no finder has a given name or the same name is
+            given more than once
+        """
+        ...
+
+    def enabled_debug_info_finders(self) -> List[str]:
+        """
+        Return the names of enabled debugging information finders, in order.
+        """
+        ...
+    debug_info_options: DebugInfoOptions
+    """Default options for debugging information searches."""
+
     def load_debug_info(
         self,
-        paths: Optional[Iterable[Path]] = None,
+        paths: Optional[Iterable[Path]] = (),
         default: bool = False,
         main: bool = False,
     ) -> None:
         """
-        Load debugging information for a list of executable or library files.
+        Load debugging information for the given set of files and/or modules.
 
-        Note that this is parallelized, so it is usually faster to load
-        multiple files at once rather than one by one.
+        This determines what executables, libraries, etc. are loaded in the
+        program (see :meth:`loaded_modules()`) and tries to load their
+        debugging information from the given *paths*.
 
-        :param paths: Paths of binary files.
-        :param default: Also load debugging information which can automatically
-            be determined from the program.
+        .. note::
+            It is much more efficient to load multiple files at once rather
+            than one by one when possible.
 
-            For the Linux kernel, this tries to load ``vmlinux`` and any loaded
-            kernel modules from a few standard locations.
+        :param paths: Paths of binary files to try.
 
-            For userspace programs, this tries to load the executable and any
-            loaded libraries.
+            Files that don't correspond to any loaded modules are ignored. See
+            :class:`ExtraModule` for a way to provide arbitrary debugging
+            information.
+        :param default: Try to load all debugging information for all loaded
+            modules.
+
+            The files in *paths* are tried first before falling back to the
+            enabled debugging information finders.
 
             This implies ``main=True``.
-        :param main: Also load debugging information for the main executable.
+        :param main: Try to load all debugging information for the main module.
 
-            For the Linux kernel, this tries to load ``vmlinux``.
-
-            This is currently ignored for userspace programs.
+            The files in *paths* are tried first before falling back to the
+            enabled debugging information finders.
         :raises MissingDebugInfoError: if debugging information was not
             available for some files; other files with debugging information
             are still loaded
@@ -727,12 +961,40 @@ class Program:
 
     def load_default_debug_info(self) -> None:
         """
-        Load debugging information which can automatically be determined from
-        the program.
+        Load all debugging information that can automatically be determined
+        from the program.
 
-        This is equivalent to ``load_debug_info(None, True)``.
+        This is equivalent to ``load_debug_info(default=True)``.
         """
         ...
+
+    def load_module_debug_info(self, *modules: Module) -> None:
+        """
+        Load debugging information for the given modules using the enabled
+        debugging information finders.
+
+        The files to search for are controlled by
+        :attr:`Module.loaded_file_status` and :attr:`Module.debug_file_status`.
+        """
+        ...
+
+    def find_standard_debug_info(
+        self, modules: Iterable[Module], options: Optional[DebugInfoOptions] = None
+    ) -> None:
+        """
+        Load debugging information for the given modules from the standard
+        locations.
+
+        This is equivalent to the ``standard`` debugging information finder
+        that is registered by default. It is intended for use by other
+        debugging information finders that need a variation of the standard
+        finder (e.g., after installing something or setting specific options).
+
+        :param modules: Modules to load debugging information for.
+        :param options: Options to use when searching for debugging
+            information. If ``None`` or not given, this uses
+            :attr:`self.debug_info_options <debug_info_options>`.
+        """
     cache: Dict[Any, Any]
     """
     Dictionary for caching program metadata.
@@ -1082,6 +1344,181 @@ class FindObjectFlags(enum.Flag):
     ANY = ...
     ""
 
+class DebugInfoOptions:
+    """
+    Options for debugging information searches.
+
+    All of these options can be reassigned.
+    """
+
+    def __init__(
+        self,
+        __options: Optional[DebugInfoOptions] = None,
+        *,
+        directories: Iterable[Path] = ...,
+        try_module_name: bool = ...,
+        try_build_id: bool = ...,
+        try_debug_link: bool = ...,
+        try_procfs: bool = ...,
+        try_embedded_vdso: bool = ...,
+        try_reuse: bool = ...,
+        try_supplementary: bool = ...,
+        kernel_directories: Iterable[Path] = ...,
+        try_kmod: KmodSearchMethod = ...,
+    ) -> None:
+        """
+        Create a ``DebugInfoOptions``.
+
+        :param options: If given, create a copy of the given options.
+            Otherwise, use the default options.
+
+        Any remaining arguments override the copied/default options.
+        """
+        ...
+    directories: Tuple[str, ...]
+    """
+    Directories to search for debugging information files.
+
+    Defaults to ``("", ".debug", "/usr/lib/debug")``, which should work out of
+    the box on most Linux distributions.
+
+    This controls searches by build ID (see :attr:`try_build_id`) and debug
+    link (see :attr:`try_debug_link`), and for kernel files (see
+    :attr:`kernel_directories`).
+    """
+    try_module_name: bool
+    """
+    If the name of a module resembles a filesystem path, try the file at that
+    path.
+
+    Defaults to ``True``.
+    """
+    try_build_id: bool
+    """
+    Try finding files using build IDs.
+
+    Defaults to ``True``.
+
+    A *build ID* is a unique byte string present in a module's :ref:`loaded
+    file <module-loaded-file>` and :ref:`debug file <module-debug-file>`. If
+    configured correctly, it is also present in core dumps and provides a
+    reliable way to identify the correct files for a module.
+
+    Searches by build ID check under each absolute path in :attr:`directories`
+    for a file named ``.build-id/xx/yyyy`` (for loaded files) or
+    ``.build-id/xx/yyyy.debug`` (for debug files), where ``xxyyyy`` is the
+    lowercase hexadecimal representation of the build ID.
+    """
+    try_debug_link: bool
+    """
+    Try finding files using debug links.
+
+    Defaults to ``True``.
+
+    A *debug link* is a pointer in a module's :ref:`loaded file
+    <module-loaded-file>` to its :ref:`debug file <module-debug-file>`. It
+    consists of a name and a checksum.
+
+    Searches by debug link check every path in :attr:`directories` for a file
+    with a matching name and checksum. Relative paths in :attr:`directories`
+    are relative to the directory containing the loaded file. An empty path in
+    :attr:`directories` means the directory containing the loaded file.
+    """
+    try_procfs: bool
+    """
+    For local processes, try getting files via the ``proc`` filesystem (e.g.,
+    :manpage:`proc_pid_exe(5)`, :manpage:`proc_pid_map_files(5)`).
+
+    Defaults to ``True``.
+    """
+    try_embedded_vdso: bool
+    """
+    Try reading the vDSO embedded in a process's memory/core dump.
+
+    Defaults to ``True``.
+
+    The entire (stripped) vDSO is included in core dumps, so this is a reliable
+    way to get it.
+    """
+    try_reuse: bool
+    """
+    Try reusing a module's loaded file as its debug file and vice versa.
+
+    Defaults to ``True``.
+    """
+    try_supplementary: bool
+    """
+    Try finding :ref:`supplementary files <module-supplementary-debug-file>`.
+
+    Defaults to ``True``.
+    """
+    kernel_directories: Tuple[str, ...]
+    """
+    Directories to search for the kernel image and loadable kernel modules.
+
+    Defaults to ``("",)``.
+
+    An empty path means to check standard paths (e.g.,
+    :file:`/boot/vmlinux-{release}`, :file:`/lib/modules/{release}`) absolutely
+    and under each absolute path in :attr:`directories`.
+    """
+    try_kmod: KmodSearchMethod
+    """
+    How to search for loadable kernel modules.
+
+    Defaults to :attr:`KmodSearchMethod.DEPMOD_OR_WALK`.
+    """
+
+class KmodSearchMethod(enum.Enum):
+    """
+    Methods of searching for loadable kernel module debugging information.
+
+    In addition to searching by build ID, there are currently two methods of
+    searching for debugging information specific to loadable kernel modules:
+
+    1. Using :manpage:`depmod(8)` metadata. This looks for :command:`depmod`
+       metadata (specifically, :file:`modules.dep.bin`) at the top level of
+       each directory in :attr:`DebugInfoOptions.kernel_directories` (an empty
+       path means :file:`/lib/modules/{release}`). The metadata is used to
+       quickly find the path of each module, which is then checked relative to
+       each directory specified by :attr:`DebugInfoOptions.kernel_directories`.
+
+       This method is faster but typically only applicable to installed
+       kernels.
+    2. Walking kernel directories. This traverses each directory specified by
+       :attr:`DebugInfoOptions.kernel_directories` looking for ``.ko`` files.
+       Module names are matched to filenames before the ``.ko`` extension and
+       with dashes (``-``) replaced with underscores (``_``).
+
+       This method is slower but not limited to installed kernels.
+
+    Debugging information searches can be configured to use one, both, or
+    neither method.
+    """
+
+    NONE = ...
+    """Don't search using kernel module-specific methods."""
+    DEPMOD = ...
+    """Search using :command:`depmod` metadata."""
+    WALK = ...
+    """Search by walking kernel directories."""
+    DEPMOD_OR_WALK = ...
+    """
+    Search using :command:`depmod` metadata, falling back to walking kernel
+    directories only if no :command:`depmod` metadata is found.
+
+    Since :command:`depmod` metadata is expected to be reliable if present,
+    this is the default.
+    """
+    DEPMOD_AND_WALK = ...
+    """
+    Search using :command:`depmod` metadata and by walking kernel directories.
+
+    Unlike :attr:`DEPMOD_OR_WALK`, if :command:`depmod` metadata is found but
+    doesn't result in the desired debugging information, this will still walk
+    kernel directories.
+    """
+
 def get_default_prog() -> Program:
     """
     Get the default program for the current thread.
@@ -1104,6 +1541,396 @@ class NoDefaultProgramError(Exception):
     """
 
     ...
+
+class Module:
+    """
+    A ``Module`` represents an executable, library, or other binary file used
+    by a program. It has several subclasses representing specific types of
+    modules.
+
+    Modules are uniquely identified by their type, name, and a type-specific
+    value.
+
+    Modules have several attributes that are determined automatically whenever
+    possible but may be overridden manually if needed.
+
+    Modules can be assigned files that provide debugging and runtime
+    information:
+
+    * .. _module-loaded-file:
+
+      The "loaded file" is the file containing the executable code, data, etc.
+      used by the program at runtime.
+
+
+    * .. _module-debug-file:
+
+      The "debug file" is the file containing debugging information (e.g.,
+      `DWARF <https://dwarfstd.org/>`_).
+
+      The loaded file and debug file may be the same file, for example, an
+      unstripped binary. They may be different files if the binary was stripped
+      and its debugging information was split into a separate file.
+
+
+    * .. _module-supplementary-debug-file:
+
+      The debug file may depend on a "supplementary debug file" such as one
+      generated by `dwz(1) <https://manpages.debian.org/dwz.1.html>`_. If so,
+      then the supplementary debug file must be found before the debug file can
+      be used.
+    """
+
+    prog: Final[Program]
+    """Program that this module is from."""
+    name: Final[str]
+    """
+    Name of this module.
+
+    Its exact meaning varies by module type.
+    """
+    address_range: Optional[Tuple[int, int]]
+    """
+    Address range where this module is loaded.
+
+    This is a tuple of the start (inclusive) and end (exclusive) addresses. If
+    the module is not loaded in memory, then both are 0. If not known yet, then
+    this is ``None``.
+
+    :meth:`Program.loaded_modules()` sets this automatically from the program
+    state/core dump when possible. Otherwise, for :class:`MainModule`,
+    :class:`SharedLibraryModule`, and :class:`VdsoModule`, it may be set
+    automatically when a file is assigned to the module. It is never set
+    automatically for :class:`ExtraModule`. It can also be set manually.
+    """
+    build_id: Optional[bytes]
+    """
+    Unique byte string (e.g., GNU build ID) identifying files used by this
+    module.
+
+    If not known, then this is ``None``.
+
+    :meth:`Program.loaded_modules()` sets this automatically from the program
+    state/core dump when possible. Otherwise, when a file is assigned to the
+    module, it is set to the file's build ID if it is not already set. It can
+    also be set manually.
+    """
+    object: Object
+    """
+    The object associated with this module.
+
+    For Linux kernel loadable modules, this is the ``struct module *``
+    associated with the kernel module. For other kinds, this is currently an
+    absent object. The object may be set manually.
+    """
+    loaded_file_status: ModuleFileStatus
+    """Status of the module's :ref:`loaded file <module-loaded-file>`."""
+    loaded_file_path: Optional[str]
+    """
+    Absolute path of the module's :ref:`loaded file <module-loaded-file>`, or
+    ``None`` if not known.
+    """
+    loaded_file_bias: Optional[int]
+    """
+    Difference between the load address in the program and addresses in the
+    :ref:`loaded file <module-loaded-file>` itself.
+
+    This is often non-zero due to address space layout randomization (ASLR).
+
+    It is set automatically based on the module type when the loaded file is
+    added:
+
+    * For :class:`MainModule`, it is set based on metadata from the process or
+      core dump (the `auxiliary vector
+      <https://man7.org/linux/man-pages/man3/getauxval.3.html>`_ for userspace
+      programs, the ``VMCOREINFO`` note for the Linux kernel).
+    * For :class:`SharedLibraryModule` and :class:`VdsoModule`, it is set to
+      :attr:`~SharedLibraryModule.dynamic_address` minus the address of the
+      dynamic section in the file.
+    * For :class:`RelocatableModule`, it is set to zero. Addresses are adjusted
+      according to :attr:`~RelocatableModule.section_addresses` instead.
+    * For :class:`ExtraModule`, if :attr:`~Module.address_range` is set before
+      the file is added, then the bias is set to :attr:`address_range[0]
+      <Module.address_range>` (i.e., the module's start address) minus the
+      file's start address. If :attr:`~Module.address_range` is not set when
+      the file is added or is set to ``(0, 0)``, then the bias is set to zero.
+
+    This cannot be set manually.
+    """
+    debug_file_status: ModuleFileStatus
+    """Status of the module's :ref:`debug file <module-debug-file>`."""
+    debug_file_path: Optional[str]
+    """
+    Absolute path of the module's :ref:`debug file <module-debug-file>`, or
+    ``None`` if not known.
+    """
+    debug_file_bias: Optional[int]
+    """
+    Difference between the load address in the program and addresses in the
+    :ref:`debug file <module-debug-file>`.
+
+    See :attr:`loaded_file_bias`.
+    """
+    supplementary_debug_file_kind: Optional[SupplementaryFileKind]
+    """
+    Kind of the module's :ref:`supplementary debug file
+    <module-supplementary-debug-file>`, or ``None`` if not known or not needed.
+    """
+    supplementary_debug_file_path: Optional[str]
+    """
+    Absolute path of the module's :ref:`supplementary debug file
+    <module-supplementary-debug-file>`, or ``None`` if not known or not needed.
+    """
+
+    def wants_loaded_file(self) -> bool:
+        """
+        Return whether this module wants a :ref:`loaded file
+        <module-loaded-file>`.
+
+        This should be preferred over checking :attr:`loaded_file_status`
+        directly since this is future-proof against new status types being
+        added. It is currently equivalent to ``module.loaded_file_status ==
+        ModuleFileStatus.WANT``.
+        """
+        ...
+
+    def wants_debug_file(self) -> bool:
+        """
+        Return whether this module wants a :ref:`debug file
+        <module-debug-file>`.
+
+        This should be preferred over checking :attr:`debug_file_status`
+        directly since this is future-proof against new status types being
+        added. It is currently equivalent to ``module.debug_file_status ==
+        ModuleFileStatus.WANT or module.debug_file_status ==
+        ModuleFileStatus.WANT_SUPPLEMENTARY``.
+        """
+        ...
+
+    def wanted_supplementary_debug_file(self) -> WantedSupplementaryFile:
+        """
+        Return information about the :ref:`supplementary debug file
+        <module-supplementary-debug-file>` that this module currently wants.
+
+        :raises ValueError: if the module doesn't currently want a
+            supplementary debug file (i.e., ``module.debug_file_status !=
+            ModuleFileStatus.WANT_SUPPLEMENTARY``)
+        """
+        ...
+
+    def try_file(
+        self,
+        path: Path,
+        *,
+        fd: int = -1,
+        force: bool = False,
+    ) -> None:
+        """
+        Try to use the given file for this module.
+
+        If the file does not appear to belong to this module, then it is
+        ignored. This currently checks that the file and the module have the
+        same build ID.
+
+        If :attr:`loaded_file_status` is :attr:`~ModuleFileStatus.WANT` and the
+        file is loadable, then it is used as the :ref:`loaded file
+        <module-loaded-file>` and :attr:`loaded_file_status` is set to
+        :attr:`~ModuleFileStatus.HAVE`.
+
+        If :attr:`debug_file_status` is :attr:`~ModuleFileStatus.WANT` or
+        :attr:`~ModuleFileStatus.WANT_SUPPLEMENTARY` and the file provides
+        debugging information, then it is used as the :ref:`debug file
+        <module-debug-file>` and :attr:`debug_file_status` is set to
+        :attr:`~ModuleFileStatus.HAVE`. However, if the file requires a
+        supplementary debug file, then it is not used as the debug file yet and
+        :attr:`debug_file_status` is set to
+        :attr:`~ModuleFileStatus.WANT_SUPPLEMENTARY` instead.
+
+        If :attr:`debug_file_status` is
+        :attr:`~ModuleFileStatus.WANT_SUPPLEMENTARY` and the file matches
+        :meth:`wanted_supplementary_debug_file()`, then the previously found
+        file is used as the debug file, the given file is used as the
+        :ref:`supplementary debug file <module-supplementary-debug-file>`, and
+        :attr:`debug_file_status` is set to :attr:`~ModuleFileStatus.HAVE`.
+
+        The file may be used as both the loaded file and debug file if
+        applicable.
+
+        :param path: Path to file.
+        :param fd: If nonnegative, an open file descriptor referring to the
+            file. This always takes ownership of the file descriptor even if
+            the file is not used or on error, so the caller must not close it.
+        :param force: If ``True``, then don't check whether the file matches
+            the module.
+        """
+        ...
+
+class MainModule(Module):
+    """
+    Main module.
+
+    There is only one main module in a program. For userspace programs, it is
+    the executable, and its name is usually the absolute path of the
+    executable. For the Linux kernel, it is the kernel image, a.k.a.
+    ``vmlinux``, and its name is "kernel".
+    """
+
+class SharedLibraryModule(Module):
+    """
+    Shared library (a.k.a. dynamic library, dynamic shared object, or ``.so``)
+    module.
+
+    Shared libraries are uniquely identified by their name (usually the
+    absolute path of the shared object file) and dynamic address.
+    """
+
+    dynamic_address: Final[int]
+    """Address of the shared object's dynamic section."""
+
+class VdsoModule(Module):
+    """
+    Virtual dynamic shared object (vDSO) module.
+
+    The vDSO is a special shared library automatically loaded into a process by
+    the kernel; see :manpage:`vdso(7)`. It is uniquely identified by its name
+    (the ``SONAME`` field of the shared object file) and dynamic address.
+    """
+
+    dynamic_address: Final[int]
+    """Address of the shared object's dynamic section."""
+
+class RelocatableModule(Module):
+    """
+    Relocatable object module.
+
+    A relocatable object is an object file requiring a linking step to assign
+    section addresses and adjust the file to reference those addresses.
+
+    Linux kernel loadable modules (``.ko`` files) are a special kind of
+    relocatable object.
+
+    For userspace programs, relocatable objects are usually intermediate
+    products of the compilation process (``.o`` files). They are not typically
+    loaded at runtime. However, drgn allows manually defining a relocatable
+    module and assigning its section addresses if needed.
+
+    Relocatable modules are uniquely identified by a name and address.
+    """
+
+    address: Final[int]
+    """
+    Address identifying the module.
+
+    For Linux kernel loadable modules, this is the module base address.
+    """
+
+    section_addresses: MutableMapping[str, int]
+    """
+    Mapping from section names to assigned addresses.
+
+    Once a file has been assigned to the module, this can no longer be
+    modified.
+
+    :meth:`Program.linux_kernel_loadable_module()` and
+    :meth:`Program.loaded_modules()` prepopulate this for Linux kernel loadable
+    modules.
+    """
+
+class ExtraModule(Module):
+    """
+    Module with extra debugging information.
+
+    For advanced use cases, it may be necessary to manually add debugging
+    information that does not fit into any of the categories above.
+    ``ExtraModule`` is intended for these use cases. For example, it can be
+    used to add debugging information from a standalone file that is not in use
+    by a particular program.
+
+    Extra modules are uniquely identified by a name and ID number. Both the
+    name and ID number are arbitrary.
+    """
+
+    id: Final[int]
+    """Arbitrary identification number."""
+
+class ModuleFileStatus(enum.Enum):
+    """
+    Status of a file in a :class:`Module`.
+
+    This is usually used to communicate with debugging information finders; see
+    :meth:`Program.register_debug_info_finder()`.
+    """
+
+    WANT = ...
+    """File has not been found and should be searched for."""
+
+    HAVE = ...
+    """File has already been found and assigned."""
+
+    DONT_WANT = ...
+    """
+    File has not been found, but it should not be searched for.
+
+    :meth:`Module.try_file()` and debugging information finders are required to
+    honor this and will never change it. However, other operations may reset
+    this to :attr:`WANT` when they load debugging information automatically.
+    """
+
+    DONT_NEED = ...
+    """
+    File has not been found and is not needed (e.g., because its debugging
+    information is not applicable or is provided through another mechanism).
+
+    In contrast to :attr:`DONT_WANT`, drgn itself will never change this to
+    :attr:`WANT`.
+    """
+
+    WANT_SUPPLEMENTARY = ...
+    """
+    File has been found, but it requires a supplementary file before it can be
+    used. See :meth:`Module.wanted_supplementary_debug_file()`.
+    """
+
+class WantedSupplementaryFile(NamedTuple):
+    """Information about a wanted supplementary file."""
+
+    kind: SupplementaryFileKind
+    """Kind of supplementary file."""
+    path: str
+    """Path of main file that wants the supplementary file."""
+    supplementary_path: str
+    """
+    Path to the supplementary file.
+
+    This may be absolute or relative to :attr:`path`.
+    """
+    checksum: bytes
+    """
+    Unique identifier of the supplementary file.
+
+    The interpretation depends on :attr:`kind`.
+    """
+
+class SupplementaryFileKind(enum.Enum):
+    """
+    Kind of supplementary file.
+
+    .. note::
+        DWARF 5 supplementary files are not currently supported but may be in
+        the future.
+
+        DWARF package files are not considered supplementary files. They are
+        considered part of the debug file and must have the same path as the
+        debug file plus a ".dwp" extension.
+    """
+
+    GNU_DEBUGALTLINK = ...
+    """
+    GNU-style supplementary debug file referred to by a ``.gnu_debugaltlink``
+    section.
+
+    Its :attr:`~WantedSupplementaryFile.checksum` is the file's GNU build ID.
+    """
 
 class Thread:
     """A thread in a program."""
@@ -1426,6 +2253,7 @@ class Object:
         prog: Program,
         type: Union[str, Type],
         *,
+        absence_reason: AbsenceReason = AbsenceReason.OTHER,
         bit_field_size: Optional[IntegerLike] = None,
     ) -> None:
         """Create an absent object."""
@@ -1436,6 +2264,12 @@ class Object:
     type_: Final[Type]
     """Type of this object."""
 
+    address_: Final[Optional[int]]
+    """
+    Address of this object if it is a reference, ``None`` if it is a value or
+    absent.
+    """
+
     absent_: Final[bool]
     """
     Whether this object is absent.
@@ -1444,10 +2278,11 @@ class Object:
     an invalid address).
     """
 
-    address_: Final[Optional[int]]
+    absence_reason_: Final[Optional[AbsenceReason]]
     """
-    Address of this object if it is a reference, ``None`` if it is a value or
-    absent.
+    Reason that this object is absent.
+
+    This is ``None`` for all values and references.
     """
 
     bit_offset_: Final[Optional[int]]
@@ -1530,6 +2365,20 @@ class Object:
         For enums, this returns an ``int``. For structures and unions, this
         returns a ``dict`` of members. For arrays, this returns a ``list`` of
         values.
+
+        .. note::
+            Helpers that wish to accept an argument that may be an
+            :class:`Object` or an :class:`int` should use
+            :func:`operator.index()` and :class:`IntegerLike` instead:
+
+            .. code-block:: python3
+
+                import operator
+                from drgn import IntegerLike
+
+                def my_helper(i: IntegerLike) -> ...:
+                    value = operator.index(i)  # Returns an int
+                    ...
 
         :raises FaultError: if reading the object causes a bad memory access
         :raises TypeError: if this object has an unreadable type (e.g.,
@@ -1755,6 +2604,16 @@ class Object:
     def __floor__(self) -> int: ...
     def __ceil__(self) -> int: ...
     def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
+
+class AbsenceReason(enum.Enum):
+    """Reason an object is :ref:absent <absent-objects>`."""
+
+    OTHER = ...
+    """Another reason not listed below."""
+    OPTIMIZED_OUT = ...
+    """Object was optimized out by the compiler."""
+    NOT_IMPLEMENTED = ...
+    """Encountered unknown debugging information."""
 
 def NULL(prog: Program, type: Union[str, Type]) -> Object:
     """
@@ -2079,23 +2938,28 @@ class StackFrame:
     (int)1
     """
 
-    name: Final[Optional[str]]
+    name: Final[str]
+    """
+    Name of the function or symbol at this frame.
+
+    This tries to get the best available name for this frame in the following
+    order:
+
+    1. The name of the function in the source code based on debugging
+       information (:attr:`frame.function_name <function_name>`).
+    2. The name of the symbol in the binary (:meth:`frame.symbol().name
+       <symbol>`).
+    3. The program counter in hexadecimal (:attr:`hex(frame.pc) <pc>`).
+    4. The string "???".
+    """
+
+    function_name: Final[Optional[str]]
     """
     Name of the function at this frame, or ``None`` if it could not be
     determined.
 
     The name cannot be determined if debugging information is not available for
-    the function, e.g., because it is implemented in assembly. It may be
-    desirable to use the symbol name or program counter as a fallback:
-
-    .. code-block:: python3
-
-        name = frame.name
-        if name is None:
-            try:
-                name = frame.symbol().name
-            except LookupError:
-                name = hex(frame.pc)
+    the function, e.g., because it is implemented in assembly.
     """
 
     is_inline: Final[bool]
@@ -2778,6 +3642,8 @@ class OutOfBoundsError(Exception):
     ...
 
 _elfutils_version: str
+_have_debuginfod: bool
+_enable_dlopen_debuginfod: bool
 _with_libkdumpfile: bool
 
 def _linux_helper_direct_mapping_offset(__prog: Program) -> int: ...

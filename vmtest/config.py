@@ -13,6 +13,8 @@ from _drgn_util.platform import NORMALIZED_MACHINE_NAME
 # Kernel versions that we run tests on and therefore support. Keep this in sync
 # with docs/support_matrix.rst.
 SUPPORTED_KERNEL_VERSIONS = (
+    "6.15",
+    "6.14",
     "6.13",
     "6.12",
     "6.11",
@@ -106,6 +108,9 @@ CONFIG_MAGIC_SYSRQ=y
 
 # For testing kernel core dumps from QEMU's dump-guest-memory command.
 CONFIG_FW_CFG_SYSFS=y
+
+# kmodify breakpoints need kprobes.
+CONFIG_KPROBES=y
 
 # For BPF tests.
 CONFIG_BPF_SYSCALL=y
@@ -284,7 +289,7 @@ ARCHITECTURES = {
                 """,
             },
             kernel_org_compiler_name="aarch64-linux",
-            qemu_options=("-M", "virt", "-cpu", "cortex-a57"),
+            qemu_options=("-M", "virt", "-cpu", "cortex-a76"),
             qemu_console="ttyAMA0",
         ),
         Architecture(
@@ -426,7 +431,7 @@ def kconfig_localversion(arch: Architecture, flavor: KernelFlavor, version: str)
     vmtest_kernel_version = [
         # Increment the major version to rebuild every
         # architecture/flavor/version combination.
-        34,
+        35,
         # The minor version makes the default flavor the "latest" version.
         1 if flavor.name == "default" else 0,
     ]

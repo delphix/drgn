@@ -69,8 +69,7 @@ struct drgn_error *drgn_handler_list_set_enabled(struct drgn_handler_list *list,
 						 size_t count, const char *what)
 {
 	// Put all of the handlers in a hash table of tagged pointers.
-	_cleanup_(drgn_handler_table_deinit)
-		struct drgn_handler_table table = HASH_TABLE_INIT;
+	HASH_TABLE(drgn_handler_table, table);
 	drgn_handler_list_for_each_registered(handler, list) {
 		uintptr_t entry = (uintptr_t)handler;
 		if (drgn_handler_table_insert(&table, &entry, NULL) < 0)
@@ -106,8 +105,7 @@ struct drgn_error *drgn_handler_list_set_enabled(struct drgn_handler_list *list,
 	}
 
 	// The remaining handlers in the hash table are disabled. Insert them.
-	for (auto it = drgn_handler_table_first(&table); it.entry;
-	     it = drgn_handler_table_next(it)) {
+	hash_table_for_each(drgn_handler_table, it, &table) {
 		struct drgn_handler *handler = (struct drgn_handler *)*it.entry;
 		handler->enabled = false;
 		*handlerp = handler;
@@ -134,4 +132,32 @@ struct drgn_error *drgn_handler_list_enabled(struct drgn_handler_list *list,
 	*names_ret = names;
 	*count_ret = n;
 	return NULL;
+}
+
+bool drgn_handler_list_disable(struct drgn_handler_list *list,
+			       const char *name)
+{
+	// Find an enabled handler with the given name.
+	struct drgn_handler **handlerp = &list->head;
+	struct drgn_handler *handler = list->head;
+	for (;;) {
+		if (!handler || !handler->enabled)
+			return false;
+		if (strcmp(handler->name, name) == 0)
+			break;
+		handlerp = &handler->next;
+		handler = handler->next;
+	}
+
+	// Disable the handler.
+	handler->enabled = false;
+
+	// Move it to the appropriate part of the list (after all enabled
+	// handlers).
+	*handlerp = handler->next;
+	while (*handlerp && (*handlerp)->enabled)
+		handlerp = &(*handlerp)->next;
+	handler->next = *handlerp;
+	*handlerp = handler;
+	return true;
 }
