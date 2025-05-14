@@ -45,6 +45,9 @@ class _ProgressPrinter:
         self._passed: Dict[str, List[str]] = {}
         self._failed: Dict[str, List[str]] = {}
 
+    def succeeded(self) -> bool:
+        return not self._failed
+
     def _green(self, s: str) -> str:
         if self._color:
             return "\033[32m" + s + "\033[0m"
@@ -331,7 +334,7 @@ chroot "$1" sh -c 'cd /mnt && pytest -v --ignore=tests/linux_kernel'
             else:
                 python_executable = "/usr/bin/python3"
                 # Skip excessively slow tests when emulating.
-                tests_expression = "-k 'not test_slab_cache_for_each_allocated_object'"
+                tests_expression = "-k 'not test_slab_cache_for_each_allocated_object and not test_mtree_load_three_levels'"
 
             if _kdump_works(kernel):
                 kdump_command = """\
@@ -374,3 +377,4 @@ fi
             if in_github_actions:
                 shutil.rmtree(kernel.path)
             progress.update(kernel.arch.name, kernel.release, status == 0)
+    sys.exit(0 if progress.succeeded() else 1)

@@ -3,6 +3,7 @@
 
 import os
 import os.path
+import tempfile
 
 from drgn import Program
 from tests import TestCase
@@ -15,6 +16,10 @@ class TestLive(TestCase):
         super().setUpClass()
         cls.prog = Program()
         cls.prog.set_pid(os.getpid())
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.prog
 
     def test_threads(self):
         tids = [thread.tid for thread in self.prog.threads()]
@@ -71,6 +76,10 @@ class TestCoreDump(TestCase):
         cls.prog = Program()
         cls.prog.set_core_dump(get_resource("multithreaded.core"))
 
+    @classmethod
+    def tearDownClass(cls):
+        del cls.prog
+
     def test_threads(self):
         self.assertSequenceEqual(
             sorted(thread.tid for thread in self.prog.threads()),
@@ -95,3 +104,24 @@ class TestCoreDump(TestCase):
         for tid in self.TIDS:
             if tid != self.MAIN_TID:
                 self.assertIsNone(self.prog.thread(tid).name)
+
+
+class TestCoreDumpLongName(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.prog = Program()
+        with open(get_resource("crashme_static_pie.core"), "rb") as f:
+            data = f.read()
+        data = data.replace(b"crashme_static_\x00", b"crashme_static_p")
+        with tempfile.NamedTemporaryFile("wb") as f:
+            f.write(data)
+            f.flush()
+            cls.prog.set_core_dump(f.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.prog
+
+    def test_thread_name(self):
+        self.assertEqual(self.prog.main_thread().name, "crashme_static_p")

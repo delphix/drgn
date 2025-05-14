@@ -30,7 +30,9 @@
 #include "vector.h"
 
 struct drgn_object_finder;
+struct drgn_symbol;
 struct drgn_symbol_finder;
+struct drgn_type_finder;
 
 /**
  * @defgroup Internals Internals
@@ -118,6 +120,11 @@ struct drgn_program {
 	/* Default language of the program. */
 	const struct drgn_language *lang;
 	struct drgn_platform platform;
+	/**
+	 * Whether we have tried determining the default language from "main"
+	 * since the last time that debug info was added.
+	 */
+	bool tried_main_language;
 	bool has_platform;
 	enum drgn_program_flags flags;
 
@@ -146,7 +153,14 @@ struct drgn_program {
 		 */
 		struct {
 			/** Cached `pr_fname` from `NT_PRPSINFO` note. */
-			const char *core_dump_fname_cached;
+			char *core_dump_fname_cached;
+			/** Cache of important parts of auxiliary vector. */
+			struct {
+				uint64_t at_phdr;
+				uint64_t at_phnum;
+				uint64_t at_sysinfo_ehdr;
+			} auxv;
+			bool auxv_cached;
 		};
 
 		/*
@@ -160,6 +174,8 @@ struct drgn_program {
 			struct {
 				/** `uname -r` */
 				char osrelease[128];
+				/** Build ID. */
+				char build_id[128];
 				/** `PAGE_SIZE` of the kernel. */
 				uint64_t page_size;
 				/**
@@ -193,6 +209,8 @@ struct drgn_program {
 				bool have_crashtime;
 				/** Whether `phys_base` was in the VMCOREINFO. */
 				bool have_phys_base;
+				/** Length of build ID. */
+				unsigned int build_id_len;
 				/**
 				 * `PAGE_SHIFT` of the kernel (derived from
 				 * `PAGE_SIZE`).
@@ -240,14 +258,9 @@ struct drgn_program {
 	 */
 	drgn_log_fn *log_fn;
 	void *log_arg;
+	FILE *progress_file;
 	enum drgn_log_level log_level;
-
-	/*
-	 * Blocking callbacks.
-	 */
-	drgn_program_begin_blocking_fn *begin_blocking_fn;
-	drgn_program_end_blocking_fn *end_blocking_fn;
-	void *blocking_arg;
+	bool default_progress_file;
 };
 
 /** Initialize a @ref drgn_program. */
@@ -288,6 +301,8 @@ struct drgn_error *drgn_program_init_kernel(struct drgn_program *prog);
  * Implement @ref drgn_program_from_pid() on an initialized @ref drgn_program.
  */
 struct drgn_error *drgn_program_init_pid(struct drgn_program *prog, pid_t pid);
+
+struct drgn_error *drgn_program_cache_auxv(struct drgn_program *prog);
 
 /**
  * Return whether a @ref drgn_program is a userspace process running on the
@@ -450,46 +465,32 @@ drgn_program_register_symbol_finder_impl(struct drgn_program *prog,
 /**
  * Call before a blocking (I/O or long-running) operation.
  *
- * Must be paired with @ref drgn_program_end_blocking().
+ * Must be paired with @ref drgn_end_blocking().
  *
- * @return Opaque pointer to pass to @ref drgn_program_end_blocking().
+ * @return Opaque pointer to pass to @ref drgn_end_blocking().
  */
-void *drgn_program_begin_blocking(struct drgn_program *prog);
+void *drgn_begin_blocking(void);
 
 /**
  * Call after a blocking (I/O or long-running) operation.
  *
- * @param[in] state Return value of @ref drgn_program_begin_blocking().
+ * @param[in] state Return value of @ref drgn_begin_blocking().
  */
-void drgn_program_end_blocking(struct drgn_program *prog, void *state);
+void drgn_end_blocking(void *state);
 
-struct drgn_blocking_guard_struct {
-	struct drgn_program *prog;
-	void *state;
-};
-
-static inline struct drgn_blocking_guard_struct
-drgn_blocking_guard_init(struct drgn_program *prog)
+static inline void drgn_blocking_guard_cleanup(void **statep)
 {
-	return (struct drgn_blocking_guard_struct){
-		prog, drgn_program_begin_blocking(prog),
-	};
-}
-
-static inline void
-drgn_blocking_guard_cleanup(struct drgn_blocking_guard_struct *guard)
-{
-	drgn_program_end_blocking(guard->prog, guard->state);
+	drgn_end_blocking(*statep);
 }
 
 /**
- * Scope guard that wraps @ref drgn_program_begin_blocking() and @ref
- * drgn_program_end_blocking().
+ * Scope guard that wraps @ref drgn_begin_blocking() and @ref
+ * drgn_end_blocking().
  */
-#define drgn_blocking_guard(prog)						\
-	struct drgn_blocking_guard_struct PP_UNIQUE(guard)			\
+#define drgn_blocking_guard()							\
+	void *PP_UNIQUE(guard)							\
 	__attribute__((__cleanup__(drgn_blocking_guard_cleanup), __unused__)) =	\
-	drgn_blocking_guard_init(prog)
+		drgn_begin_blocking()
 
 /**
  * @}

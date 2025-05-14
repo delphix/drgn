@@ -365,21 +365,28 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 				  PyObject *kwds)
 {
 	static char *keywords[] = {
-		"prog", "type", "value", "address", "bit_offset",
-		"bit_field_size", NULL,
+		"prog", "type", "value", "address", "absence_reason",
+		"bit_offset", "bit_field_size", NULL,
 	};
 	struct drgn_error *err;
 	Program *prog;
 	PyObject *type_obj = Py_None, *value_obj = Py_None;
 	struct index_arg address = { .allow_none = true, .is_none = true };
+	struct enum_arg absence_reason = {
+		.type = AbsenceReason_class,
+		// Sentinel value so we can tell when the argument was passed.
+		.value = ULONG_MAX,
+	};
 	struct index_arg bit_offset = { .allow_none = true, .is_none = true };
 	struct index_arg bit_field_size = { .allow_none = true, .is_none = true };
 	struct drgn_qualified_type qualified_type;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|OO$O&O&O&:Object",
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|OO$O&O&O&O&:Object",
 					 keywords, &Program_type, &prog,
 					 &type_obj, &value_obj, index_converter,
-					 &address, index_converter, &bit_offset,
-					 index_converter, &bit_field_size))
+					 &address, enum_converter,
+					 &absence_reason, index_converter,
+					 &bit_offset, index_converter,
+					 &bit_field_size))
 		return NULL;
 
 	if (Program_type_arg(prog, type_obj, true, &qualified_type) == -1)
@@ -394,9 +401,17 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 	_cleanup_pydecref_ DrgnObject *obj = DrgnObject_alloc(prog);
 	if (!obj)
 		return NULL;
-	if (!address.is_none && value_obj != Py_None) {
-		PyErr_SetString(PyExc_ValueError,
-				"object cannot have address and value");
+	if (!address.is_none
+	    + (value_obj != Py_None)
+	    + (absence_reason.value != ULONG_MAX) > 1) {
+		PyErr_Format(PyExc_ValueError,
+			     "object cannot have %s and %s",
+			     !address.is_none
+			     ? (value_obj != Py_None
+				&& absence_reason.value != ULONG_MAX)
+			     ? "address, value," : "address" : "value",
+			     absence_reason.value != ULONG_MAX
+			     ? "absence reason" : "value");
 		return NULL;
 	} else if (!address.is_none) {
 		if (!qualified_type.type) {
@@ -532,6 +547,9 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 			return NULL;
 		}
 		err = drgn_object_set_absent(&obj->obj, qualified_type,
+					     absence_reason.value == ULONG_MAX
+					     ? DRGN_ABSENCE_REASON_OTHER
+					     : absence_reason.value,
 					     bit_field_size.uvalue);
 	}
 	if (err)
@@ -541,6 +559,7 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 
 static void DrgnObject_dealloc(DrgnObject *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_DECREF(DrgnObject_prog(self));
 	drgn_object_deinit(&self->obj);
 	Py_TYPE(self)->tp_free((PyObject *)self);
@@ -575,9 +594,9 @@ static PyObject *DrgnObject_compound_value(struct drgn_object *obj,
 		if (err)
 			return set_drgn_error(err);
 
-		err = drgn_object_slice(&member, obj, member_type,
-					members[i].bit_offset,
-					member_bit_field_size);
+		err = drgn_object_fragment(&member, obj, member_type,
+					   members[i].bit_offset,
+					   member_bit_field_size);
 		if (err)
 			return set_drgn_error(err);
 
@@ -622,8 +641,8 @@ static PyObject *DrgnObject_array_value(struct drgn_object *obj,
 
 	DRGN_OBJECT(element, drgn_object_program(obj));
 	for (uint64_t i = 0; i < length; i++) {
-		err = drgn_object_slice(&element, obj, element_type,
-					i * element_bit_size, 0);
+		err = drgn_object_fragment(&element, obj, element_type,
+					   i * element_bit_size, 0);
 		if (err)
 			return set_drgn_error(err);
 
@@ -872,6 +891,12 @@ static PyObject *DrgnObject_repr(DrgnObject *self)
 		break;
 	}
 	case DRGN_OBJECT_ABSENT:
+		if (self->obj.absence_reason != DRGN_ABSENCE_REASON_OTHER) {
+			if (append_format(parts, ", absence_reason=") < 0
+			    || append_attr_str(parts, (PyObject *)self,
+					       "absence_reason_") < 0)
+				return NULL;
+		}
 		break;
 	default:
 		UNREACHABLE();
@@ -999,6 +1024,14 @@ static PyObject *DrgnObject_get_type(DrgnObject *self, void *arg)
 static PyObject *DrgnObject_get_absent(DrgnObject *self, void *arg)
 {
 	Py_RETURN_BOOL(self->obj.kind == DRGN_OBJECT_ABSENT);
+}
+
+static PyObject *DrgnObject_get_absence_reason(DrgnObject *self, void *arg)
+{
+	if (self->obj.kind != DRGN_OBJECT_ABSENT)
+		Py_RETURN_NONE;
+	return PyObject_CallFunction(AbsenceReason_class, "i",
+				     (int)self->obj.absence_reason);
 }
 
 static PyObject *DrgnObject_get_address(DrgnObject *self, void *arg)
@@ -1535,6 +1568,8 @@ static PyGetSetDef DrgnObject_getset[] = {
 	{"type_", (getter)DrgnObject_get_type, NULL, drgn_Object_type__DOC},
 	{"absent_", (getter)DrgnObject_get_absent, NULL,
 	 drgn_Object_absent__DOC},
+	{"absence_reason_", (getter)DrgnObject_get_absence_reason, NULL,
+	 drgn_Object_absence_reason__DOC},
 	{"address_", (getter)DrgnObject_get_address, NULL,
 	 drgn_Object_address__DOC},
 	{"bit_offset_", (getter)DrgnObject_get_bit_offset, NULL,
@@ -1601,6 +1636,12 @@ static PyMappingMethods DrgnObject_as_mapping = {
 	.mp_subscript = (binaryfunc)DrgnObject_subscript,
 };
 
+static int DrgnObject_traverse(DrgnObject *self, visitproc visit, void *arg)
+{
+	Py_VISIT(DrgnObject_prog(self));
+	return 0;
+}
+
 PyTypeObject DrgnObject_type = {
 	PyVarObject_HEAD_INIT(NULL, 0)
 	.tp_name = "_drgn.Object",
@@ -1611,7 +1652,8 @@ PyTypeObject DrgnObject_type = {
 	.tp_as_mapping = &DrgnObject_as_mapping,
 	.tp_str = (reprfunc)DrgnObject_str,
 	.tp_getattro = (getattrofunc)DrgnObject_getattro,
-	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+	.tp_traverse = (traverseproc)DrgnObject_traverse,
 	.tp_doc = drgn_Object_DOC,
 	.tp_richcompare = DrgnObject_richcompare,
 	.tp_iter = (getiterfunc)DrgnObject_iter,
@@ -1695,8 +1737,16 @@ DrgnObject *DrgnObject_container_of(PyObject *self, PyObject *args,
 
 static void ObjectIterator_dealloc(ObjectIterator *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_DECREF(self->obj);
 	Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static int ObjectIterator_traverse(ObjectIterator *self, visitproc visit,
+				   void *arg)
+{
+	Py_VISIT(self->obj);
+	return 0;
 }
 
 static DrgnObject *ObjectIterator_next(ObjectIterator *self)
@@ -1722,7 +1772,8 @@ PyTypeObject ObjectIterator_type = {
 	.tp_name = "_drgn._ObjectIterator",
 	.tp_basicsize = sizeof(ObjectIterator),
 	.tp_dealloc = (destructor)ObjectIterator_dealloc,
-	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+	.tp_traverse = (traverseproc)ObjectIterator_traverse,
 	.tp_iter = PyObject_SelfIter,
 	.tp_iternext = (iternextfunc)ObjectIterator_next,
 	.tp_methods = ObjectIterator_methods,
