@@ -1049,9 +1049,10 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 		if (member->name ||
 		    !(iter->flags & DRGN_FORMAT_OBJECT_MEMBER_NAMES) ||
 		    !drgn_type_has_members(member_type.type)) {
-			err = drgn_object_slice(obj_ret, iter->obj, member_type,
-						bit_offset + member->bit_offset,
-						member_bit_field_size);
+			err = drgn_object_fragment(obj_ret, iter->obj,
+						   member_type,
+						   bit_offset + member->bit_offset,
+						   member_bit_field_size);
 			if (err)
 				return err;
 
@@ -1178,9 +1179,9 @@ c_format_compound_object(const struct drgn_object *obj,
 			if (err)
 				goto out;
 
-			err = drgn_object_slice(&member, obj, member_type,
-						new->end[-1].bit_offset,
-						member_bit_field_size);
+			err = drgn_object_fragment(&member, obj, member_type,
+						   new->end[-1].bit_offset,
+						   member_bit_field_size);
 			if (err)
 				goto out;
 
@@ -1385,8 +1386,10 @@ array_initializer_iter_next(struct initializer_iter *iter_,
 
 		if (iter->i >= iter->length)
 			return &drgn_stop;
-		err = drgn_object_slice(obj_ret, iter->obj, iter->element_type,
-					iter->i * iter->element_bit_size, 0);
+		err = drgn_object_fragment(obj_ret, iter->obj,
+					   iter->element_type,
+					   iter->i * iter->element_bit_size,
+					   0);
 		if (err)
 			return err;
 		iter->i++;
@@ -1499,11 +1502,11 @@ c_format_array_object(const struct drgn_object *obj,
 		do {
 			bool zero;
 
-			err = drgn_object_slice(&element, obj,
-						iter.element_type,
-						(iter.length - 1) *
-						iter.element_bit_size,
-						0);
+			err = drgn_object_fragment(&element, obj,
+						   iter.element_type,
+						   (iter.length - 1)
+						   * iter.element_bit_size,
+						   0);
 			if (err)
 				return err;
 
@@ -1531,6 +1534,19 @@ c_format_function_object(const struct drgn_object *obj,
 	if (!string_builder_appendf(sb, "0x%" PRIx64, obj->address))
 		return &drgn_enomem;
 	return NULL;
+}
+
+static const char *drgn_absence_reason_str(enum drgn_absence_reason reason)
+{
+	SWITCH_ENUM (reason) {
+	case DRGN_ABSENCE_REASON_OPTIMIZED_OUT:
+		return "<optimized out>";
+	case DRGN_ABSENCE_REASON_NOT_IMPLEMENTED:
+		return "<not implemented>";
+	case DRGN_ABSENCE_REASON_OTHER:
+	default:
+		return "<absent>";
+	}
 }
 
 static struct drgn_error *
@@ -1571,7 +1587,8 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	}
 
 	if (obj->kind == DRGN_OBJECT_ABSENT) {
-		if (!string_builder_append(sb, "<absent>"))
+		if (!string_builder_append(sb,
+					   drgn_absence_reason_str(obj->absence_reason)))
 			return &drgn_enomem;
 		return NULL;
 	}
@@ -3395,7 +3412,8 @@ static struct drgn_error *c_op_cast(struct drgn_object *res,
 
 	switch (drgn_type_kind(type.underlying_type)) {
 	case DRGN_TYPE_VOID:
-		drgn_object_set_absent_internal(res, &type);
+		drgn_object_set_absent_internal(res, &type,
+						DRGN_ABSENCE_REASON_OTHER);
 		return NULL;
 	case DRGN_TYPE_BOOL: {
 		bool truthy;
@@ -3470,7 +3488,7 @@ c_op_implicit_convert(struct drgn_object *res,
 			return err;
 		if (!compatible)
 			goto incompatible_type_error;
-		return drgn_object_slice_internal(res, obj, &type, 0, 0);
+		return drgn_object_fragment_internal(res, obj, &type, 0, 0);
 	}
 	case DRGN_TYPE_POINTER: {
 		if (drgn_type_kind(obj_type.underlying_type)

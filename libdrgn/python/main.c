@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <elfutils/libdwfl.h>
-#ifdef WITH_KDUMPFILE
-#include <libkdumpfile/kdumpfile.h>
-#endif
 
 #include "drgnpy.h"
 #include "../path.h"
@@ -291,8 +288,20 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	})
 
 	if (add_module_constants(m) ||
+	    add_type(m, &DebugInfoOptions_type) ||
 	    add_type(m, &Language_type) || add_languages() ||
 	    add_type(m, &DrgnObject_type) ||
+	    add_type(m, &Module_type) ||
+	    add_type(m, &MainModule_type) ||
+	    add_type(m, &SharedLibraryModule_type) ||
+	    add_type(m, &VdsoModule_type) ||
+	    add_type(m, &RelocatableModule_type) ||
+	    add_type(m, &ExtraModule_type) ||
+	    PyType_Ready(&ModuleIterator_type) ||
+	    PyType_Ready(&ModuleIteratorWithNew_type) ||
+	    add_WantedSupplementaryFile(m) ||
+	    init_module_section_addresses() ||
+	    PyType_Ready(&ModuleSectionAddressesIterator_type) ||
 	    PyType_Ready(&ObjectIterator_type) ||
 	    add_type(m, &Platform_type) ||
 	    add_type(m, &Program_type) ||
@@ -335,6 +344,25 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 				       dwfl_version(NULL)))
 		goto err;
 
+	PyObject *have_debuginfod = PyBool_FromLong(drgn_have_debuginfod());
+	if (PyModule_AddObject(m, "_have_debuginfod", have_debuginfod)) {
+		Py_XDECREF(have_debuginfod);
+		goto err;
+	}
+
+	PyObject *enable_dlopen_debuginfod;
+#if ENABLE_DLOPEN_DEBUGINFOD
+	enable_dlopen_debuginfod = Py_True;
+#else
+	enable_dlopen_debuginfod = Py_False;
+#endif
+	Py_INCREF(enable_dlopen_debuginfod);
+	if (PyModule_AddObject(m, "_enable_dlopen_debuginfod",
+			       enable_dlopen_debuginfod)) {
+		Py_DECREF(enable_dlopen_debuginfod);
+		goto err;
+	}
+
 	PyObject *with_libkdumpfile;
 #ifdef WITH_LIBKDUMPFILE
 	with_libkdumpfile = Py_True;
@@ -352,4 +380,48 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 err:
 	Py_DECREF(m);
 	return NULL;
+}
+
+// On return from this function, three things need to be true:
+//
+// 1. The Python interpreter needs to be initialized.
+// 2. The GIL needs to be held (and the caller needs to know whether to release
+//    it to restore the original state).
+// 3. The _drgn module needs to be initialized.
+//
+// This can be called from many possible contexts (drgn CLI, standalone
+// application using libdrgn, etc.), so we have to handle every possible initial
+// state.
+PyGILState_STATE drgn_initialize_python(bool *success_ret)
+{
+	PyGILState_STATE gstate;
+	if (Py_IsInitialized()) {
+		gstate = PyGILState_Ensure();
+	} else {
+		gstate = PyGILState_UNLOCKED;
+		// If the Python interpreter wasn't already initialized, then we
+		// are in a standalone application using libdrgn. Set our
+		// imports up.
+		PyImport_AppendInittab("_drgn", PyInit__drgn);
+		Py_InitializeEx(0);
+		// Note: we don't have a good place to call Py_Finalize(), so we
+		// don't call it.
+#if PY_VERSION_HEX < 0x03070000
+		// Py_Initialize() calls this for us since Python 3.7, and it
+		// was deprecated in Python 3.9.
+		PyEval_InitThreads();
+#endif
+		const char *env = getenv("PYTHONSAFEPATH");
+		if (!env || !env[0])
+			PyRun_SimpleString("import sys\nsys.path.insert(0, '')");
+	}
+
+	bool success = true;
+	if (!PyState_FindModule(&drgnmodule)) {
+		_cleanup_pydecref_ PyObject *m = PyImport_ImportModule("_drgn");
+		if (!m)
+			success = false;
+	}
+	*success_ret = success;
+	return gstate;
 }

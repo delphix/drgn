@@ -14,50 +14,75 @@ import pkgutil
 import runpy
 import shutil
 import sys
-from typing import Any, Callable, Dict, Optional
+from typing import IO, Any, Callable, Dict, Optional, Tuple
 
 import drgn
 from drgn.internal.repl import interact, readline
 from drgn.internal.rlcompleter import Completer
 from drgn.internal.sudohelper import open_via_sudo
 
-__all__ = ("run_interactive", "version_header")
+__all__ = ("default_globals", "run_interactive", "version_header")
 
 logger = logging.getLogger("drgn")
+
+# The list of attributes from the drgn module which are imported and inserted
+# into the global namespace for interactive debugging.
+_DRGN_GLOBALS = [
+    "FaultError",
+    "NULL",
+    "Object",
+    "alignof",
+    "cast",
+    "container_of",
+    "execscript",
+    "implicit_convert",
+    "offsetof",
+    "reinterpret",
+    "sizeof",
+    "stack_trace",
+]
+
+
+def _is_tty(file: IO[Any]) -> bool:
+    try:
+        return os.isatty(file.fileno())
+    except (AttributeError, OSError):
+        return False
 
 
 class _LogFormatter(logging.Formatter):
     _LEVELS = (
-        (logging.DEBUG, "debug", "36"),
-        (logging.INFO, "info", "32"),
-        (logging.WARNING, "warning", "33"),
-        (logging.ERROR, "error", "31"),
-        (logging.CRITICAL, "critical", "31;1"),
+        (logging.DEBUG, "debug", "\033[36m", "\033[m", ""),
+        (logging.INFO, "info", "\033[32m", "\033[m", ""),
+        (logging.WARNING, "warning", "\033[33m", "\033[m", ""),
+        (logging.ERROR, "error", "\033[31m", "\033[m", ""),
+        (logging.CRITICAL, "critical", "\033[31;1m", "\033[0;1m", "\033[m"),
     )
 
     def __init__(self, color: bool) -> None:
         if color:
-            level_prefixes = {
-                level: f"\033[{level_color}m{level_name}:\033[0m"
-                for level, level_name, level_color in self._LEVELS
+            levels = {
+                level: (f"{level_prefix}{level_name}:{message_prefix}", message_suffix)
+                for level, level_name, level_prefix, message_prefix, message_suffix in self._LEVELS
             }
         else:
-            level_prefixes = {
-                level: f"{level_name}:" for level, level_name, _ in self._LEVELS
+            levels = {
+                level: (f"{level_name}:", "")
+                for level, level_name, _, _, _ in self._LEVELS
             }
         default_prefix = "%(levelname)s:"
 
         self._drgn_formatters = {
-            level: logging.Formatter(f"{prefix} %(message)s")
-            for level, prefix in level_prefixes.items()
+            level: logging.Formatter(f"{prefix} %(message)s{suffix}")
+            for level, (prefix, suffix) in levels.items()
         }
         self._default_drgn_formatter = logging.Formatter(
             f"{default_prefix} %(message)s"
         )
 
         self._other_formatters = {
-            level: logging.Formatter(f"{prefix}%(name)s: %(message)s")
-            for level, prefix in level_prefixes.items()
+            level: logging.Formatter(f"{prefix}%(name)s: %(message)s{suffix}")
+            for level, (prefix, suffix) in levels.items()
         }
         self._default_other_formatter = logging.Formatter(
             f"{default_prefix}%(name)s: %(message)s"
@@ -85,21 +110,38 @@ def version_header() -> str:
     calling :func:`run_interactive()`.
     """
     python_version = ".".join(str(v) for v in sys.version_info[:3])
+    debuginfod = f'with{"" if drgn._have_debuginfod else "out"} debuginfod'
+    if drgn._enable_dlopen_debuginfod:
+        debuginfod += " (dlopen)"
     libkdumpfile = f'with{"" if drgn._with_libkdumpfile else "out"} libkdumpfile'
-    return f"drgn {drgn.__version__} (using Python {python_version}, elfutils {drgn._elfutils_version}, {libkdumpfile})"
+    return f"drgn {drgn.__version__} (using Python {python_version}, elfutils {drgn._elfutils_version}, {debuginfod}, {libkdumpfile})"
 
 
-class _QuietAction(argparse.Action):
-    def __init__(
-        self, option_strings: Any, dest: Any, nargs: Any = 0, **kwds: Any
-    ) -> None:
-        super().__init__(option_strings, dest, nargs=nargs, **kwds)
+def default_globals(prog: drgn.Program) -> Dict[str, Any]:
+    """
+    Return the default globals for an interactive drgn session
 
-    def __call__(
-        self, parser: Any, namespace: Any, values: Any, option_string: Any = None
-    ) -> None:
-        setattr(namespace, self.dest, True)
-        namespace.log_level = "none"
+    :param prog: the program which will be debugged
+    :return: a dict of globals
+    """
+    # Don't forget to update the default banner in run_interactive()
+    # with any new additions.
+    init_globals: Dict[str, Any] = {
+        "prog": prog,
+        "drgn": drgn,
+        "__name__": "__main__",
+        "__doc__": None,
+    }
+    for attr in _DRGN_GLOBALS:
+        init_globals[attr] = getattr(drgn, attr)
+    module = importlib.import_module("drgn.helpers.common")
+    for name in module.__dict__["__all__"]:
+        init_globals[name] = getattr(module, name)
+    if prog.flags & drgn.ProgramFlags.IS_LINUX_KERNEL:
+        module = importlib.import_module("drgn.helpers.linux")
+        for name in module.__dict__["__all__"]:
+            init_globals[name] = getattr(module, name)
+    return init_globals
 
 
 def _identify_script(path: str) -> str:
@@ -159,11 +201,175 @@ def _displayhook(value: Any) -> None:
     setattr(builtins, "_", value)
 
 
+def _bool_options(value: bool) -> Dict[str, Tuple[str, bool]]:
+    return {
+        option: ("try_" + option.replace("-", "_"), value)
+        for option in (
+            "module-name",
+            "build-id",
+            "debug-link",
+            "procfs",
+            "embedded-vdso",
+            "reuse",
+            "supplementary",
+        )
+    }
+
+
+class _TrySymbolsByBaseAction(argparse.Action):
+    _enable: bool
+    _finder = ("disable_debug_info_finders", "enable_debug_info_finders")
+
+    _options = (
+        {
+            **_bool_options(False),
+            "kmod": ("try_kmod", drgn.KmodSearchMethod.NONE),
+        },
+        {
+            **_bool_options(True),
+            "kmod=depmod": ("try_kmod", drgn.KmodSearchMethod.DEPMOD),
+            "kmod=walk": ("try_kmod", drgn.KmodSearchMethod.WALK),
+            "kmod=depmod-or-walk": ("try_kmod", drgn.KmodSearchMethod.DEPMOD_OR_WALK),
+            "kmod=depmod-and-walk": ("try_kmod", drgn.KmodSearchMethod.DEPMOD_AND_WALK),
+        },
+    )
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["dest"] = argparse.SUPPRESS
+        super().__init__(*args, **kwargs)
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: Any,
+        option_string: Optional[str] = None,
+    ) -> None:
+        for value in values.split(","):
+            try:
+                option_name, option_value = self._options[self._enable][value]
+            except KeyError:
+                # Raise an error if passed an option meant for the opposite
+                # argument.
+                if value in self._options[not self._enable]:
+                    raise argparse.ArgumentError(self, f"invalid option: {value!r}")
+
+                if not hasattr(namespace, self._finder[self._enable]):
+                    setattr(namespace, self._finder[self._enable], {})
+                getattr(namespace, self._finder[self._enable])[value] = None
+
+                if hasattr(namespace, self._finder[not self._enable]):
+                    getattr(namespace, self._finder[not self._enable]).pop(value, None)
+            else:
+                if not hasattr(namespace, "debug_info_options"):
+                    namespace.debug_info_options = {}
+                namespace.debug_info_options[option_name] = option_value
+
+
+class _TrySymbolsByAction(_TrySymbolsByBaseAction):
+    _enable = True
+
+
+class _NoSymbolsByAction(_TrySymbolsByBaseAction):
+    _enable = False
+
+
+def _load_debugging_symbols(prog: drgn.Program, args: argparse.Namespace) -> None:
+    enable_debug_info_finders = getattr(args, "enable_debug_info_finders", ())
+    disable_debug_info_finders = getattr(args, "disable_debug_info_finders", ())
+    if enable_debug_info_finders or disable_debug_info_finders:
+        debug_info_finders = prog.enabled_debug_info_finders()
+        registered_debug_info_finders = prog.registered_debug_info_finders()
+
+        unknown_finders = []
+
+        for finder in enable_debug_info_finders:
+            if finder not in debug_info_finders:
+                if finder in registered_debug_info_finders:
+                    debug_info_finders.append(finder)
+                else:
+                    unknown_finders.append(finder)
+
+        for finder in disable_debug_info_finders:
+            try:
+                debug_info_finders.remove(finder)
+            except ValueError:
+                if finder not in registered_debug_info_finders:
+                    unknown_finders.append(finder)
+
+        if unknown_finders:
+            if len(unknown_finders) == 1:
+                unknown_finders_repr = repr(unknown_finders[0])
+            elif len(unknown_finders) == 2:
+                unknown_finders_repr = (
+                    f"{unknown_finders[0]!r} or {unknown_finders[1]!r}"
+                )
+            elif len(unknown_finders) > 2:
+                unknown_finders = [repr(finder) for finder in unknown_finders]
+                unknown_finders[-1] = "or " + unknown_finders[-1]
+                unknown_finders_repr = ", ".join(unknown_finders)
+            logger.warning(
+                "no matching debugging information finders or options for %s",
+                unknown_finders_repr,
+            )
+
+        prog.set_enabled_debug_info_finders(debug_info_finders)
+
+    debug_info_options = getattr(args, "debug_info_options", None)
+    if debug_info_options:
+        for option, value in debug_info_options.items():
+            setattr(prog.debug_info_options, option, value)
+
+    if args.debug_directories is not None:
+        if args.no_default_debug_directories:
+            prog.debug_info_options.directories = args.debug_directories
+        else:
+            prog.debug_info_options.directories = (
+                tuple(args.debug_directories) + prog.debug_info_options.directories
+            )
+    elif args.no_default_debug_directories:
+        prog.debug_info_options.directories = ()
+
+    if args.kernel_directories is not None:
+        if args.no_default_kernel_directories:
+            prog.debug_info_options.kernel_directories = args.kernel_directories
+        else:
+            prog.debug_info_options.kernel_directories = (
+                tuple(args.kernel_directories)
+                + prog.debug_info_options.kernel_directories
+            )
+    elif args.no_default_kernel_directories:
+        prog.debug_info_options.kernel_directories = ()
+
+    if args.default_symbols is None:
+        args.default_symbols = {"default": True, "main": True}
+    try:
+        prog.load_debug_info(args.symbols, **args.default_symbols)
+    except drgn.MissingDebugInfoError as e:
+        if args.default_symbols.get("main"):
+            try:
+                main_module = prog.main_module()
+                critical = (
+                    main_module.wants_debug_file() or main_module.wants_loaded_file()
+                )
+            except LookupError:
+                critical = True
+        else:
+            critical = False
+        logger.log(logging.CRITICAL if critical else logging.WARNING, "%s", e)
+
+    if args.extra_symbols:
+        for extra_symbol_path in args.extra_symbols:
+            extra_symbol_path = os.path.abspath(extra_symbol_path)
+            prog.extra_module(extra_symbol_path, create=True).try_file(
+                extra_symbol_path
+            )
+
+
 def _main() -> None:
     handler = logging.StreamHandler()
-    handler.setFormatter(
-        _LogFormatter(hasattr(sys.stderr, "fileno") and os.isatty(sys.stderr.fileno()))
-    )
+    color = _is_tty(sys.stderr)
+    handler.setFormatter(_LogFormatter(color))
     logging.getLogger().addHandler(handler)
 
     version = version_header()
@@ -193,7 +399,9 @@ def _main() -> None:
         metavar="PATH",
         type=str,
         action="append",
-        help="load additional debugging symbols from the given file; this option may be given more than once",
+        help="load debugging symbols from the given file. "
+        "If the file does not correspond to a loaded executable, library, or module, "
+        "then it is ignored. This option may be given more than once",
     )
     default_symbols_group = symbol_group.add_mutually_exclusive_group()
     default_symbols_group.add_argument(
@@ -201,15 +409,79 @@ def _main() -> None:
         dest="default_symbols",
         action="store_const",
         const={"main": True},
-        help="only load debugging symbols for the main executable and those added with -s; "
-        "for userspace programs, this is currently equivalent to --no-default-symbols",
+        help="only load debugging symbols for the main executable "
+        "and those added with -s or --extra-symbols",
     )
     default_symbols_group.add_argument(
         "--no-default-symbols",
         dest="default_symbols",
         action="store_const",
         const={},
-        help="don't load any debugging symbols that were not explicitly added with -s",
+        help="don't load any debugging symbols that were not explicitly added "
+        "with -s or --extra-symbols",
+    )
+    symbol_group.add_argument(
+        "--extra-symbols",
+        metavar="PATH",
+        type=str,
+        action="append",
+        help="load additional debugging symbols from the given file, "
+        "which is assumed not to correspond to a loaded executable, library, or module. "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--try-symbols-by",
+        metavar="METHOD[,METHOD...]",
+        action=_TrySymbolsByAction,
+        help="enable loading debugging symbols using the given methods. "
+        "Choices are debugging information finder names "
+        "(standard, debuginfod, or any added by plugins) "
+        "or debugging information options ("
+        + ", ".join(_TrySymbolsByBaseAction._options[True])
+        + "). "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--no-symbols-by",
+        metavar="METHOD[,METHOD...]",
+        action=_NoSymbolsByAction,
+        help="disable loading debugging symbols using the given methods. "
+        "Choices are debugging information finder names "
+        "(standard, debuginfod, or any added by plugins) "
+        "or debugging information options ("
+        + ", ".join(_TrySymbolsByBaseAction._options[False])
+        + "). "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--debug-directory",
+        dest="debug_directories",
+        metavar="PATH",
+        type=str,
+        action="append",
+        help="search for debugging symbols by build ID and debug link in the given directory. "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--no-default-debug-directories",
+        action="store_true",
+        help="don't search for debugging symbols by build ID and debug link "
+        "in the standard directories or those added by plugins",
+    )
+    symbol_group.add_argument(
+        "--kernel-directory",
+        dest="kernel_directories",
+        metavar="PATH",
+        type=str,
+        action="append",
+        help="search for the kernel image and loadable kernel modules in the given directory. "
+        "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--no-default-kernel-directories",
+        action="store_true",
+        help="don't search for the kernel image and loadable kernel modules "
+        "in the standard directories or those added by plugins",
     )
 
     advanced_group = parser.add_argument_group("advanced")
@@ -235,41 +507,50 @@ def _main() -> None:
     parser.add_argument(
         "-q",
         "--quiet",
-        action=_QuietAction,
+        dest="log_level",
+        action="store_const",
+        const="none",
         help="don't print any logs or download progress",
     )
     parser.add_argument(
-        "script",
+        "-e",
+        dest="exec",
+        metavar="CODE",
+        help="an expression or statement to evaluate, instead of running in interactive mode",
+    )
+    parser.add_argument(
+        "args",
         metavar="ARG",
         type=str,
         nargs=argparse.REMAINDER,
-        help="script to execute instead of running in interactive mode",
+        help="script to execute instead of running in interactive mode "
+        "(unless -e is given) and arguments to pass",
     )
     parser.add_argument("--version", action="version", version=version)
 
     args = parser.parse_args()
 
-    if args.script:
+    script = bool(args.exec is None and args.args)
+    interactive = bool(args.exec is None and not args.args and _is_tty(sys.stdin))
+    if script:
         # A common mistake users make is running drgn $core_dump, which tries
         # to run $core_dump as a Python script. Rather than failing later with
         # some inscrutable syntax or encoding error, try to catch this early
         # and provide a helpful message.
         try:
-            script_type = _identify_script(args.script[0])
+            script_type = _identify_script(args.args[0])
         except OSError as e:
             sys.exit(str(e))
         if script_type == "core":
             sys.exit(
-                f"error: {args.script[0]} is a core dump\n"
-                f'Did you mean "-c {args.script[0]}"?'
+                f"error: {args.args[0]} is a core dump\n"
+                f'Did you mean "-c {args.args[0]}"?'
             )
         elif script_type == "elf":
-            sys.exit(f"error: {args.script[0]} is a binary, not a drgn script")
-    else:
+            sys.exit(f"error: {args.args[0]} is a binary, not a drgn script")
+    elif interactive:
         print(version, file=sys.stderr, flush=True)
 
-    if not args.quiet:
-        os.environ["DEBUGINFOD_PROGRESS"] = "1"
     if args.log_level == "none":
         logger.setLevel(logging.CRITICAL + 1)
     else:
@@ -311,22 +592,30 @@ def _main() -> None:
         # E.g., "not an ELF core file"
         sys.exit(f"error: {e}")
 
-    if args.default_symbols is None:
-        args.default_symbols = {"default": True, "main": True}
-    try:
-        prog.load_debug_info(args.symbols, **args.default_symbols)
-    except drgn.MissingDebugInfoError as e:
-        logger.warning("%s", e)
+    _load_debugging_symbols(prog, args)
 
-    if args.script:
-        sys.argv = args.script
-        script = args.script[0]
-        if pkgutil.get_importer(script) is None:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(script)))
-        drgn.set_default_prog(prog)
-        runpy.run_path(script, init_globals={"prog": prog}, run_name="__main__")
-    else:
+    if interactive:
         run_interactive(prog)
+    else:
+        drgn.set_default_prog(prog)
+        if script:
+            sys.argv = args.args
+            script_path = args.args[0]
+            if pkgutil.get_importer(script_path) is None:
+                sys.path.insert(0, os.path.dirname(os.path.abspath(script_path)))
+            runpy.run_path(
+                script_path, init_globals={"prog": prog}, run_name="__main__"
+            )
+        else:
+            sys.path.insert(0, "")
+            exec_globals = default_globals(prog)
+            if args.exec is None:
+                sys.argv = [""]
+                exec_globals["__file__"] = "<stdin>"
+                exec(compile(sys.stdin.read(), "<stdin>", "exec"), exec_globals)
+            else:
+                sys.argv = ["-e"] + args.args
+                exec(args.exec, exec_globals)
 
 
 def run_interactive(
@@ -364,44 +653,14 @@ def run_interactive(
         function, applications should restore their history and settings before
         using ``readline``.
     """
-    init_globals: Dict[str, Any] = {
-        "prog": prog,
-        "drgn": drgn,
-        "__name__": "__main__",
-        "__doc__": None,
-    }
-    drgn_globals = [
-        "FaultError",
-        "NULL",
-        "Object",
-        "alignof",
-        "cast",
-        "container_of",
-        "execscript",
-        "implicit_convert",
-        "offsetof",
-        "reinterpret",
-        "sizeof",
-        "stack_trace",
-    ]
-    for attr in drgn_globals:
-        init_globals[attr] = getattr(drgn, attr)
-
+    init_globals = default_globals(prog)
     banner = f"""\
 For help, type help(drgn).
 >>> import drgn
->>> from drgn import {", ".join(drgn_globals)}
+>>> from drgn import {", ".join(_DRGN_GLOBALS)}
 >>> from drgn.helpers.common import *"""
-
-    module = importlib.import_module("drgn.helpers.common")
-    for name in module.__dict__["__all__"]:
-        init_globals[name] = getattr(module, name)
     if prog.flags & drgn.ProgramFlags.IS_LINUX_KERNEL:
         banner += "\n>>> from drgn.helpers.linux import *"
-        module = importlib.import_module("drgn.helpers.linux")
-        for name in module.__dict__["__all__"]:
-            init_globals[name] = getattr(module, name)
-
     if banner_func:
         banner = banner_func(banner)
     if globals_func:

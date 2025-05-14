@@ -26,14 +26,27 @@ Table of Contents
 -----------------
 
 .. toctree::
+    :caption: Using drgn
     :maxdepth: 3
 
     installation
     user_guide
     advanced_usage
+    getting_debugging_symbols
+
+.. toctree::
+    :caption: Tutorials
+    :maxdepth: 3
+
+    tutorials
+    case_studies
+
+.. toctree::
+    :caption: Reference
+    :maxdepth: 3
+
     api_reference
     helpers
+    Man Page <man/drgn>
     support_matrix
-    case_studies
-    getting_debugging_symbols
     release_highlights
