@@ -1,46 +1,150 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
-import tempfile
 
-from _drgn_util.elf import ET, PT, SHT, STB, STT
+import itertools
+import lzma
+import tempfile
+import unittest
+
+from _drgn_util.elf import ET, PT, SHF, SHT, STB, STT
+import drgn
 from drgn import Program, Symbol, SymbolBinding, SymbolIndex, SymbolKind
 from tests import TestCase
-from tests.dwarfwriter import dwarf_sections
+from tests.dwarfwriter import create_dwarf_file
 from tests.elfwriter import ElfSection, ElfSymbol, create_elf_file
 
 
-def create_elf_symbol_file(symbols):
-    # We need some DWARF data so that libdwfl will load the file.
-    sections = dwarf_sections(())
-    # Create a section for the symbols to reference and the corresponding
-    # segment for address lookups.
-    min_address = min(symbol.value for symbol in symbols)
-    max_address = max(symbol.value + symbol.size for symbol in symbols)
-    sections.append(
-        ElfSection(
-            name=".foo",
-            sh_type=SHT.NOBITS,
-            p_type=PT.LOAD,
-            vaddr=min_address,
-            memsz=max_address - min_address,
-        )
-    )
-    symbols = [
-        symbol._replace(
-            shindex=len(sections) if symbol.shindex is None else symbol.shindex
-        )
+def add_shndx(symbols, shndx):
+    return [
+        symbol._replace(shindex=shndx if symbol.shindex is None else symbol.shindex)
         for symbol in symbols
     ]
-    return create_elf_file(ET.EXEC, sections, symbols)
+
+
+def create_elf_symbol_file(
+    symbols=(),
+    dynamic_symbols=(),
+    gnu_debugdata_symbols=(),
+    dwarf=False,
+    loadable=True,
+):
+    def symbols_start(symbols):
+        return min(symbol.value for symbol in symbols)
+
+    def symbols_end(symbols):
+        return max(symbol.value + max(symbol.size, 1) for symbol in symbols)
+
+    assert symbols or dynamic_symbols or gnu_debugdata_symbols
+    start = float("inf")
+    end = float("-inf")
+    if symbols:
+        start = min(start, symbols_start(symbols))
+        end = max(end, symbols_end(symbols))
+    if dynamic_symbols:
+        start = min(start, symbols_start(dynamic_symbols))
+        end = max(end, symbols_end(dynamic_symbols))
+    if gnu_debugdata_symbols:
+        start = min(start, symbols_start(gnu_debugdata_symbols))
+        end = max(end, symbols_end(gnu_debugdata_symbols))
+
+    start &= ~7
+    end = (end + 7) & ~7
+
+    # Create a section for the symbols to reference and the corresponding
+    # segment for address lookups. It must be SHF_ALLOC and must not be
+    # SHT_NOBITS or SHT_NOTE for the file to be loadable.
+    size = end - start
+    assert size <= 4096, "symbols are too far apart; file would be too large"
+    sections = [
+        ElfSection(
+            name=".data",
+            sh_type=SHT.PROGBITS,
+            sh_flags=SHF.ALLOC if loadable else 0,
+            p_type=PT.LOAD,
+            vaddr=start,
+            memsz=size,
+            data=bytes(size),
+        ),
+    ]
+    symbols = add_shndx(symbols, len(sections))
+    dynamic_symbols = add_shndx(dynamic_symbols, len(sections))
+
+    if gnu_debugdata_symbols:
+        gds_sections = [
+            ElfSection(
+                name=".data",
+                sh_type=SHT.NOBITS,
+                sh_flags=SHF.ALLOC,
+                p_type=PT.LOAD,
+                vaddr=start,
+                memsz=size,
+            ),
+        ]
+        gds_contents = create_elf_file(
+            ET.EXEC,
+            sections=gds_sections,
+            symbols=add_shndx(gnu_debugdata_symbols, len(gds_sections)),
+        )
+        compressor = lzma.LZMACompressor()
+        gds_compressed = compressor.compress(gds_contents) + compressor.flush()
+        sections.append(
+            ElfSection(
+                name=".gnu_debugdata",
+                sh_type=SHT.PROGBITS,
+                memsz=len(gds_compressed),
+                data=gds_compressed,
+            )
+        )
+
+    if dwarf:
+        contents = create_dwarf_file(
+            (),
+            sections=sections,
+            symbols=symbols,
+            dynamic_symbols=dynamic_symbols,
+        )
+    else:
+        contents = create_elf_file(
+            ET.EXEC,
+            sections=sections,
+            symbols=symbols,
+            dynamic_symbols=dynamic_symbols,
+        )
+
+    return contents, start, end
+
+
+def module_set_elf_symbol_file(module, **kwargs):
+    contents, start, end = create_elf_symbol_file(**kwargs)
+
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(contents)
+        f.flush()
+
+        if module.address_range is None:
+            for other_module in module.prog.modules():
+                other_address_range = other_module.address_range
+                if other_address_range is not None:
+                    other_start, other_end = other_address_range
+                    assert (
+                        end <= other_start or start >= other_end
+                    ), f"{module.name} overlaps {other_module.name}"
+            module.address_range = (start, end)
+        else:
+            assert (start, end) == module.address_range
+
+        module.try_file(f.name, force=True)
+
+
+def program_add_elf_symbol_file(prog, name, **kwargs):
+    module = prog.extra_module(name, create=True)
+    module_set_elf_symbol_file(module, **kwargs)
 
 
 def elf_symbol_program(*modules):
     prog = Program()
-    for symbols in modules:
-        with tempfile.NamedTemporaryFile() as f:
-            f.write(create_elf_symbol_file(symbols))
-            f.flush()
-            prog.load_debug_info([f.name])
+    for i, symbols in enumerate(modules):
+        program_add_elf_symbol_file(prog, f"module{i}", symbols=symbols)
     return prog
 
 
@@ -78,59 +182,164 @@ class TestElfSymbol(TestCase):
                 self.assert_symbols_equal_unordered(prog.symbols(0xFFFF000C), [second])
                 self.assertRaises(LookupError, prog.symbol, 0xFFFF0010)
 
-    def test_by_address_precedence(self):
-        precedence = (STB.GLOBAL, STB.WEAK, STB.LOCAL)
-        drgn_precedence = (
-            SymbolBinding.GLOBAL,
-            SymbolBinding.WEAK,
-            SymbolBinding.LOCAL,
+    def test_by_address_closest(self):
+        # If two symbols contain the given address, then the one whose start
+        # address is closest to the given address should be preferred
+        # (regardless of the binding of either symbol).
+        elf_closest = ElfSymbol("closest", 0xFFFF0008, 0x8, STT.OBJECT, STB.WEAK)
+        elf_furthest = ElfSymbol("furthest", 0xFFFF0000, 0xC, STT.OBJECT, STB.GLOBAL)
+        closest = Symbol(
+            "closest", 0xFFFF0008, 0x8, SymbolBinding.WEAK, SymbolKind.OBJECT
+        )
+        furthest = Symbol(
+            "furthest", 0xFFFF0000, 0xC, SymbolBinding.GLOBAL, SymbolKind.OBJECT
         )
 
-        def assert_find_higher(*modules):
-            self.assertEqual(
-                elf_symbol_program(*modules).symbol(0xFFFF0000).name, "foo"
-            )
-
-        def assert_finds_both(symbols, *modules):
+        def test(elf_symbols):
+            prog = elf_symbol_program(elf_symbols)
+            self.assertEqual(prog.symbol(0xFFFF000B), closest)
             self.assert_symbols_equal_unordered(
-                elf_symbol_program(*modules).symbols(0xFFFF0000),
-                symbols,
+                prog.symbols(0xFFFF000B), [closest, furthest]
             )
 
-        for i in range(len(precedence) - 1):
-            higher_binding = precedence[i]
-            higher_binding_drgn = drgn_precedence[i]
-            for j in range(i + 1, len(precedence)):
-                lower_binding = precedence[j]
-                lower_binding_drgn = drgn_precedence[j]
-                with self.subTest(higher=higher_binding, lower=lower_binding):
-                    higher = ElfSymbol(
-                        "foo", 0xFFFF0000, 0x8, STT.OBJECT, higher_binding
-                    )
-                    lower = ElfSymbol("bar", 0xFFFF0000, 0x8, STT.OBJECT, lower_binding)
-                    symbols = [
-                        Symbol(
-                            "foo",
-                            0xFFFF0000,
-                            0x8,
-                            higher_binding_drgn,
-                            SymbolKind.OBJECT,
-                        ),
-                        Symbol(
-                            "bar",
-                            0xFFFF0000,
-                            0x8,
-                            lower_binding_drgn,
-                            SymbolKind.OBJECT,
-                        ),
-                    ]
-                    # Local symbols must be before global symbols.
-                    if lower_binding != STB.LOCAL:
-                        with self.subTest("higher before lower"):
-                            assert_find_higher((higher, lower))
-                    with self.subTest("lower before higher"):
-                        assert_find_higher((lower, higher))
-                    assert_finds_both(symbols, (lower, higher))
+        with self.subTest("closest first"):
+            test([elf_closest, elf_furthest])
+
+        with self.subTest("furthest first"):
+            test([elf_furthest, elf_closest])
+
+    def test_by_address_closest_end(self):
+        # If two symbols contain the given address and have the same start
+        # address, then the one whose end address is closest to the given
+        # address should be preferred (regardless of the binding of either
+        # symbol).
+        elf_closest = ElfSymbol("closest", 0xFFFF0000, 0xC, STT.OBJECT, STB.WEAK)
+        elf_furthest = ElfSymbol("furthest", 0xFFFF0000, 0x10, STT.OBJECT, STB.GLOBAL)
+        closest = Symbol(
+            "closest", 0xFFFF0000, 0xC, SymbolBinding.WEAK, SymbolKind.OBJECT
+        )
+        furthest = Symbol(
+            "furthest", 0xFFFF0000, 0x10, SymbolBinding.GLOBAL, SymbolKind.OBJECT
+        )
+
+        def test(elf_symbols):
+            prog = elf_symbol_program(elf_symbols)
+            self.assertEqual(prog.symbol(0xFFFF000B), closest)
+            self.assert_symbols_equal_unordered(
+                prog.symbols(0xFFFF000B), [closest, furthest]
+            )
+
+        with self.subTest("closest first"):
+            test([elf_closest, elf_furthest])
+
+        with self.subTest("furthest first"):
+            test([elf_furthest, elf_closest])
+
+    def test_by_address_sizeless(self):
+        label = ElfSymbol("label", 0xFFFF0008, 0x0, STT.FUNC, STB.LOCAL)
+        less = ElfSymbol("less", 0xFFFF0000, 0x4, STT.FUNC, STB.LOCAL)
+        greater = ElfSymbol("greater", 0xFFFF0010, 0x4, STT.FUNC, STB.LOCAL)
+
+        expected = Symbol(
+            "label", 0xFFFF0008, 0x0, SymbolBinding.LOCAL, SymbolKind.FUNC
+        )
+
+        # Test every permutation of every combination of symbols that includes
+        # "label".
+        for elf_symbols in itertools.chain.from_iterable(
+            itertools.permutations((label,) + extra_elf_symbols)
+            for r in range(3)
+            for extra_elf_symbols in itertools.combinations((less, greater), r)
+        ):
+            with self.subTest(elf_symbols=[sym.name for sym in elf_symbols]):
+                prog = elf_symbol_program(elf_symbols)
+                self.assertEqual(prog.symbol(0xFFFF0009), expected)
+                self.assertEqual(prog.symbols(0xFFFF0009), [expected])
+
+    def test_by_address_sizeless_subsumed(self):
+        label = ElfSymbol("label", 0xFFFF0008, 0x0, STT.FUNC, STB.LOCAL)
+        subsume = ElfSymbol("subsume", 0xFFFF0004, 0x8, STT.FUNC, STB.LOCAL)
+        less = ElfSymbol("less", 0xFFFF0000, 0x4, STT.FUNC, STB.LOCAL)
+        greater = ElfSymbol("greater", 0xFFFF0010, 0x4, STT.FUNC, STB.LOCAL)
+
+        expected = Symbol(
+            "subsume", 0xFFFF0004, 0x8, SymbolBinding.LOCAL, SymbolKind.FUNC
+        )
+
+        # Test every permutation of every combination of symbols that includes
+        # "label" and "subsume".
+        for elf_symbols in itertools.chain.from_iterable(
+            itertools.permutations((label, subsume) + extra_elf_symbols)
+            for r in range(3)
+            for extra_elf_symbols in itertools.combinations((less, greater), r)
+        ):
+            with self.subTest(elf_symbols=[sym.name for sym in elf_symbols]):
+                prog = elf_symbol_program(elf_symbols)
+                self.assertEqual(prog.symbol(0xFFFF0009), expected)
+                self.assertEqual(prog.symbols(0xFFFF0009), [expected])
+
+    def test_by_address_sizeless_wrong_section(self):
+        prog = elf_symbol_program(
+            (ElfSymbol("label", 0xFFFF0008, 0x0, STT.FUNC, STB.LOCAL),)
+        )
+        for module in prog.modules():
+            start, end = module.address_range
+            module.address_range = (start, 0xFFFFFF00)
+        self.assertRaises(LookupError, prog.symbol, 0xFFFFFE00)
+
+    def test_by_address_binding_precedence(self):
+        precedence = (
+            (STB.GLOBAL, STB.GNU_UNIQUE),
+            (STB.WEAK,),
+            (STB.LOCAL, STB.HIPROC),
+        )
+
+        def assert_find_higher(*modules, both):
+            prog = elf_symbol_program(*modules)
+            self.assertEqual(prog.symbol(0xFFFF0000).name, "foo")
+            # Test that symbols() finds both if expected or either one if not.
+            if both:
+                self.assertCountEqual(
+                    [sym.name for sym in prog.symbols(0xFFFF0000)], ["foo", "bar"]
+                )
+            else:
+                self.assertIn(
+                    [sym.name for sym in prog.symbols(0xFFFF0000)], (["foo"], ["bar"])
+                )
+
+        for size in (8, 0):
+            with self.subTest(size=size):
+                for i in range(len(precedence) - 1):
+                    for higher_binding in precedence[i]:
+                        for j in range(i + 1, len(precedence)):
+                            for lower_binding in precedence[j]:
+                                with self.subTest(
+                                    higher=higher_binding, lower=lower_binding
+                                ):
+                                    higher = ElfSymbol(
+                                        "foo",
+                                        0xFFFF0000,
+                                        size,
+                                        STT.OBJECT,
+                                        higher_binding,
+                                    )
+                                    lower = ElfSymbol(
+                                        "bar",
+                                        0xFFFF0000,
+                                        size,
+                                        STT.OBJECT,
+                                        lower_binding,
+                                    )
+                                    # Local symbols must be before global symbols.
+                                    if lower_binding not in precedence[-1]:
+                                        with self.subTest("higher before lower"):
+                                            assert_find_higher(
+                                                (higher, lower), both=size > 0
+                                            )
+                                    with self.subTest("lower before higher"):
+                                        assert_find_higher(
+                                            (lower, higher), both=size > 0
+                                        )
 
     def test_by_name(self):
         elf_first = ElfSymbol("first", 0xFFFF0000, 0x8, STT.OBJECT, STB.GLOBAL)
@@ -156,7 +365,7 @@ class TestElfSymbol(TestCase):
                 self.assert_symbols_equal_unordered(prog.symbols("second"), [second])
                 self.assertEqual(prog.symbols("third"), [])
 
-    def test_by_name_precedence(self):
+    def test_by_name_binding_precedence(self):
         precedence = (
             (STB.GLOBAL, STB.GNU_UNIQUE),
             (STB.WEAK,),
@@ -170,10 +379,9 @@ class TestElfSymbol(TestCase):
             prog = elf_symbol_program(*modules)
             self.assertEqual(prog.symbol("foo").address, expected)
             # assert symbols() always finds both
-            symbols = sorted(prog.symbols("foo"), key=lambda s: s.address)
-            self.assertEqual(len(symbols), 2)
-            self.assertEqual(symbols[0].address, other)
-            self.assertEqual(symbols[1].address, expected)
+            self.assertCountEqual(
+                [sym.address for sym in prog.symbols("foo")], [expected, other]
+            )
 
         for i in range(len(precedence) - 1):
             for higher_binding in precedence[i]:
@@ -263,6 +471,297 @@ class TestElfSymbol(TestCase):
         ]
         prog = elf_symbol_program(*elf_syms)
         self.assert_symbols_equal_unordered(prog.symbols(), syms)
+
+    def test_dynsym(self):
+        prog = Program()
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            dynamic_symbols=[
+                ElfSymbol("sym", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+        )
+
+        sym = Symbol("sym", 0xFFFF0000, 0x8, SymbolBinding.LOCAL, SymbolKind.OBJECT)
+        self.assertEqual(prog.symbol("sym"), sym)
+        self.assertEqual(prog.symbol(0xFFFF0004), sym)
+
+    def test_ignore_dynsym_same_file(self):
+        # Test that .dynsym is ignored in a file with both .symtab and .dynsym.
+        prog = Program()
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            # Normally .symtab is a superset of .dynsym, but to test that we
+            # ignore .dynsym, make them distinct.
+            symbols=[
+                ElfSymbol("full", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+            dynamic_symbols=[
+                ElfSymbol("partial", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+        )
+
+        self.assertRaises(LookupError, prog.symbol, "partial")
+
+        full = Symbol("full", 0xFFFF0000, 0x8, SymbolBinding.LOCAL, SymbolKind.OBJECT)
+        self.assertEqual(prog.symbol("full"), full)
+        self.assertEqual(prog.symbol(0xFFFF0004), full)
+
+    def test_ignore_dynsym_separate_files(self):
+        # Same as test_ignore_dynsym_same_file(), except .symtab and .dynsym
+        # are in different files.
+        prog = Program()
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            dynamic_symbols=[
+                ElfSymbol("partial", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+        )
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            symbols=[
+                ElfSymbol("full", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+            dwarf=True,
+        )
+
+        self.assertRaises(LookupError, prog.symbol, "partial")
+
+        full = Symbol("full", 0xFFFF0000, 0x8, SymbolBinding.LOCAL, SymbolKind.OBJECT)
+        self.assertEqual(prog.symbol("full"), full)
+        self.assertEqual(prog.symbol(0xFFFF0004), full)
+
+    def test_override_dynsym(self):
+        # Same as test_ignore_dynsym_separate_files(), except we do a lookup in
+        # .dynsym before we have .symtab.
+        prog = Program()
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            dynamic_symbols=[
+                ElfSymbol("partial", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+        )
+
+        partial = Symbol(
+            "partial", 0xFFFF0000, 0x8, SymbolBinding.LOCAL, SymbolKind.OBJECT
+        )
+        self.assertEqual(prog.symbol("partial"), partial)
+        self.assertEqual(prog.symbol(0xFFFF0004), partial)
+
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            symbols=[
+                ElfSymbol("full", 0xFFFF0000, 0x8, STT.OBJECT, STB.LOCAL),
+            ],
+            dwarf=True,
+        )
+
+        self.assertRaises(LookupError, prog.symbol, "partial")
+
+        full = Symbol("full", 0xFFFF0000, 0x8, SymbolBinding.LOCAL, SymbolKind.OBJECT)
+        self.assertEqual(prog.symbol("full"), full)
+        self.assertEqual(prog.symbol(0xFFFF0004), full)
+
+
+@unittest.skipUnless(drgn._with_lzma, "built without lzma support")
+class TestGnuDebugdata(TestCase):
+
+    def assert_all_symbols_found_by_name(self, prog, symbols):
+        for symbol in symbols:
+            self.assertEqual(prog.symbol(symbol.name), symbol)
+
+    def assert_all_symbols_found_by_address(self, prog, symbols):
+        for symbol in symbols:
+            self.assertEqual(prog.symbol(symbol.address), symbol)
+            self.assertEqual(prog.symbol(symbol.address + symbol.size - 1), symbol)
+
+    def assert_all_symbols_returned_by_lookup(self, prog, symbols):
+        def sort_key(sym):
+            return (sym.address, sym.name)
+
+        expected = sorted(symbols, key=sort_key)
+        actual = prog.symbols()
+        actual.sort(key=sort_key)
+        self.assertEqual(expected, actual)
+
+    def test_gnu_debugdata_and_dynamic_lookup(self):
+        gnu_symbols = [
+            ElfSymbol("first", 0xFFFF0000, 0x8, STT.FUNC, STB.LOCAL),
+            ElfSymbol("second", 0xFFFF0018, 0x8, STT.FUNC, STB.LOCAL),
+        ]
+        dynamic_symbols = [
+            ElfSymbol("third", 0xFFFF0010, 0x8, STT.FUNC, STB.LOCAL),
+            ElfSymbol("fourth", 0xFFFF0008, 0x8, STT.FUNC, STB.LOCAL),
+        ]
+        prog = Program()
+        program_add_elf_symbol_file(
+            prog,
+            "module0",
+            dynamic_symbols=dynamic_symbols,
+            gnu_debugdata_symbols=gnu_symbols,
+        )
+        drgn_symbols = [
+            Symbol("first", 0xFFFF0000, 0x8, SymbolBinding.LOCAL, SymbolKind.FUNC),
+            Symbol("second", 0xFFFF0018, 0x8, SymbolBinding.LOCAL, SymbolKind.FUNC),
+            Symbol("third", 0xFFFF0010, 0x8, SymbolBinding.LOCAL, SymbolKind.FUNC),
+            Symbol("fourth", 0xFFFF0008, 0x8, SymbolBinding.LOCAL, SymbolKind.FUNC),
+        ]
+        self.assert_all_symbols_found_by_name(prog, drgn_symbols)
+        self.assert_all_symbols_found_by_address(prog, drgn_symbols)
+        self.assert_all_symbols_returned_by_lookup(prog, drgn_symbols)
+
+    def test_sizeless_symbols_gnu_debugdata(self):
+        gnu_symbols = [
+            ElfSymbol("zero", 0xFFFF0000, 0x0, STT.FUNC, STB.LOCAL),
+            ElfSymbol("two", 0xFFFF0002, 0x4, STT.FUNC, STB.LOCAL),
+            ElfSymbol("ten", 0xFFFF000A, 0x0, STT.FUNC, STB.LOCAL),
+        ]
+        dynamic_symbols = [
+            ElfSymbol("four", 0xFFFF0004, 0x0, STT.FUNC, STB.LOCAL),
+            ElfSymbol("eight", 0xFFFF0008, 0x0, STT.FUNC, STB.LOCAL),
+        ]
+        drgn_symbols = {
+            s.name: s
+            for s in (
+                Symbol("zero", 0xFFFF0000, 0x0, SymbolBinding.LOCAL, SymbolKind.FUNC),
+                Symbol("two", 0xFFFF0002, 0x4, SymbolBinding.LOCAL, SymbolKind.FUNC),
+                Symbol("four", 0xFFFF0004, 0x0, SymbolBinding.LOCAL, SymbolKind.FUNC),
+                Symbol("eight", 0xFFFF0008, 0x0, SymbolBinding.LOCAL, SymbolKind.FUNC),
+                Symbol("ten", 0xFFFF000A, 0x0, SymbolBinding.LOCAL, SymbolKind.FUNC),
+            )
+        }
+
+        for swap in (False, True):
+            prog = Program()
+            program_add_elf_symbol_file(
+                prog,
+                "module0",
+                dynamic_symbols=gnu_symbols if swap else dynamic_symbols,
+                gnu_debugdata_symbols=dynamic_symbols if swap else gnu_symbols,
+            )
+
+            self.assert_all_symbols_found_by_name(prog, drgn_symbols.values())
+            self.assert_all_symbols_returned_by_lookup(prog, drgn_symbols.values())
+
+            # Address 9 has a best match in .dynsym, despite other sizeless matches
+            # in .gnu_debugdata.
+            self.assertEqual(drgn_symbols["eight"], prog.symbol(0xFFFF0009))
+
+            # Address 5 is conained by symbol "two" in .gnu_debugdata, despite
+            # "four" being a sizeless match in .dynsym.
+            self.assertEqual(drgn_symbols["two"], prog.symbol(0xFFFF0005))
+
+            # Address 11 has a best sizeless match of "ten" in .gnu_debugdata,
+            # despite having a sizeless match of "eight" in .dynsym.
+            self.assertEqual(drgn_symbols["ten"], prog.symbol(0xFFFF000B))
+
+    def test_file_preferences(self):
+        # We need to be careful to make the address range the same for both
+        # files: so the minimum and maximum address for gnu + dynamic must be
+        # the same as for symtab.
+        # Normally a debug file would contain the same symbols as the loaded
+        # file, plus more. For testing, give them different names to
+        # distinguish.
+        loaded = [
+            ElfSymbol("loaded_lo", 0xFFFF0000, 0x4, STT.FUNC, STB.LOCAL),
+            ElfSymbol("loaded_hi", 0xFFFF0004, 0x4, STT.FUNC, STB.LOCAL),
+        ]
+        debug = [
+            ElfSymbol("symtab_lo", 0xFFFF0000, 0x4, STT.OBJECT, STB.LOCAL),
+            ElfSymbol("symtab_hi", 0xFFFF0004, 0x4, STT.OBJECT, STB.LOCAL),
+        ]
+        empty = [ElfSymbol("", 0xFFFF0000, 0, 0, 0, 0, 0)]
+        loaded_file_symbols = [
+            Symbol("loaded_lo", 0xFFFF0000, 0x4, SymbolBinding.LOCAL, SymbolKind.FUNC),
+            Symbol("loaded_hi", 0xFFFF0004, 0x4, SymbolBinding.LOCAL, SymbolKind.FUNC),
+        ]
+        debug_file_symbols = [
+            Symbol(
+                "symtab_lo", 0xFFFF0000, 0x4, SymbolBinding.LOCAL, SymbolKind.OBJECT
+            ),
+            Symbol(
+                "symtab_hi", 0xFFFF0004, 0x4, SymbolBinding.LOCAL, SymbolKind.OBJECT
+            ),
+        ]
+        file_choices = {
+            "loaded": (
+                {"gnu_debugdata_symbols": loaded[:1], "dynamic_symbols": loaded[1:]},
+                loaded_file_symbols,
+            ),
+            "loaded_dyn": (
+                {"dynamic_symbols": loaded},
+                loaded_file_symbols,
+            ),
+            "loaded_gnu": (
+                {"gnu_debugdata_symbols": loaded},
+                loaded_file_symbols,
+            ),
+            "loaded_gnu_dynempty": (
+                {"gnu_debugdata_symbols": loaded, "dynamic_symbols": empty},
+                loaded_file_symbols,
+            ),
+            "debug": (
+                {"symbols": debug, "dwarf": True, "loadable": False},
+                debug_file_symbols,
+            ),
+            "debug_dyn": (
+                {"dynamic_symbols": debug, "dwarf": True, "loadable": False},
+                debug_file_symbols,
+            ),
+        }
+
+        # First file, second file, whether or not the symtab should be replaced.
+        # Combining the symbol table is possible in a corner case (.dynsym from
+        # the debug file, plus .gnu_debugdata from the loaded, if the loaded
+        # file has no .dynsym of its own). This really ought not to happen in
+        # practice, but it's worth ensuring that it's handled safely.
+        cases = [
+            ("loaded", "debug", "replace"),
+            ("loaded_dyn", "debug", "replace"),
+            ("loaded_gnu", "debug", "replace"),
+            ("loaded_gnu_dynempty", "debug", "replace"),
+            ("debug", "loaded", None),
+            ("debug", "loaded_dyn", None),
+            ("debug", "loaded_gnu", None),
+            ("debug", "loaded_gnu_dynempty", None),
+            ("loaded", "debug_dyn", None),
+            ("loaded_dyn", "debug_dyn", None),
+            ("loaded_gnu", "debug_dyn", "combine"),
+            ("loaded_gnu_dynempty", "debug_dyn", None),
+            # We will replace a .dynsym with another .dynsym only if the file
+            # also has a .gnu_debugdata
+            ("debug_dyn", "loaded", "replace"),
+            ("debug_dyn", "loaded_dyn", None),
+            ("debug_dyn", "loaded_gnu", "combine"),
+            ("debug_dyn", "loaded_gnu_dynempty", "replace"),
+        ]
+
+        for first, second, action in cases:
+            with self.subTest(f"{first}, {second}"):
+                prog = Program()
+                module = prog.extra_module("module0", create=True)
+                module_set_elf_symbol_file(module, **file_choices[first][0])
+                expected = file_choices[first][1]
+                self.assert_all_symbols_found_by_name(prog, expected)
+                self.assert_all_symbols_found_by_address(prog, expected)
+                self.assert_all_symbols_returned_by_lookup(prog, expected)
+
+                module_set_elf_symbol_file(module, **file_choices[second][0])
+                if action == "replace":
+                    expected = file_choices[second][1]
+                elif action == "combine":
+                    expected = expected + file_choices[second][1]
+                self.assert_all_symbols_found_by_name(prog, expected)
+                # We end up with overlapping symbols when tables get combined.
+                # Don't bother checking address lookup there.
+                if action != "combine":
+                    self.assert_all_symbols_found_by_address(prog, expected)
+                self.assert_all_symbols_returned_by_lookup(prog, expected)
 
 
 class TestSymbolFinder(TestCase):

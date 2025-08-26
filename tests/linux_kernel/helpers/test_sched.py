@@ -3,14 +3,18 @@
 
 import os
 import signal
+import time
 
 from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.pid import find_task
 from drgn.helpers.linux.sched import (
     cpu_curr,
+    get_task_state,
     idle_task,
     loadavg,
     task_cpu,
+    task_on_cpu,
+    task_since_last_arrival_ns,
     task_state_to_char,
     task_thread_info,
 )
@@ -19,7 +23,6 @@ from tests.linux_kernel import (
     fork_and_stop,
     proc_state,
     skip_unless_have_test_kmod,
-    smp_enabled,
     wait_until,
 )
 
@@ -40,6 +43,7 @@ class TestSched(LinuxKernelTestCase):
     def test_task_state_to_char(self):
         task = find_task(self.prog, os.getpid())
         self.assertEqual(task_state_to_char(task), "R")
+        self.assertEqual(get_task_state(task), "R (running)")
 
         pid = os.fork()
         try:
@@ -54,6 +58,7 @@ class TestSched(LinuxKernelTestCase):
 
             wait_until(lambda: proc_state(pid) == "S")
             self.assertEqual(task_state_to_char(task), "S")
+            self.assertEqual(get_task_state(task), "S (sleeping)")
 
             os.kill(pid, signal.SIGSTOP)
             wait_until(lambda: proc_state(pid) == "T")
@@ -66,6 +71,14 @@ class TestSched(LinuxKernelTestCase):
             os.kill(pid, signal.SIGKILL)
             os.waitpid(pid, 0)
 
+    def test_task_on_cpu(self):
+        task = find_task(self.prog, os.getpid())
+        self.assertTrue(task_on_cpu(task))
+
+        with fork_and_stop() as pid:
+            task = find_task(self.prog, pid)
+            self.assertFalse(task_on_cpu(task))
+
     def test_cpu_curr(self):
         task = find_task(self.prog, os.getpid())
         cpu = os.cpu_count() - 1
@@ -77,15 +90,20 @@ class TestSched(LinuxKernelTestCase):
             os.sched_setaffinity(0, old_affinity)
 
     def test_idle_task(self):
-        if smp_enabled():
-            for cpu in for_each_possible_cpu(self.prog):
-                self.assertEqual(
-                    idle_task(self.prog, cpu).comm.string_(), f"swapper/{cpu}".encode()
-                )
-        else:
-            self.assertEqual(idle_task(self.prog, 0).comm.string_(), b"swapper")
+        for cpu in for_each_possible_cpu(self.prog):
+            task = idle_task(self.prog, cpu)
+            if cpu == 0:
+                self.assertEqual(task, self.prog["init_task"].address_of_())
+            else:
+                self.assertEqual(task.comm.string_(), f"swapper/{cpu}".encode())
 
     def test_loadavg(self):
         values = loadavg(self.prog)
         self.assertEqual(len(values), 3)
         self.assertTrue(all(v >= 0.0 for v in values))
+
+    def test_task_since_last_arrival_ns(self):
+        with fork_and_stop() as pid:
+            time.sleep(0.01)
+            task = find_task(self.prog, pid)
+            self.assertGreaterEqual(task_since_last_arrival_ns(task), 10000000)

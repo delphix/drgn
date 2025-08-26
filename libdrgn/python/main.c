@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <elfutils/libdwfl.h>
-#ifdef WITH_KDUMPFILE
-#include <libkdumpfile/kdumpfile.h>
-#endif
 
 #include "drgnpy.h"
 #include "../path.h"
@@ -23,6 +20,16 @@ static int add_type(PyObject *module, PyTypeObject *type)
 	ret = PyModule_AddObject(module, name, (PyObject *)type);
 	if (ret)
 		Py_DECREF(type);
+	return ret;
+}
+
+static int add_bool(PyObject *module, const char *name, bool value)
+{
+	PyObject *obj = value ? Py_True : Py_False;
+	Py_INCREF(obj);
+	int ret = PyModule_AddObject(module, name, obj);
+	if (ret)
+		Py_DECREF(obj);
 	return ret;
 }
 
@@ -190,6 +197,9 @@ static PyMethodDef drgn_methods[] = {
 	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_task_thread_info_DOC},
 	{"_linux_helper_task_cpu", (PyCFunction)drgnpy_linux_helper_task_cpu,
 	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_task_cpu_DOC},
+	{"_linux_helper_task_on_cpu",
+	 (PyCFunction)drgnpy_linux_helper_task_on_cpu,
+	 METH_VARARGS | METH_KEYWORDS, drgn__linux_helper_task_on_cpu_DOC},
 	{"_linux_helper_xa_load",
 	 (PyCFunction)drgnpy_linux_helper_xa_load,
 	 METH_VARARGS | METH_KEYWORDS},
@@ -244,17 +254,10 @@ static int add_type_aliases(PyObject *m)
 	if (!typing_Union)
 		return -1;
 
-	// This should be a subclass of typing.Protocol, but that is only
-	// available since Python 3.8.
-	PyObject *IntegerLike = PyType_FromSpec(&(PyType_Spec){
-		.name = "_drgn.IntegerLike",
-		.flags = Py_TPFLAGS_DEFAULT,
-		.slots = (PyType_Slot []){{0, NULL}},
-	});
-	if (!IntegerLike)
-		return -1;
-	if (PyModule_AddObject(m, "IntegerLike", IntegerLike) == -1) {
-		Py_DECREF(IntegerLike);
+	PyObject *typing_SupportsIndex =
+		PyObject_GetAttrString(typing_module, "SupportsIndex");
+	if (PyModule_AddObject(m, "IntegerLike", typing_SupportsIndex) == -1) {
+		Py_XDECREF(typing_SupportsIndex);
 		return -1;
 	}
 
@@ -291,8 +294,20 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	})
 
 	if (add_module_constants(m) ||
+	    add_type(m, &DebugInfoOptions_type) ||
 	    add_type(m, &Language_type) || add_languages() ||
 	    add_type(m, &DrgnObject_type) ||
+	    add_type(m, &Module_type) ||
+	    add_type(m, &MainModule_type) ||
+	    add_type(m, &SharedLibraryModule_type) ||
+	    add_type(m, &VdsoModule_type) ||
+	    add_type(m, &RelocatableModule_type) ||
+	    add_type(m, &ExtraModule_type) ||
+	    PyType_Ready(&ModuleIterator_type) ||
+	    PyType_Ready(&ModuleIteratorWithNew_type) ||
+	    add_WantedSupplementaryFile(m) ||
+	    init_module_section_addresses() ||
+	    PyType_Ready(&ModuleSectionAddressesIterator_type) ||
 	    PyType_Ready(&ObjectIterator_type) ||
 	    add_type(m, &Platform_type) ||
 	    add_type(m, &Program_type) ||
@@ -323,6 +338,14 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	if (add_type(m, &FaultError_type))
 		goto err;
 
+	ObjectNotFoundError_type.tp_base = (PyTypeObject *)PyExc_KeyError;
+	// KeyError.__str__() returns repr(args[0]). Use BaseException.__str__()
+	// instead, which returns str(args[0]).
+	ObjectNotFoundError_type.tp_str =
+		((PyTypeObject *)PyExc_BaseException)->tp_str;
+	if (add_type(m, &ObjectNotFoundError_type))
+		goto err;
+
 	PyObject *host_platform_obj = Platform_wrap(&drgn_host_platform);
 	if (!host_platform_obj)
 		goto err;
@@ -335,21 +358,78 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 				       dwfl_version(NULL)))
 		goto err;
 
-	PyObject *with_libkdumpfile;
-#ifdef WITH_LIBKDUMPFILE
-	with_libkdumpfile = Py_True;
-#else
-	with_libkdumpfile = Py_False;
-#endif
-	Py_INCREF(with_libkdumpfile);
-	if (PyModule_AddObject(m, "_with_libkdumpfile", with_libkdumpfile)) {
-		Py_DECREF(with_libkdumpfile);
+	if (add_bool(m, "_have_debuginfod", drgn_have_debuginfod()))
 		goto err;
-	}
+
+	if (add_bool(m, "_enable_dlopen_debuginfod",
+#if ENABLE_DLOPEN_DEBUGINFOD
+		     true
+#else
+		     false
+#endif
+		    ))
+		goto err;
+
+	if (add_bool(m, "_with_libkdumpfile",
+#ifdef WITH_LIBKDUMPFILE
+		     true
+#else
+		     false
+#endif
+		    ))
+		goto err;
+
+	if (add_bool(m, "_with_lzma",
+#ifdef WITH_LZMA
+		     true
+#else
+		     false
+#endif
+		    ))
+		goto err;
 
 	return m;
 
 err:
 	Py_DECREF(m);
 	return NULL;
+}
+
+// On return from this function, three things need to be true:
+//
+// 1. The Python interpreter needs to be initialized.
+// 2. The GIL needs to be held (and the caller needs to know whether to release
+//    it to restore the original state).
+// 3. The _drgn module needs to be initialized.
+//
+// This can be called from many possible contexts (drgn CLI, standalone
+// application using libdrgn, etc.), so we have to handle every possible initial
+// state.
+PyGILState_STATE drgn_initialize_python(bool *success_ret)
+{
+	PyGILState_STATE gstate;
+	if (Py_IsInitialized()) {
+		gstate = PyGILState_Ensure();
+	} else {
+		gstate = PyGILState_UNLOCKED;
+		// If the Python interpreter wasn't already initialized, then we
+		// are in a standalone application using libdrgn. Set our
+		// imports up.
+		PyImport_AppendInittab("_drgn", PyInit__drgn);
+		Py_InitializeEx(0);
+		// Note: we don't have a good place to call Py_Finalize(), so we
+		// don't call it.
+		const char *env = getenv("PYTHONSAFEPATH");
+		if (!env || !env[0])
+			PyRun_SimpleString("import sys\nsys.path.insert(0, '')");
+	}
+
+	bool success = true;
+	if (!PyState_FindModule(&drgnmodule)) {
+		_cleanup_pydecref_ PyObject *m = PyImport_ImportModule("_drgn");
+		if (!m)
+			success = false;
+	}
+	*success_ret = success;
+	return gstate;
 }

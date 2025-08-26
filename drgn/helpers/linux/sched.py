@@ -15,16 +15,20 @@ from _drgn import (
     _linux_helper_cpu_curr,
     _linux_helper_idle_task,
     _linux_helper_task_cpu as task_cpu,
+    _linux_helper_task_on_cpu as task_on_cpu,
     _linux_helper_task_thread_info as task_thread_info,
 )
 from drgn import IntegerLike, Object, Program
 from drgn.helpers.common.prog import takes_program_or_default
+from drgn.helpers.linux.percpu import per_cpu
 
 __all__ = (
     "cpu_curr",
+    "get_task_state",
     "idle_task",
     "loadavg",
     "task_cpu",
+    "task_on_cpu",
     "task_state_to_char",
     "task_thread_info",
 )
@@ -121,6 +125,32 @@ def task_state_to_char(task: Object) -> str:
         return char
 
 
+_TASK_STATE_CHAR_TO_STATE = {
+    "R": "R (running)",
+    "S": "S (sleeping)",
+    "D": "D (disk sleep)",
+    "T": "T (stopped)",
+    "t": "t (tracing stop)",
+    "X": "X (dead)",
+    "Z": "Z (zombie)",
+    "P": "P (parked)",
+    "I": "I (idle)",
+}
+
+
+def get_task_state(task: Object) -> str:
+    """
+    Get the state of the task as a character plus a parenthesized name (e.g.,
+    ``'R (running)'``).
+
+    See also :func:`task_state_to_char()`.
+
+    :param task: ``struct task_struct *``
+    """
+    char = task_state_to_char(task)
+    return _TASK_STATE_CHAR_TO_STATE.get(char, char)
+
+
 @takes_program_or_default
 def loadavg(prog: Program) -> Tuple[float, float, float]:
     """
@@ -134,3 +164,43 @@ def loadavg(prog: Program) -> Tuple[float, float, float]:
     avenrun = prog["avenrun"]
     vals = [avenrun[i].value_() / (1 << 11) for i in range(3)]
     return (vals[0], vals[1], vals[2])
+
+
+@takes_program_or_default
+def cpu_rq(prog: Program, cpu: IntegerLike) -> Object:
+    """
+    Get the runqueue for a given cpu.
+
+    :param cpu: CPU number.
+    :returns: ``struct rq``
+    """
+    return per_cpu(prog["runqueues"], cpu)
+
+
+def task_rq(task: Object) -> Object:
+    """
+    Get the runqueue for a given task.
+
+    :param task: ``struct task_struct *``
+    :returns: ``struct rq``
+    """
+    return cpu_rq(task.prog_, task_cpu(task))
+
+
+def task_since_last_arrival_ns(task: Object) -> int:
+    """
+    Get the number of nanoseconds since a task last started running.
+
+    Assuming that time slices are short, this is approximately the time that
+    the task has been in its current status (running, queued, or blocked).
+
+    This is only supported if the kernel was compiled with
+    ``CONFIG_SCHEDSTATS`` or ``CONFIG_TASK_DELAY_ACCT``.
+
+    :param task: ``struct task_struct *``
+    :returns: Duration in nanoseconds.
+    """
+    arrival_time = task.sched_info.last_arrival.value_()
+    rq_clock = task_rq(task).clock.value_()
+
+    return rq_clock - arrival_time

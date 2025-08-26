@@ -10,15 +10,47 @@ kernfs pseudo filesystem interface in :linux:`include/linux/kernfs.h`.
 """
 
 import os
+from typing import Iterator, Optional
 
 from drgn import NULL, Object, Path
 from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
 
 __all__ = (
     "kernfs_name",
+    "kernfs_parent",
     "kernfs_path",
+    "kernfs_root",
     "kernfs_walk",
+    "kernfs_children",
 )
+
+
+def kernfs_root(kn: Object) -> Object:
+    """
+    Get the kernfs root that the given kernfs node belongs to.
+
+    :param kn: ``struct kernfs_node *``
+    :return: ``struct kernfs_root *``
+    """
+    knp = kernfs_parent(kn)
+    if knp:
+        kn = knp
+    return kn.dir.root.read_()
+
+
+def kernfs_parent(kn: Object) -> Object:
+    """
+    Get the parent of the given kernfs node.
+
+    :param kn: ``struct kernfs_node *``
+    :return: ``struct kernfs_node *``
+    """
+    # Linux kernel commit 633488947ef6 ("kernfs: Use RCU to access
+    # kernfs_node::parent.") (in v6.15) renamed the parent member.
+    try:
+        return kn.__parent.read_()
+    except AttributeError:
+        return kn.parent.read_()
 
 
 def kernfs_name(kn: Object) -> bytes:
@@ -29,13 +61,7 @@ def kernfs_name(kn: Object) -> bytes:
     """
     if not kn:
         return b"(null)"
-    return kn.name.string_() if kn.parent else b"/"
-
-
-def _kernfs_root(kn: Object) -> Object:
-    if kn.parent:
-        kn = kn.parent
-    return kn.dir.root
+    return kn.name.string_() if kernfs_parent(kn) else b"/"
 
 
 def kernfs_path(kn: Object) -> bytes:
@@ -47,14 +73,14 @@ def kernfs_path(kn: Object) -> bytes:
     if not kn:
         return b"(null)"
 
-    root_kn = _kernfs_root(kn).kn
+    root_kn = kernfs_root(kn).kn
     if kn == root_kn:
         return b"/"
 
     names = []
     while kn != root_kn:
         names.append(kn.name.string_())
-        kn = kn.parent
+        kn = kernfs_parent(kn)
     names.append(root_kn.name.string_())
     names.reverse()
 
@@ -86,3 +112,22 @@ def kernfs_walk(parent: Object, path: Path) -> Object:
         else:
             return NULL(parent.prog_, kernfs_nodep_type)
     return parent
+
+
+def kernfs_children(kn: Object) -> Optional[Iterator[Object]]:
+    """
+    Get an iterator over the children of the given kernfs node if the node
+    represents a directory.
+
+    :param kn: ``struct kernfs_node *``
+    :return: Iterator of ``struct kernfs_node *`` objects.
+    """
+    KERNFS_TYPE_MASK = 0x000F
+    kernfs_dir = kn.prog_.constant("KERNFS_DIR")
+
+    if (kn.flags & KERNFS_TYPE_MASK) != kernfs_dir:
+        raise ValueError("not a directory")
+
+    return rbtree_inorder_for_each_entry(
+        "struct kernfs_node", kn.dir.children.address_of_(), "rb"
+    )

@@ -3,6 +3,7 @@
 
 import contextlib
 import ctypes
+import enum
 import errno
 from fcntl import ioctl
 import functools
@@ -13,6 +14,8 @@ import pickle
 import re
 import signal
 import socket
+import stat
+import struct
 import subprocess
 import sys
 import time
@@ -20,7 +23,7 @@ import traceback
 from typing import NamedTuple
 import unittest
 
-from _drgn_util.platform import NORMALIZED_MACHINE_NAME, SYS
+from _drgn_util.platform import _IO, _IOR, NORMALIZED_MACHINE_NAME, SYS
 import drgn
 from tests import TestCase
 
@@ -209,10 +212,6 @@ def fork_and_stop(fn=None, *args, **kwds):
             os.waitpid(pid, 0)
 
 
-def smp_enabled():
-    return bool(re.search(r"\bSMP\b", os.uname().version))
-
-
 def parse_range_list(s):
     values = set()
     s = s.strip()
@@ -224,6 +223,10 @@ def parse_range_list(s):
             else:
                 values.add(int(first))
     return values
+
+
+def possible_cpus():
+    return parse_range_list(Path("/sys/devices/system/cpu/possible").read_text())
 
 
 _c = ctypes.CDLL(None, use_errno=True)
@@ -463,6 +466,14 @@ def losetup(fd):
                     loop.close()
 
 
+def fallocate(path, offset, len):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o666)
+    try:
+        os.posix_fallocate(fd, offset, len)
+    finally:
+        os.close(fd)
+
+
 _swapon = _c.swapon
 _swapon.argtypes = [ctypes.c_char_p, ctypes.c_int]
 _swapon.restype = ctypes.c_int
@@ -480,19 +491,99 @@ def swapoff(path):
     _check_ctypes_syscall(_swapoff(os.fsencode(path)), path)
 
 
-def mkswap(path, size):
-    header = bytearray(mmap.PAGESIZE)
-    header[1024:1028] = (1).to_bytes(4, sys.byteorder)  # version
-    header[1028:1032] = (size // mmap.PAGESIZE - 1).to_bytes(
-        4, sys.byteorder
-    )  # last_page
-    header[1036:1052] = os.urandom(16)  # sws_uuid
-    magic = b"SWAPSPACE2"
-    header[-len(magic) :] = magic
+_BLKRRPART = _IO(0x12, 95)
+_BLKSSZGET = _IO(0x12, 104)
+_BLKGETSIZE64 = _IOR(0x12, 114, ctypes.sizeof(ctypes.c_size_t))
 
-    with open(path, "wb") as f:
-        os.posix_fallocate(f.fileno(), 0, size)
-        f.write(header)
+
+def mkswap(path, size=None):
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        if size is None:
+            st = os.stat(fd)
+            if stat.S_ISBLK(st.st_mode):
+                size = ctypes.c_uint64()
+                ioctl(fd, _BLKGETSIZE64, size)
+                size = size.value
+            else:
+                size = st.st_size
+
+        header = bytearray(mmap.PAGESIZE)
+        header[1024:1028] = (1).to_bytes(4, sys.byteorder)  # version
+        header[1028:1032] = (size // mmap.PAGESIZE - 1).to_bytes(
+            4, sys.byteorder
+        )  # last_page
+        header[1036:1052] = os.urandom(16)  # sws_uuid
+        magic = b"SWAPSPACE2"
+        header[-len(magic) :] = magic
+
+        n = os.write(fd, header)
+        while n < len(header):
+            n += os.write(fd, header[n:])
+    finally:
+        os.close(fd)
+
+
+class MbrPartitionType(enum.IntEnum):
+    LINUX_SWAP = 0x82
+    LINUX = 0x83
+
+
+class MbrPartition(NamedTuple):
+    type: int
+    start: int
+    size: int
+    bootable: bool = False
+
+
+_MBR_PARTITION_STRUCT = struct.Struct("<8BII")
+
+
+def write_mbr(path, partitions, sector_size=None):
+    fd = os.open(path, os.O_WRONLY)
+    try:
+        if sector_size is None:
+            sector_size = ctypes.c_int()
+            ioctl(fd, _BLKSSZGET, sector_size)
+            sector_size = sector_size.value
+
+        buf = bytearray(sector_size)
+
+        buf[0x1B8:0x1BC] = os.urandom(4)  # Disk ID.
+
+        offset = 0x01BE
+        for partition in partitions:
+            if partition.start % sector_size != 0:
+                raise ValueError("partition start is not sector-aligned")
+            if partition.size % sector_size != 0:
+                raise ValueError("partition size is not sector-aligned")
+            _MBR_PARTITION_STRUCT.pack_into(
+                buf,
+                offset,
+                0x80 if partition.bootable else 0x0,
+                # Placeholder first CHS.
+                0xFE,
+                0xFF,
+                0xFF,
+                partition.type,
+                # Placeholder last CHS.
+                0xFE,
+                0xFF,
+                0xFF,
+                partition.start // sector_size,
+                partition.size // sector_size,
+            )
+            offset += _MBR_PARTITION_STRUCT.size
+
+        buf[0x1FE] = 0x55
+        buf[0x1FF] = 0xAA
+
+        n = os.write(fd, buf)
+        while n < len(buf):
+            n += os.write(fd, buf[n:])
+        ioctl(fd, _BLKRRPART)
+    finally:
+        os.close(fd)
 
 
 class _perf_event_attr_sample_period_or_freq(ctypes.Union):

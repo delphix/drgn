@@ -18,11 +18,12 @@
 #include "type.h"
 #include "util.h"
 
-#define DRGN_OBJECT_INITIALIZER(prog)			\
-	(struct drgn_object){				\
-		.type = drgn_void_type(prog, NULL),	\
-		.encoding = DRGN_OBJECT_ENCODING_NONE,	\
-		.kind = DRGN_OBJECT_ABSENT,		\
+#define DRGN_OBJECT_INITIALIZER(prog)				\
+	(struct drgn_object){					\
+		.type = &(prog)->void_types[DRGN_LANGUAGE_C],	\
+		.encoding = DRGN_OBJECT_ENCODING_NONE,		\
+		.kind = DRGN_OBJECT_ABSENT,			\
+		.absence_reason = DRGN_ABSENCE_REASON_OTHER,	\
 	}
 
 LIBDRGN_PUBLIC
@@ -498,6 +499,7 @@ drgn_object_set_reference(struct drgn_object *res,
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_set_absent(struct drgn_object *res,
 		       struct drgn_qualified_type qualified_type,
+		       enum drgn_absence_reason reason,
 		       uint64_t bit_field_size)
 {
 	struct drgn_error *err;
@@ -505,7 +507,7 @@ drgn_object_set_absent(struct drgn_object *res,
 	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	drgn_object_set_absent_internal(res, &type);
+	drgn_object_set_absent_internal(res, &type, reason);
 	return NULL;
 }
 
@@ -565,17 +567,19 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 }
 
 struct drgn_error *
-drgn_object_slice_internal(struct drgn_object *res,
-			   const struct drgn_object *obj,
-			   const struct drgn_object_type *type,
-			   uint64_t bit_offset, uint64_t bit_field_size)
+drgn_object_fragment_internal(struct drgn_object *res,
+			      const struct drgn_object *obj,
+			      const struct drgn_object_type *type,
+			      int64_t bit_offset, uint64_t bit_field_size)
 {
 	struct drgn_error *err;
 
 	SWITCH_ENUM(obj->kind) {
 	case DRGN_OBJECT_VALUE: {
 		uint64_t bit_end;
-		if (__builtin_add_overflow(bit_offset, type->bit_size, &bit_end)
+		if (bit_offset < 0
+		    || __builtin_add_overflow(bit_offset, type->bit_size,
+					      &bit_end)
 		    || bit_end > obj->bit_size) {
 			return drgn_error_create(DRGN_ERROR_OUT_OF_BOUNDS,
 						 "out of bounds of value");
@@ -601,14 +605,19 @@ drgn_object_slice_internal(struct drgn_object *res,
 		return drgn_object_set_from_buffer_internal(res, type, buf,
 							    bit_offset);
 	}
-	case DRGN_OBJECT_REFERENCE:
+	case DRGN_OBJECT_REFERENCE: {
 		// obj->bit_offset + bit_offset can overflow, so apply the
 		// byte-aligned part of bit_offset now.
-		return drgn_object_set_reference_internal(res, type,
-							  obj->address
-							  + (bit_offset / 8),
+		//
+		// / and % truncate towards 0. Here, we want to truncate towards
+		// negative infinity. We can accomplish that by replacing "/ 8"
+		// with an arithmetic shift ">> 3" and "% 8" with "& 7".
+		uint64_t address = obj->address + (bit_offset >> 3);
+		bit_offset &= 7;
+		return drgn_object_set_reference_internal(res, type, address,
 							  obj->bit_offset
-							  + (bit_offset % 8));
+							  + bit_offset);
+	}
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
 	default:
@@ -617,9 +626,9 @@ drgn_object_slice_internal(struct drgn_object *res,
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
-drgn_object_slice(struct drgn_object *res, const struct drgn_object *obj,
-		  struct drgn_qualified_type qualified_type,
-		  uint64_t bit_offset, uint64_t bit_field_size)
+drgn_object_fragment(struct drgn_object *res, const struct drgn_object *obj,
+		     struct drgn_qualified_type qualified_type,
+		     int64_t bit_offset, uint64_t bit_field_size)
 {
 	struct drgn_error *err;
 	if (drgn_object_program(res) != drgn_object_program(obj)) {
@@ -630,8 +639,8 @@ drgn_object_slice(struct drgn_object *res, const struct drgn_object *obj,
 	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	return drgn_object_slice_internal(res, obj, &type, bit_offset,
-					  bit_field_size);
+	return drgn_object_fragment_internal(res, obj, &type, bit_offset,
+					     bit_field_size);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1097,16 +1106,33 @@ drgn_object_read_c_string(const struct drgn_object *obj, char **ret)
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
-drgn_format_object(const struct drgn_object *obj, size_t columns,
-		   enum drgn_format_object_flags flags, char **ret)
+drgn_format_object(const struct drgn_object *obj,
+		   const struct drgn_format_object_options *options,
+		   char **ret)
 {
+
 	const struct drgn_language *lang = drgn_object_language(obj);
 
-	if (flags & ~DRGN_FORMAT_OBJECT_VALID_FLAGS) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "invalid format object flags");
+	if (options) {
+		if (options->flags & ~DRGN_FORMAT_OBJECT_VALID_FLAGS) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "invalid format object flags");
+		}
+		if (options->integer_base != 8
+		    && options->integer_base != 10
+		    && options->integer_base != 16) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "invalid integer base");
+		}
+	} else {
+		static const struct drgn_format_object_options default_options = {
+			.columns = SIZE_MAX,
+			.flags = DRGN_FORMAT_OBJECT_PRETTY,
+			.integer_base = 10,
+		};
+		options = &default_options;
 	}
-	return lang->format_object(obj, columns, flags, ret);
+	return lang->format_object(obj, options, ret);
 }
 
 static struct drgn_error *
@@ -1225,9 +1251,9 @@ drgn_compound_object_is_zero(const struct drgn_object *obj,
 		if (err)
 			return err;
 
-		err = drgn_object_slice(&member, obj, member_type,
-					members[i].bit_offset,
-					member_bit_field_size);
+		err = drgn_object_fragment(&member, obj, member_type,
+					   members[i].bit_offset,
+					   member_bit_field_size);
 		if (err)
 			return err;
 
@@ -1254,8 +1280,8 @@ drgn_array_object_is_zero(const struct drgn_object *obj,
 	DRGN_OBJECT(element, drgn_object_program(obj));
 	length = drgn_type_length(underlying_type);
 	for (i = 0; i < length; i++) {
-		err = drgn_object_slice(&element, obj, element_type,
-					i * element_bit_size, 0);
+		err = drgn_object_fragment(&element, obj, element_type,
+					   i * element_bit_size, 0);
 		if (err)
 			return err;
 
@@ -1383,7 +1409,7 @@ drgn_object_reinterpret(struct drgn_object *res,
 			struct drgn_qualified_type qualified_type,
 			const struct drgn_object *obj)
 {
-	return drgn_object_slice(res, obj, qualified_type, 0, 0);
+	return drgn_object_fragment(res, obj, qualified_type, 0, 0);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1586,8 +1612,46 @@ drgn_object_subscript(struct drgn_object *res, const struct drgn_object *obj,
 						      index * element.bit_size,
 						      0);
 	} else {
-		return drgn_object_slice(res, obj, element.qualified_type,
-					 index * element.bit_size, 0);
+		return drgn_object_fragment(res, obj, element.qualified_type,
+					    index * element.bit_size, 0);
+	}
+}
+
+LIBDRGN_PUBLIC
+struct drgn_error *drgn_object_slice(struct drgn_object *res,
+				     const struct drgn_object *obj,
+				     int64_t start, int64_t end)
+{
+	struct drgn_error *err;
+	struct drgn_program *prog = drgn_object_program(obj);
+
+	if (drgn_object_program(res) != prog) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "objects are from different programs");
+	}
+
+	struct drgn_element_info element;
+	err = drgn_program_element_info(drgn_object_program(obj), obj->type,
+					&element);
+	if (err)
+		return err;
+
+	struct drgn_qualified_type array_type;
+	err = drgn_array_type_create(prog, element.qualified_type,
+				     end > start ? end - start : 0,
+				     drgn_type_language(element.qualified_type.type),
+				     &array_type.type);
+	if (err)
+		return err;
+	array_type.qualifiers = 0;
+
+	if (obj->encoding == DRGN_OBJECT_ENCODING_UNSIGNED) {
+		return drgn_object_dereference_offset(res, obj, array_type,
+						      start * element.bit_size,
+						      0);
+	} else {
+		return drgn_object_fragment(res, obj, array_type,
+					    start * element.bit_size, 0);
 	}
 }
 
@@ -1613,8 +1677,8 @@ drgn_object_member(struct drgn_object *res, const struct drgn_object *obj,
 	err = drgn_member_type(member, &member_type, &member_bit_field_size);
 	if (err)
 		return err;
-	return drgn_object_slice(res, obj, member_type, member_bit_offset,
-				 member_bit_field_size);
+	return drgn_object_fragment(res, obj, member_type, member_bit_offset,
+				    member_bit_field_size);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1649,6 +1713,24 @@ drgn_object_member_dereference(struct drgn_object *res,
 	return drgn_object_dereference_offset(res, obj, member_type,
 					      member_bit_offset,
 					      member_bit_field_size);
+}
+
+LIBDRGN_PUBLIC
+struct drgn_error *drgn_object_subobject(struct drgn_object *res,
+					 const struct drgn_object *obj,
+					 const char *designator)
+{
+	struct drgn_error *err;
+	const struct drgn_language *lang = drgn_object_language(obj);
+	struct drgn_qualified_type qualified_type;
+	uint64_t bit_offset, bit_field_size;
+	err = lang->type_subobject(obj->type, designator, false,
+				   &qualified_type, &bit_offset,
+				   &bit_field_size);
+	if (err)
+		return err;
+	return drgn_object_fragment(res, obj, qualified_type, bit_offset,
+				    bit_field_size);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *

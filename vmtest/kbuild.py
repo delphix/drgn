@@ -52,10 +52,6 @@ _PATCHES = (
         versions=((None, None),),
     ),
     _Patch(
-        name="9p-fix-slab-cache-name-creation-for-real.patch",
-        versions=((KernelVersion("6.12"), None),),
-    ),
-    _Patch(
         name="filelock-fix-name-of-file_lease-slab-cache.patch",
         versions=((KernelVersion("6.9"), KernelVersion("6.10")),),
     ),
@@ -145,6 +141,44 @@ _PATCHES = (
     _Patch(
         name="lib-raid6-add-option-to-skip-algo-benchmarking.patch",
         versions=((None, KernelVersion("5.0")),),
+    ),
+    _Patch(
+        name="5.18-Revert-Makefile-link-with-z-noexecstack-no-warn-rwx-.patch",
+        versions=((KernelVersion("5.18.18"), KernelVersion("5.19")),),
+    ),
+    # We could backport this further, but we currently only need it between
+    # Linux kernel commits 50428fdc53ba ("powerpc: Add a ppc_inst_as_str()
+    # helper") (in v5.9) and 2a83afe72a2b ("powerpc/64: Drop
+    # ppc_inst_as_str()") (in v6.0).
+    _Patch(
+        name="gcc-12-disable-Wdangling-pointer-warning-for-now.patch",
+        versions=((KernelVersion("5.16"), KernelVersion("5.18.6")),),
+    ),
+    _Patch(
+        name="5.10-gcc-12-disable-Wdangling-pointer-warning-for-now.patch",
+        versions=(
+            (KernelVersion("5.11"), KernelVersion("5.15.49")),
+            (KernelVersion("5.9"), KernelVersion("5.10.183")),
+        ),
+    ),
+    _Patch(
+        name="5.17-page_pool-enable-CONFIG_PAGE_POOL-by-default.patch",
+        versions=((KernelVersion("5.5"), KernelVersion("5.18")),),
+    ),
+    _Patch(
+        name="5.4-page_pool-enable-CONFIG_PAGE_POOL-by-default.patch",
+        versions=((KernelVersion("4.18"), KernelVersion("5.5")),),
+    ),
+    _Patch(
+        name="kernel-reboot-emergency_restart-Set-correct-system_s.patch",
+        versions=(
+            (KernelVersion("6.6"), KernelVersion("6.6.3")),
+            (KernelVersion("6.2"), KernelVersion("6.5.13")),
+            (KernelVersion("5.16"), KernelVersion("6.1.64")),
+            (KernelVersion("5.11"), KernelVersion("5.15.140")),
+            (KernelVersion("5.5"), KernelVersion("5.10.202")),
+            (None, KernelVersion("5.4.262")),
+        ),
     ),
 )
 

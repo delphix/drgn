@@ -9,14 +9,27 @@ The ``drgn.helpers.linux.printk`` module provides helpers for reading the Linux
 kernel log buffer.
 """
 
+import operator
 import sys
-from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Union,
+)
 
 if TYPE_CHECKING:
     from _typeshed import SupportsWrite
 
+from datetime import datetime
+
 from drgn import Object, Program, cast, sizeof
 from drgn.helpers.common.prog import takes_program_or_default
+from drgn.helpers.linux.timekeeping import ktime_get_coarse_ns, ktime_get_coarse_real_ns
 
 __all__ = (
     "get_dmesg",
@@ -242,8 +255,18 @@ def get_printk_records(prog: Program) -> List[PrintkRecord]:
         return _get_printk_records_lockless(prog, prb)
 
 
+def _format_record_default(record: PrintkRecord) -> bytes:
+    return b"[% 5d.%06d] %s" % (
+        record.timestamp // 1000000000,
+        record.timestamp % 1000000000 // 1000,
+        record.text,
+    )
+
+
 @takes_program_or_default
-def get_dmesg(prog: Program) -> bytes:
+def get_dmesg(
+    prog: Program, *, timestamps: Union[bool, Literal["human"]] = True
+) -> bytes:
     """
     Get the contents of the kernel log buffer formatted like
     :manpage:`dmesg(1)`.
@@ -258,22 +281,46 @@ def get_dmesg(prog: Program) -> bytes:
 
     If you need to format the log buffer differently, use
     :func:`get_printk_records()` and format it yourself.
+
+    :param timestamps: How to format timestamps. If ``True``, timestamps are
+        formatted in decimal seconds. If ``False``, timestamps are omitted. If
+        ``"human"``, timestamps are formatted as human-readable dates and
+        times, which are only correct for messages printed since the last
+        suspend/resume.
     """
-    lines = [
-        b"[% 5d.%06d] %s"
-        % (
-            record.timestamp // 1000000000,
-            record.timestamp % 1000000000 // 1000,
-            record.text,
+    if timestamps == "human":
+        boot_time_s = (
+            ktime_get_coarse_real_ns(prog).value_() - ktime_get_coarse_ns(prog).value_()
         )
-        for record in get_printk_records(prog)
-    ]
+
+        def format(record: PrintkRecord) -> bytes:
+            return b"[%s] %s" % (
+                datetime.fromtimestamp((boot_time_s + record.timestamp) // 1000000000)
+                .astimezone()
+                .strftime("%a %b %e %T %Z %Y")
+                .encode(),
+                record.text,
+            )
+
+    else:
+        assert isinstance(timestamps, bool)
+        if timestamps:
+            format = _format_record_default
+        else:
+            format = operator.attrgetter("text")  # type: ignore[assignment]
+
+    lines = [format(record) for record in get_printk_records(prog)]
     lines.append(b"")  # So we get a trailing newline.
     return b"\n".join(lines)
 
 
 @takes_program_or_default
-def print_dmesg(prog: Program, *, file: "Optional[SupportsWrite[str]]" = None) -> None:
+def print_dmesg(
+    prog: Program,
+    *,
+    timestamps: Union[bool, Literal["human"]] = True,
+    file: "Optional[SupportsWrite[str]]" = None,
+) -> None:
     """
     Print the contents of the kernel log buffer.
 
@@ -283,8 +330,9 @@ def print_dmesg(prog: Program, *, file: "Optional[SupportsWrite[str]]" = None) -
     [    0.000000] BIOS-provided physical RAM map:
     ...
 
+    :param timestamps: How to format timestamps. See :func:`get_dmesg()`.
     :param file: File to print to. Defaults to :data:`sys.stdout`.
     """
     (sys.stdout if file is None else file).write(
-        get_dmesg(prog).decode(errors="replace")
+        get_dmesg(prog, timestamps=timestamps).decode(errors="replace")
     )

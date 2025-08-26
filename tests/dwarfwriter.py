@@ -3,7 +3,7 @@
 
 from collections import OrderedDict
 import os.path
-from typing import Any, NamedTuple, Optional, Sequence, Union
+from typing import Any, Dict, NamedTuple, Optional, Sequence, Union
 import zlib
 
 from _drgn_util.elf import ET, SHF, SHT
@@ -24,13 +24,14 @@ class DwarfLabel(NamedTuple):
 
 class DwarfDie(NamedTuple):
     tag: DW_TAG
-    attribs: Sequence[DwarfAttrib]
+    attribs: Sequence[DwarfAttrib] = ()
     children: Sequence[Union["DwarfDie", DwarfLabel]] = ()
 
 
 class DwarfUnit(NamedTuple):
     type: DW_UT
     die: DwarfDie
+    die_label: Optional[str] = None
     dwo_id: Optional[int] = None
     type_signature: Optional[int] = None
     type_offset: Optional[str] = None
@@ -66,20 +67,18 @@ def _compile_debug_abbrev(units, use_dw_form_indirect):
 
 
 def _compile_debug_info(units, little_endian, bits, version, use_dw_form_indirect):
+    offset_size = 4  # We only emit the 32-bit format for now.
     byteorder = "little" if little_endian else "big"
-    all_labels = set()
     labels = {}
-    relocations = []
+    references = []
+    unit_references = []
     code = 1
     decl_file = 1
 
     def aux(buf, die, depth):
         if isinstance(die, DwarfLabel):
-            # For now, labels are only supported within a unit, but make sure
-            # they're unique across all units.
-            if die.name in all_labels:
+            if die.name in labels:
                 raise ValueError(f"duplicate label {die.name!r}")
-            all_labels.add(die.name)
             labels[die.name] = len(buf)
             return
 
@@ -100,9 +99,9 @@ def _compile_debug_info(units, little_endian, bits, version, use_dw_form_indirec
                 buf.append(value)
             elif attrib.form == DW_FORM.data2:
                 buf.extend(value.to_bytes(2, byteorder))
-            elif attrib.form == DW_FORM.data4:
+            elif attrib.form in (DW_FORM.data4, DW_FORM.ref_sup4):
                 buf.extend(value.to_bytes(4, byteorder))
-            elif attrib.form == DW_FORM.data8:
+            elif attrib.form in (DW_FORM.data8, DW_FORM.ref_sup8):
                 buf.extend(value.to_bytes(8, byteorder))
             elif attrib.form == DW_FORM.udata:
                 _append_uleb128(buf, value)
@@ -114,16 +113,53 @@ def _compile_debug_info(units, little_endian, bits, version, use_dw_form_indirec
             elif attrib.form == DW_FORM.block1:
                 buf.append(len(value))
                 buf.extend(value)
+            elif attrib.form in (DW_FORM.strp, DW_FORM.GNU_ref_alt):
+                buf.extend(value.to_bytes(offset_size, byteorder))
             elif attrib.form == DW_FORM.string:
                 buf.extend(value.encode())
                 buf.append(0)
+            elif attrib.form == DW_FORM.ref1:
+                if isinstance(value, str):
+                    unit_references.append((len(buf), 1, value))
+                    buf.append(0)
+                else:
+                    buf.extend(value.to_bytes(1, byteorder))
+            elif attrib.form == DW_FORM.ref2:
+                if isinstance(value, str):
+                    unit_references.append((len(buf), 2, value))
+                    buf.extend(bytes(2))
+                else:
+                    buf.extend(value.to_bytes(2, byteorder))
             elif attrib.form == DW_FORM.ref4:
-                relocations.append((len(buf), value))
-                buf.extend(b"\0\0\0\0")
+                if isinstance(value, str):
+                    unit_references.append((len(buf), 4, value))
+                    buf.extend(bytes(4))
+                else:
+                    buf.extend(value.to_bytes(4, byteorder))
+            elif attrib.form == DW_FORM.ref8:
+                if isinstance(value, str):
+                    unit_references.append((len(buf), 8, value))
+                    buf.extend(bytes(8))
+                else:
+                    buf.extend(value.to_bytes(8, byteorder))
+            elif attrib.form == DW_FORM.ref_udata:
+                if isinstance(value, str):
+                    assert (
+                        value in labels
+                    ), "DW_FORM_ref_udata can only be used for backreferences"
+                    _append_uleb128(buf, labels[value] - unit_offset)
+                else:
+                    _append_uleb128(buf, value)
+            elif attrib.form == DW_FORM.ref_addr:
+                if isinstance(value, str):
+                    references.append((len(buf), offset_size, value))
+                    buf.extend(bytes(offset_size))
+                else:
+                    buf.extend(value.to_bytes(offset_size, byteorder))
             elif attrib.form == DW_FORM.ref_sig8:
                 buf.extend(value.to_bytes(8, byteorder))
             elif attrib.form == DW_FORM.sec_offset:
-                buf.extend(b"\0\0\0\0")
+                buf.extend(bytes(offset_size))
             elif attrib.form == DW_FORM.flag_present:
                 pass
             elif attrib.form == DW_FORM.exprloc:
@@ -139,14 +175,13 @@ def _compile_debug_info(units, little_endian, bits, version, use_dw_form_indirec
     debug_info = bytearray()
     debug_types = bytearray()
     for unit in units:
-        labels.clear()
-        relocations.clear()
+        unit_references.clear()
         decl_file = 1
         if version == 4 and unit.type in (DW_UT.type, DW_UT.split_type):
             buf = debug_types
         else:
             buf = debug_info
-        orig_len = len(buf)
+        unit_offset = len(buf)
         buf.extend(b"\0\0\0\0")  # unit_length
         buf.extend(version.to_bytes(2, byteorder))  # version
         if version >= 5:
@@ -162,21 +197,27 @@ def _compile_debug_info(units, little_endian, bits, version, use_dw_form_indirec
             assert unit.dwo_id is None
         if unit.type in (DW_UT.type, DW_UT.split_type):
             buf.extend(unit.type_signature.to_bytes(8, byteorder))  # type_signature
-            relocations.append((len(buf), unit.type_offset))
-            buf.extend(b"\0\0\0\0")  # type_offset
+            unit_references.append((len(buf), offset_size, unit.type_offset))
+            buf.extend(bytes(offset_size))  # type_offset
         else:
             assert unit.type_signature is None
             assert unit.type_offset is None
 
+        if unit.die_label is not None:
+            aux(buf, DwarfLabel(unit.die_label), 0)
         aux(buf, unit.die, 0)
 
-        unit_length = len(buf) - orig_len - 4
-        buf[orig_len : orig_len + 4] = unit_length.to_bytes(4, byteorder)
+        unit_length = len(buf) - unit_offset - 4
+        buf[unit_offset : unit_offset + 4] = unit_length.to_bytes(4, byteorder)
 
-        for offset, label in relocations:
-            die_offset = labels[label] - orig_len
-            buf[offset : offset + 4] = die_offset.to_bytes(4, byteorder)
-    return debug_info, debug_types
+        for offset, size, label in unit_references:
+            die_offset = labels[label] - unit_offset
+            buf[offset : offset + size] = die_offset.to_bytes(size, byteorder)
+
+    for offset, size, label in references:
+        buf[offset : offset + size] = labels[label].to_bytes(size, byteorder)
+
+    return debug_info, debug_types, labels
 
 
 def _compile_debug_line(units, little_endian, bits, version):
@@ -295,19 +336,27 @@ def _compile_debug_line(units, little_endian, bits, version):
     return buf
 
 
-_UNIT_TAGS = frozenset({DW_TAG.type_unit, DW_TAG.compile_unit})
+_UNIT_TAGS = frozenset({DW_TAG.type_unit, DW_TAG.compile_unit, DW_TAG.partial_unit})
 
 
-def dwarf_sections(
+class DwarfResult(NamedTuple):
+    data: bytes
+    labels: Dict[str, int]
+
+
+def compile_dwarf(
     units_or_dies,
-    little_endian=True,
-    bits=64,
     *,
     version=4,
     lang=None,
     use_dw_form_indirect=False,
     compress=None,
     split=None,
+    sections=(),
+    little_endian=True,
+    bits=64,
+    allow_any_unit_die=False,
+    **kwargs,
 ):
     assert compress in (None, "zlib-gnu", "zlib-gabi")
     assert split in (None, "dwo")
@@ -326,7 +375,7 @@ def dwarf_sections(
             DwarfUnit(DW_UT.compile, DwarfDie(DW_TAG.compile_unit, (), units_or_dies)),
         )
     assert all(isinstance(unit, DwarfUnit) for unit in units)
-    assert all(unit.die.tag in _UNIT_TAGS for unit in units)
+    assert allow_any_unit_die or all(unit.die.tag in _UNIT_TAGS for unit in units)
 
     unit_attribs = []
     if lang is not None:
@@ -346,7 +395,7 @@ def dwarf_sections(
     if not split:
         debug_line = _compile_debug_line(units, little_endian, bits, version)
 
-    debug_info, debug_types = _compile_debug_info(
+    debug_info, debug_types, labels = _compile_debug_info(
         units, little_endian, bits, version, use_dw_form_indirect
     )
 
@@ -368,7 +417,7 @@ def dwarf_sections(
         )
         return name
 
-    sections = [
+    dwarf_sections = [
         debug_section(
             ".debug_abbrev", _compile_debug_abbrev(units, use_dw_form_indirect)
         ),
@@ -376,41 +425,21 @@ def dwarf_sections(
         debug_section(".debug_str", b"\0"),
     ]
     if not split:
-        sections.append(debug_section(".debug_line", debug_line))
+        dwarf_sections.append(debug_section(".debug_line", debug_line))
     if debug_types:
-        sections.append(debug_section(".debug_types", debug_types))
-    return sections
+        dwarf_sections.append(debug_section(".debug_types", debug_types))
 
-
-def compile_dwarf(
-    dies,
-    little_endian=True,
-    bits=64,
-    *,
-    version=4,
-    lang=None,
-    use_dw_form_indirect=False,
-    compress=None,
-    split=None,
-    sections=(),
-    build_id=None,
-):
-    return create_elf_file(
-        ET.EXEC,
-        sections=[
-            *sections,
-            *dwarf_sections(
-                dies,
-                little_endian=little_endian,
-                bits=bits,
-                version=version,
-                lang=lang,
-                use_dw_form_indirect=use_dw_form_indirect,
-                compress=compress,
-                split=split,
-            ),
-        ],
-        build_id=build_id,
-        little_endian=little_endian,
-        bits=bits,
+    return DwarfResult(
+        data=create_elf_file(
+            ET.EXEC,
+            sections=[*sections, *dwarf_sections],
+            little_endian=little_endian,
+            bits=bits,
+            **kwargs,
+        ),
+        labels=labels,
     )
+
+
+def create_dwarf_file(*args, **kwargs):
+    return compile_dwarf(*args, **kwargs).data

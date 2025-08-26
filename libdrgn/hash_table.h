@@ -292,6 +292,14 @@ hash_table_delete_iterator_hashed(struct hash_table *table,
 				  struct hash_pair hp);
 
 /**
+ * Delete an entry in a @ref hash_table.
+ *
+ * @return An iterator pointing to the next entry in the table. See @ref
+ * hash_table_next().
+ */
+bool hash_table_delete_entry(struct hash_table *table, const entry_type *entry);
+
+/**
  * Get an iterator pointing to the first entry in a @ref hash_table.
  *
  * The first entry is arbitrary.
@@ -1515,10 +1523,17 @@ static bool table##_delete_hashed(struct table *table,				\
 	return true;								\
 }										\
 										\
-__attribute__((__unused__))							\
 static bool table##_delete(struct table *table, const table##_key_type *key)	\
 {										\
 	return table##_delete_hashed(table, key, table##_hash(key));		\
+}										\
+										\
+__attribute__((__unused__))							\
+static inline bool table##_delete_entry(struct table *table,			\
+					const table##_entry_type *entry)	\
+{										\
+	const table##_key_type key = table##_entry_to_key(entry);		\
+	return table##_delete(table, &key);					\
 }										\
 										\
 __attribute__((__unused__))							\
@@ -1678,6 +1693,25 @@ DEFINE_HASH_SET_FUNCTIONS(table, hash_func, eq_func)
  * @sa hash_table_init()
  */
 #define HASH_TABLE_INIT { hash_table_empty_chunk }
+
+/**
+ * Define and initialize an empty @ref hash_table of type @p table_type named @p
+ * table that is automatically deinitialized when it goes out of scope.
+ */
+#define HASH_TABLE(table_type, table)				\
+	__attribute__((__cleanup__(table_type##_deinit)))	\
+	struct table_type table = HASH_TABLE_INIT
+
+/**
+ * Iterate over every entry in a @ref hash_table.
+ *
+ * @param[in] table_type Name of hash table type.
+ * @param[out] it Name of iterator variable.
+ * @param[in] table Hash table to iterate over.
+ */
+#define hash_table_for_each(table_type, it, table)				\
+	for (struct table_type##_iterator it = table_type##_first(table);	\
+	     it.entry; it = table_type##_next(it))
 
 /**
  * @defgroup HashTableHelpers Hash table helpers
