@@ -92,7 +92,8 @@ class build_ext(_build_ext):
             args = [
                 os.path.relpath("libdrgn/configure", self.build_temp),
                 "--disable-static",
-                "--enable-python",
+                "--disable-libdrgn",
+                "--enable-python-extension",
             ]
             try:
                 args.extend(shlex.split(os.environ["CONFIGURE_FLAGS"]))
@@ -464,8 +465,11 @@ setup(
         "sdist": sdist,
         "test": test,
     },
-    entry_points={"console_scripts": ["drgn=drgn.cli:_main"]},
-    python_requires=">=3.6",
+    entry_points={
+        "console_scripts": ["drgn=drgn.cli:_main"],
+        "drgn.plugins": ["builtin_commands=drgn.commands._builtin"],
+    },
+    python_requires=">=3.8",
     author="Omar Sandoval",
     author_email="osandov@osandov.com",
     description="Programmable debugger",

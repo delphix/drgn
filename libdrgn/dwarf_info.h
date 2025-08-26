@@ -196,6 +196,12 @@ struct drgn_dwarf_info {
 	struct drgn_dwarf_specification_map specifications;
 	/** Indexed compilation units. */
 	struct drgn_dwarf_index_cu_vector index_cus;
+	/**
+	 * Lookup table for indexed compilation units sorted on buffer address.
+	 *
+	 * Size is equal to that of @ref index_cus.
+	 */
+	struct drgn_dwarf_index_cu_lookup *index_cu_lookup;
 
 	/**
 	 * Cache of parsed types.
@@ -216,39 +222,7 @@ struct drgn_dwarf_info {
 void drgn_dwarf_info_init(struct drgn_debug_info *dbinfo);
 void drgn_dwarf_info_deinit(struct drgn_debug_info *dbinfo);
 
-/**
- * State tracked while indexing new DWARF information in a @ref drgn_dwarf_info.
- */
-struct drgn_dwarf_index_state {
-	struct drgn_debug_info *dbinfo;
-	/** Per-thread arrays of CUs to be indexed. */
-	struct drgn_dwarf_index_cu_vector *cus;
-};
-
-/**
- * Initialize state for indexing new DWARF information.
- *
- * @return @c true on success, @c false on failure to allocate memory.
- */
-bool drgn_dwarf_index_state_init(struct drgn_dwarf_index_state *state,
-				 struct drgn_debug_info *dbinfo);
-
-/** Deinitialize state for indexing new DWARF information. */
-void drgn_dwarf_index_state_deinit(struct drgn_dwarf_index_state *state);
-
-/** Read a @ref drgn_elf_file to index its DWARF information. */
-struct drgn_error *
-drgn_dwarf_index_read_file(struct drgn_dwarf_index_state *state,
-			   struct drgn_elf_file *file);
-
-/**
- * Index new DWARF information.
- *
- * This should be called once all files have been read with @ref
- * drgn_dwarf_index_read_file() to finish indexing those files.
- */
-struct drgn_error *
-drgn_dwarf_info_update_index(struct drgn_dwarf_index_state *state);
+struct drgn_error *drgn_dwarf_info_update_index(struct drgn_debug_info *dbinfo);
 
 /**
  * Find the DWARF DIEs in a @ref drgn_module for the scope containing a given

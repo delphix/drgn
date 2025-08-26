@@ -15,6 +15,7 @@ from drgn import (
     Language,
     NoDefaultProgramError,
     Object,
+    ObjectNotFoundError,
     Platform,
     PlatformFlags,
     Program,
@@ -70,6 +71,7 @@ class TestProgram(TestCase):
         self.assertIsNone(prog.platform)
         self.assertFalse(prog.flags & ProgramFlags.IS_LIVE)
         prog.set_pid(os.getpid())
+        self.assertIsNone(prog.core_dump_path)
         self.assertEqual(prog.platform, host_platform)
         self.assertTrue(prog.flags & ProgramFlags.IS_LIVE)
         self.assertRaisesRegex(
@@ -104,46 +106,65 @@ class TestProgram(TestCase):
 
         self.assertEqual(prog.read(ctypes.addressof(buf), len(data)), data)
 
-    def test_lookup_error(self):
+    def test_object_not_found_error(self):
         prog = mock_program()
-        self.assertRaisesRegex(
-            LookupError, "^could not find constant 'foo'$", prog.constant, "foo"
-        )
-        self.assertRaisesRegex(
-            LookupError,
-            "^could not find constant 'foo' in 'foo.c'$",
-            prog.constant,
-            "foo",
-            "foo.c",
-        )
-        self.assertRaisesRegex(
-            LookupError, "^could not find function 'foo'$", prog.function, "foo"
-        )
-        self.assertRaisesRegex(
-            LookupError,
-            "^could not find function 'foo' in 'foo.c'$",
-            prog.function,
-            "foo",
-            "foo.c",
-        )
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find constant 'foo'$"
+        ) as cm:
+            prog.constant("foo")
+        self.assertEqual(cm.exception.name, "foo")
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find constant 'foo' in 'foo.c'$"
+        ) as cm:
+            prog.constant("foo", "foo.c")
+        self.assertEqual(cm.exception.name, "foo")
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find function 'foo'$"
+        ) as cm:
+            prog.function("foo")
+        self.assertEqual(cm.exception.name, "foo")
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find function 'foo' in 'foo.c'$"
+        ) as cm:
+            prog.function("foo", "foo.c")
+        self.assertEqual(cm.exception.name, "foo")
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find variable 'foo'$"
+        ) as cm:
+            prog.variable("foo")
+        self.assertEqual(cm.exception.name, "foo")
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find variable 'foo' in 'foo.c'$"
+        ) as cm:
+            prog.variable("foo", "foo.c")
+        self.assertEqual(cm.exception.name, "foo")
+
+        with self.assertRaisesRegex(
+            ObjectNotFoundError, "^could not find 'foo'$"
+        ) as cm:
+            prog["foo"]
+        self.assertEqual(cm.exception.name, "foo")
+
+        # If name isn't a string, prog.object(name) should raise TypeError, and
+        # prog[name] should raise KeyError (not ObjectNotFoundError).
+        self.assertRaises(TypeError, prog.object, 9)
+        with self.assertRaises(KeyError) as cm:
+            prog[9]
+        self.assertIs(type(cm.exception), KeyError)
+
+    def test_type_lookup_error(self):
+        prog = mock_program()
+
         self.assertRaisesRegex(LookupError, "^could not find 'foo'$", prog.type, "foo")
         self.assertRaisesRegex(
             LookupError, "^could not find 'foo' in 'foo.c'$", prog.type, "foo", "foo.c"
         )
-        self.assertRaisesRegex(
-            LookupError, "^could not find variable 'foo'$", prog.variable, "foo"
-        )
-        self.assertRaisesRegex(
-            LookupError,
-            "^could not find variable 'foo' in 'foo.c'$",
-            prog.variable,
-            "foo",
-            "foo.c",
-        )
-        # prog[key] should raise KeyError instead of LookupError.
-        self.assertRaises(KeyError, prog.__getitem__, "foo")
-        # Even for non-strings.
-        self.assertRaises(KeyError, prog.__getitem__, 9)
 
     def test_flags(self):
         self.assertIsInstance(mock_program().flags, ProgramFlags)
@@ -161,6 +182,10 @@ class TestProgram(TestCase):
         self.assertRaisesRegex(
             TypeError, "language must be Language", setattr, prog, "language", "CPP"
         )
+
+    def test_language_del(self):
+        with self.assertRaises(AttributeError):
+            del Program().language
 
 
 class TestMemory(TestCase):
@@ -402,6 +427,42 @@ class TestMemory(TestCase):
             0xFFFF0000,
             8,
         )
+
+    def test_python_fault_error(self):
+        def fault_memory_reader(address, count, offset, physical):
+            raise FaultError("fault from Python", address)
+
+        prog = Program(MOCK_PLATFORM)
+        prog.add_memory_segment(0xFFFF0000, 8, fault_memory_reader)
+
+        with self.assertRaises(FaultError) as cm:
+            Object(prog, "int", address=0xFFFF0004).read_()
+        self.assertEqual(cm.exception.message, "fault from Python")
+        self.assertEqual(cm.exception.address, 0xFFFF0004)
+
+        # If the FaultError from Python is translated to a drgn_error
+        # correctly, then this shouldn't raise an exception.
+        str(Object(prog, "int *", 0xFFFF0004))
+
+    def test_python_fault_error_invalid_message(self):
+        def fault_memory_reader(address, count, offset, physical):
+            raise FaultError(None, address)
+
+        prog = Program(MOCK_PLATFORM)
+        prog.add_memory_segment(0xFFFF0000, 8, fault_memory_reader)
+
+        # Just test that it doesn't crash.
+        self.assertRaises(Exception, Object(prog, "int", address=0xFFFF0004).read_)
+
+    def test_python_fault_error_invalid_address(self):
+        def fault_memory_reader(address, count, offset, physical):
+            raise FaultError("fault from Python", None)
+
+        prog = Program(MOCK_PLATFORM)
+        prog.add_memory_segment(0xFFFF0000, 8, fault_memory_reader)
+
+        # Just test that it doesn't crash.
+        self.assertRaises(Exception, Object(prog, "int", address=0xFFFF0004).read_)
 
 
 class TestTypeFinder(TestCase):
@@ -1007,6 +1068,7 @@ class TestCoreDump(TestCase):
     def test_simple(self):
         data = b"hello, world"
         prog = Program()
+        self.assertIsNone(prog.core_dump_path)
         with tempfile.NamedTemporaryFile() as f:
             f.write(
                 create_elf_file(
@@ -1015,6 +1077,7 @@ class TestCoreDump(TestCase):
             )
             f.flush()
             prog.set_core_dump(f.name)
+        self.assertEqual(prog.core_dump_path, f.name)
         self.assertEqual(prog.read(0xFFFF0000, len(data)), data)
         self.assertRaises(FaultError, prog.read, 0x0, len(data), physical=True)
 

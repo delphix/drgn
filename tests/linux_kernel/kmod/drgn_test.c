@@ -12,6 +12,7 @@
 
 #include <linux/completion.h>
 #include <linux/io.h>
+#include <linux/irq_work.h>
 #include <linux/kernel.h>
 #include <linux/kexec.h>
 #include <linux/kthread.h>
@@ -36,6 +37,8 @@
 #ifdef CONFIG_STACKDEPOT
 #include <linux/stackdepot.h>
 #endif
+#include <linux/sysfs.h>
+#include <linux/timekeeping.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
@@ -44,6 +47,66 @@
 #else
 #define HAVE_XARRAY 0
 #endif
+
+// Page pools were added in Linux kernel commit ff7d6b27f894 ("page_pool:
+// refurbish version of page_pool code") (in v4.18) and may not be enabled.
+#ifdef CONFIG_PAGE_POOL
+#define HAVE_PAGE_POOL 1
+// The header file was moved in Linux kernel commit a9ca9f9ceff3 ("page_pool:
+// split types and declarations from page_pool.h") (in v6.6).
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#include <net/page_pool/helpers.h>
+#else
+#include <net/page_pool.h>
+#endif
+#else
+#define HAVE_PAGE_POOL 0
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 18, 0)
+// These were added in b9ff604cff11 ("timekeeping: Add
+// ktime_get_coarse_with_offset") (in v4.18-rc1).
+static inline ktime_t ktime_get_coarse_boottime(void)
+{
+	struct timespec64 ts = get_monotonic_coarse64();
+
+	return ktime_mono_to_any(timespec64_to_ktime(ts), TK_OFFS_BOOT);
+}
+
+static inline ktime_t ktime_get_coarse_clocktai(void)
+{
+	struct timespec64 ts = get_monotonic_coarse64();
+
+	return ktime_mono_to_any(timespec64_to_ktime(ts), TK_OFFS_TAI);
+}
+
+// These were added in Linux kernel commit 06aa376903b6 ("timekeeping: Add more
+// coarse clocktai/boottime interfaces") (in v4.18).
+static inline time64_t ktime_get_boottime_seconds(void)
+{
+	return ktime_divns(ktime_get_coarse_boottime(), NSEC_PER_SEC);
+}
+
+static inline time64_t ktime_get_clocktai_seconds(void)
+{
+	return ktime_divns(ktime_get_coarse_clocktai(), NSEC_PER_SEC);
+}
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
+// These were added in 4c54294d01e6 ("timekeeping: Add missing _ns functions for
+// coarse accessors") (in v5.3).
+static inline u64 ktime_get_coarse_boottime_ns(void)
+{
+	return ktime_to_ns(ktime_get_coarse_boottime());
+}
+
+static inline u64 ktime_get_coarse_clocktai_ns(void)
+{
+	return ktime_to_ns(ktime_get_coarse_clocktai());
+}
+#endif
+
 
 // Convert a 4-character string to a seed for drgn_test_prng32().
 static inline u32 drgn_test_prng32_seed(const char *s)
@@ -473,13 +536,76 @@ static void drgn_test_net_exit(void)
 	dev_put(drgn_test_netdev);
 }
 
+// page_pool
+
+const int drgn_test_have_page_pool = HAVE_PAGE_POOL;
+
+#if HAVE_PAGE_POOL
+struct page_pool *drgn_test_page_pool;
+struct page *drgn_test_page_pool_page;
+#endif
+
+static int drgn_test_page_pool_init(void)
+{
+#if HAVE_PAGE_POOL
+	struct page_pool_params params = {
+		.order = 0,
+		.flags = 0,
+		.pool_size = 1,
+		.nid = NUMA_NO_NODE,
+	};
+	struct page_pool *pool;
+
+	pool = page_pool_create(&params);
+	if (IS_ERR(pool))
+		return PTR_ERR(pool);
+	drgn_test_page_pool = pool;
+
+	drgn_test_page_pool_page = page_pool_alloc_pages(pool, GFP_KERNEL);
+	if (!drgn_test_page_pool_page)
+		return -ENOMEM;
+#endif
+	return 0;
+}
+
+static void drgn_test_page_pool_exit(void)
+{
+#if HAVE_PAGE_POOL
+	if (drgn_test_page_pool_page) {
+		// page_pool_put_page() changed in Linux kernel commit
+		// 458de8a97f10 ("net: page_pool: API cleanup and comments") (in
+		// v5.7).
+		page_pool_put_page(drgn_test_page_pool,
+				   drgn_test_page_pool_page,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+				   0,
+#endif
+				   true);
+	}
+	page_pool_destroy(drgn_test_page_pool);
+#endif
+}
+
 // percpu
 
 DEFINE_PER_CPU(u32, drgn_test_percpu_static);
 u32 __percpu *drgn_test_percpu_dynamic;
+struct percpu_counter drgn_test_percpu_counter;
+
+struct drgn_test_percpu_struct {
+	int cpu;
+	int i;
+};
+
+DEFINE_PER_CPU(struct drgn_test_percpu_struct, drgn_test_percpu_structs);
+
+typedef struct drgn_test_percpu_struct drgn_test_percpu_array[3];
+
+DEFINE_PER_CPU(drgn_test_percpu_array, drgn_test_percpu_arrays);
 
 static int drgn_test_percpu_init(void)
 {
+	int ret;
 	int cpu;
 	u32 static_seed = drgn_test_prng32_seed("PCPU");
 	u32 dynamic_seed = drgn_test_prng32_seed("pcpu");
@@ -489,16 +615,39 @@ static int drgn_test_percpu_init(void)
 		return -ENOMEM;
 	// Initialize the per-cpu variables with a PRNG sequence.
 	for_each_possible_cpu(cpu) {
+		int i;
+
 		static_seed = drgn_test_prng32(static_seed);
 		per_cpu(drgn_test_percpu_static, cpu) = static_seed;
 		dynamic_seed = drgn_test_prng32(dynamic_seed);
 		*per_cpu_ptr(drgn_test_percpu_dynamic, cpu) = dynamic_seed;
+
+		per_cpu(drgn_test_percpu_structs, cpu) =
+			(struct drgn_test_percpu_struct){
+				.cpu = cpu,
+			};
+
+		for (i = 0; i < 3; i++) {
+			per_cpu(drgn_test_percpu_arrays, cpu)[i] =
+				(struct drgn_test_percpu_struct){
+					.cpu = cpu,
+					.i = i,
+				};
+		}
 	}
+
+	ret = percpu_counter_init(&drgn_test_percpu_counter,
+				  10, GFP_KERNEL);
+	if (ret)
+		return ret;
+	percpu_counter_add(&drgn_test_percpu_counter, 3);
+
 	return 0;
 }
 
 static void drgn_test_percpu_exit(void)
 {
+	percpu_counter_destroy(&drgn_test_percpu_counter);
 	free_percpu(drgn_test_percpu_dynamic);
 }
 
@@ -515,6 +664,11 @@ struct drgn_test_rb_entry {
 struct drgn_test_rb_entry drgn_test_rb_entries[4];
 
 struct rb_node drgn_test_empty_rb_node;
+
+struct drgn_test_rbtree_container_struct {
+	struct drgn_test_rb_entry entries[2];
+	struct rb_root root;
+} drgn_test_rbtree_container;
 
 struct rb_root drgn_test_rbtree_with_equal = RB_ROOT;
 struct drgn_test_rb_entry drgn_test_rb_entries_with_equal[4];
@@ -568,6 +722,12 @@ static void drgn_test_rbtree_init(void)
 					&drgn_test_rb_entries[i]);
 	}
 	RB_CLEAR_NODE(&drgn_test_empty_rb_node);
+
+	for (i = 0; i < ARRAY_SIZE(drgn_test_rbtree_container.entries); i++) {
+		drgn_test_rbtree_container.entries[i].value = i;
+		drgn_test_rbtree_insert(&drgn_test_rbtree_container.root,
+					&drgn_test_rbtree_container.entries[i]);
+	}
 
 	// Red-black tree with entries that compare equal to each other.
 	for (i = 0; i < ARRAY_SIZE(drgn_test_rb_entries_with_equal); i++) {
@@ -968,7 +1128,8 @@ static void drgn_test_stack_trace_exit(void)
 
 static int drgn_test_stack_trace_init(void)
 {
-	drgn_test_kthread = kthread_create(drgn_test_kthread_fn, NULL,
+	drgn_test_kthread = kthread_create(drgn_test_kthread_fn,
+					   (void *)0xb0ba000,
 					   "drgn_test_kthread");
 	if (!drgn_test_kthread)
 		return -1;
@@ -1057,7 +1218,14 @@ DEFINE_XARRAY(drgn_test_xarray_multi_index);
 DEFINE_XARRAY(drgn_test_xarray_zero_entry);
 DEFINE_XARRAY(drgn_test_xarray_zero_entry_at_zero);
 DEFINE_XARRAY(drgn_test_xarray_value);
+DEFINE_XARRAY(drgn_test_xarray_pointers);
 void *drgn_test_xa_zero_entry;
+
+struct drgn_test_xarray_entry {
+	int value;
+};
+
+struct drgn_test_xarray_entry drgn_test_xarray_entries[4];
 
 static int drgn_test_xa_store_order(struct xarray *xa, unsigned long index,
 				    unsigned order, void *entry, gfp_t gfp)
@@ -1078,6 +1246,7 @@ static int drgn_test_xarray_init(void)
 #if HAVE_XARRAY
 	void *entry;
 	int ret;
+	size_t i;
 
 	drgn_test_xa_zero_entry = XA_ZERO_ENTRY;
 
@@ -1122,6 +1291,14 @@ static int drgn_test_xarray_init(void)
 			 GFP_KERNEL);
 	if (xa_is_err(entry))
 		return xa_err(entry);
+
+	for (i = 0; i < ARRAY_SIZE(drgn_test_xarray_entries); i++) {
+		drgn_test_xarray_entries[i].value = i;
+		entry = xa_store(&drgn_test_xarray_pointers, i,
+				 &drgn_test_xarray_entries[i], GFP_KERNEL);
+		if (xa_is_err(entry))
+			return xa_err(entry);
+	}
 
 #endif
 
@@ -1227,6 +1404,9 @@ int drgn_test_function(int x)
 {
 	return x + 1;
 }
+
+char drgn_test_data[] = "abc";
+const char drgn_test_rodata[] = "def";
 
 // kmodify
 
@@ -1385,13 +1565,144 @@ DEFINE_KMODIFY_TEST_ARGS(
 )
 #endif
 
+#ifdef CONFIG_SYSFS
+
+// Crash from an IRQ handler on architectures where drgn supports unwinding
+// through IRQ handlers.
+#ifdef __x86_64__
+#define DRGN_TEST_IRQ_CRASH
+#endif
+
+static __noreturn noinline_for_stack void drgn_test_crash_func(struct irq_work *work)
+{
+	panic("drgn_test\n");
+}
+
+#ifdef DRGN_TEST_IRQ_CRASH
+static DEFINE_IRQ_WORK(drgn_test_crash_irq_work, drgn_test_crash_func);
+#endif
+
+static ssize_t drgn_test_crash_store(struct kobject *kobj,
+				     struct kobj_attribute *attr,
+				     const char *buf, size_t count)
+{
+	int ret, val;
+
+	ret = kstrtoint(buf, 0, &val);
+	if (ret < 0)
+		return ret;
+	if (val != 1)
+		return -EINVAL;
+
+#ifdef DRGN_TEST_IRQ_CRASH
+	preempt_disable();
+	irq_work_queue(&drgn_test_crash_irq_work);
+	// Spin until we get interrupted and crash.
+	while (1);
+#else
+	drgn_test_crash_func(NULL);
+#endif
+}
+
+static struct kobj_attribute drgn_test_crash_attr =
+	__ATTR(crash, 0200, NULL, drgn_test_crash_store);
+
+static ssize_t drgn_test_boottime_seconds_show(struct kobject *kobj,
+					       struct kobj_attribute *attr,
+					       char *buf)
+{
+	return sprintf(buf, "%lld\n", ktime_get_boottime_seconds());
+}
+
+static struct kobj_attribute drgn_test_boottime_seconds_attr =
+	__ATTR(boottime_seconds, 0444, drgn_test_boottime_seconds_show, NULL);
+
+static ssize_t drgn_test_coarse_boottime_ns_show(struct kobject *kobj,
+						 struct kobj_attribute *attr,
+						 char *buf)
+{
+	return sprintf(buf, "%llu\n", ktime_get_coarse_boottime_ns());
+}
+
+static struct kobj_attribute drgn_test_coarse_boottime_ns_attr =
+	__ATTR(coarse_boottime_ns, 0444, drgn_test_coarse_boottime_ns_show,
+	       NULL);
+
+static ssize_t drgn_test_clocktai_seconds_show(struct kobject *kobj,
+					       struct kobj_attribute *attr,
+					       char *buf)
+{
+	return sprintf(buf, "%lld\n", ktime_get_clocktai_seconds());
+}
+
+static struct kobj_attribute drgn_test_clocktai_seconds_attr =
+	__ATTR(clocktai_seconds, 0444, drgn_test_clocktai_seconds_show, NULL);
+
+static ssize_t drgn_test_coarse_clocktai_ns_show(struct kobject *kobj,
+						 struct kobj_attribute *attr,
+						 char *buf)
+{
+	return sprintf(buf, "%llu\n", ktime_get_coarse_clocktai_ns());
+}
+
+static struct kobj_attribute drgn_test_coarse_clocktai_ns_attr =
+	__ATTR(coarse_clocktai_ns, 0444, drgn_test_coarse_clocktai_ns_show,
+	       NULL);
+
+static struct attribute_group drgn_test_attr_group = {
+	.attrs = (struct attribute *[]){
+		&drgn_test_crash_attr.attr,
+		&drgn_test_boottime_seconds_attr.attr,
+		&drgn_test_coarse_boottime_ns_attr.attr,
+		&drgn_test_clocktai_seconds_attr.attr,
+		&drgn_test_coarse_clocktai_ns_attr.attr,
+		NULL,
+	},
+};
+
+static struct kobject *drgn_test_kobj;
+
+static int __init drgn_test_sysfs_init(void)
+{
+	drgn_test_kobj = kobject_create_and_add("drgn_test", kernel_kobj);
+	if (!drgn_test_kobj)
+		return -ENOMEM;
+
+	return sysfs_create_group(drgn_test_kobj, &drgn_test_attr_group);
+}
+
+static void drgn_test_sysfs_exit(void)
+{
+	kobject_put(drgn_test_kobj);
+}
+#else
+static inline int drgn_test_sysfs_init(void) { return 0; }
+static inline void drgn_test_sysfs_exit(void) {}
+#endif
+
+// types
+
+union drgn_test_union {
+	u32 u;
+	s32 s;
+};
+union drgn_test_union drgn_test_union_var;
+
+typedef union {
+	u64 u;
+	s64 s;
+} drgn_test_anonymous_union;
+drgn_test_anonymous_union drgn_test_anonymous_union_var;
+
 static void drgn_test_exit(void)
 {
+	drgn_test_sysfs_exit();
 	drgn_test_slab_exit();
 	drgn_test_percpu_exit();
 	drgn_test_maple_tree_exit();
 	drgn_test_mm_exit();
 	drgn_test_net_exit();
+	drgn_test_page_pool_exit();
 	drgn_test_stack_trace_exit();
 	drgn_test_radix_tree_exit();
 	drgn_test_xarray_exit();
@@ -1415,6 +1726,9 @@ static int __init drgn_test_init(void)
 	ret = drgn_test_net_init();
 	if (ret)
 		goto out;
+	ret = drgn_test_page_pool_init();
+	if (ret)
+		goto out;
 	ret = drgn_test_percpu_init();
 	if (ret)
 		goto out;
@@ -1436,6 +1750,9 @@ static int __init drgn_test_init(void)
 	if (ret)
 		goto out;
 	ret = drgn_test_idr_init();
+	if (ret)
+		goto out;
+	ret = drgn_test_sysfs_init();
 out:
 	if (ret)
 		drgn_test_exit();

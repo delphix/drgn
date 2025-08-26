@@ -34,6 +34,7 @@ __all__ = (
     "sk_fullsock",
     "sk_nulls_for_each",
     "skb_shinfo",
+    "is_pp_page",
 )
 
 
@@ -260,3 +261,49 @@ def skb_shinfo(skb: Object) -> Object:
         return cast("struct skb_shared_info *", skb.head + skb.end)
     else:
         return cast("struct skb_shared_info *", skb.end)
+
+
+def _poison_pointer_delta(prog: Program) -> int:
+    # The value of POISON_POINTER_DELTA depends on
+    # CONFIG_ILLEGAL_POINTER_VALUE, which varies by architecture and kernel
+    # version. To avoid hard-coding values, derive the value from
+    # TIMER_ENTRY_STATIC, which we can find in any statically-defined timer.
+    # This still requires hard-coding an offset, but that offset is the same on
+    # all architectures and kernel versions since Linux kernel commit
+    # b8a0255db958 ("include/linux/poison.h: use POISON_POINTER_DELTA for
+    # poison pointers") (in v4.5).
+    try:
+        return prog.cache["POISON_POINTER_DELTA"]
+    except KeyError:
+        pass
+    TIMER_ENTRY_STATIC = prog["poll_spurious_irq_timer"].entry.next.value_()
+    POISON_POINTER_DELTA = TIMER_ENTRY_STATIC - 0x300
+    prog.cache["POISON_POINTER_DELTA"] = POISON_POINTER_DELTA
+    return POISON_POINTER_DELTA
+
+
+def is_pp_page(page: Object) -> bool:
+    """
+    Check if given page is a page_pool page.
+
+    :param page: ``struct page *``
+    :raises NotImplementedError: If page_pool pages cannot be identified on
+        this kernel. This is the case from Linux 4.18 (when page_pool was
+        introduced) up to and including Linux 5.13.
+    """
+    PP_SIGNATURE = _poison_pointer_delta(page.prog_) + 0x40
+    PP_MAGIC_MASK = ~0x3
+
+    try:
+        return (page.pp_magic & PP_MAGIC_MASK) == PP_SIGNATURE
+    except AttributeError:
+        pass
+    # Before Linux kernel commit ff7d6b27f894 ("page_pool: refurbish version of
+    # page_pool code") (in v4.18), page_pool didn't exist.
+    try:
+        page.prog_.type("struct page_pool")
+    except LookupError:
+        return False
+    # Between that and Linux kernel commit c07aea3ef4d4 ("mm: add a signature
+    # in struct page") (in v5.14), there is no way to identify page_pool pages.
+    raise NotImplementedError("page_pool pages cannot be identified before Linux 5.14")
