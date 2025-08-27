@@ -66,17 +66,17 @@ Package Manager
 
 drgn can be installed using the package manager on some Linux distributions.
 
-.. image:: https://repology.org/badge/vertical-allrepos/drgn.svg
+.. image:: https://repology.org/badge/vertical-allrepos/drgn.svg?exclude_unsupported=1
     :target: https://repology.org/project/drgn/versions
     :alt: Packaging Status
 
-* Fedora >= 32
+* Fedora, RHEL/CentOS Stream >= 9
 
   .. code-block:: console
 
       $ sudo dnf install drgn
 
-* RHEL/CentOS >= 8
+* RHEL/CentOS < 9
 
   `Enable EPEL <https://docs.fedoraproject.org/en-US/epel/#_quickstart>`_. Then:
 
@@ -86,14 +86,14 @@ drgn can be installed using the package manager on some Linux distributions.
 
 * Oracle Linux >= 8
 
-  Enable the ``ol8_addons`` or ``ol9_addons`` repository and install drgn:
+  Enable the ``ol8_addons`` or ``ol9_addons`` repository. Then:
 
   .. code-block:: console
 
       $ sudo dnf config-manager --enable ol8_addons  # OR: ol9_addons
       $ sudo dnf install drgn
 
-  Drgn is also available for Python versions in application streams. For
+  drgn is also available for Python versions in application streams. For
   example, use ``dnf install python3.12-drgn`` to install drgn for Python 3.12.
   See the documentation for drgn in `Oracle Linux 9
   <https://docs.oracle.com/en/operating-systems/oracle-linux/9/drgn/how_to_install_drgn.html>`_
@@ -101,17 +101,20 @@ drgn can be installed using the package manager on some Linux distributions.
   <https://docs.oracle.com/en/operating-systems/oracle-linux/8/drgn/how_to_install_drgn.html>`_
   for more information.
 
+* Debian >= 12 (Bookworm)/Ubuntu >= 24.04 (Noble Numbat)
+
+  .. code-block:: console
+
+      $ sudo apt install python3-drgn
+
+  To get the latest version on Ubuntu, enable the `michel-slm/kernel-utils PPA
+  <https://launchpad.net/~michel-slm/+archive/ubuntu/kernel-utils>`_ first.
+
 * Arch Linux
 
   .. code-block:: console
 
       $ sudo pacman -S drgn
-
-* Debian >= 12 (Bookworm)
-
-  .. code-block:: console
-
-    $ sudo apt install python3-drgn
 
 * Gentoo
 
@@ -124,15 +127,6 @@ drgn can be installed using the package manager on some Linux distributions.
   .. code-block:: console
 
       $ sudo zypper install python3-drgn
-
-* Ubuntu
-
-  Enable the `michel-slm/kernel-utils PPA <https://launchpad.net/~michel-slm/+archive/ubuntu/kernel-utils>`_.
-  Then:
-
-  .. code-block:: console
-
-      $ sudo apt install python3-drgn
 
 pip
 ^^^
@@ -152,9 +146,11 @@ This will install a binary wheel by default. If you get a build error, then pip
 wasn't able to use the binary wheel. Install the dependencies listed `below
 <#from-source>`_ and try again.
 
-Note that RHEL/CentOS 6, Debian Stretch, Ubuntu Trusty, and Ubuntu Xenial (and
-older) ship Python versions which are too old. Python 3.6 or newer must be
-installed.
+Note that RHEL/CentOS 7, Debian 10 ("buster"), and Ubuntu 18.04 ("Bionic
+Beaver") (and older) ship Python versions which are too old. Python 3.8 or
+newer must be installed.
+
+.. _installation-from-source:
 
 From Source
 ^^^^^^^^^^^
@@ -162,17 +158,17 @@ From Source
 To get the development version of drgn, you will need to build it from source.
 First, install dependencies:
 
-* Fedora
+* Fedora, RHEL/CentOS Stream >= 9
 
   .. code-block:: console
 
-      $ sudo dnf install autoconf automake check-devel elfutils-devel gcc git libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+      $ sudo dnf install autoconf automake check-devel elfutils-debuginfod-client-devel elfutils-devel gcc git libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools xz-devel
 
-* RHEL/CentOS/Oracle Linux
+* RHEL/CentOS < 9, Oracle Linux
 
   .. code-block:: console
 
-      $ sudo dnf install autoconf automake check-devel elfutils-devel gcc git libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+      $ sudo dnf install autoconf automake check-devel elfutils-devel gcc git libtool make pkgconf python3 python3-devel python3-pip python3-setuptools xz-devel
 
   Optionally, install ``libkdumpfile-devel`` from EPEL on RHEL/CentOS >= 8 or
   install `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_ from
@@ -191,28 +187,29 @@ First, install dependencies:
 
   .. code-block:: console
 
-      $ sudo apt install autoconf automake check gcc git liblzma-dev libelf-dev libdw-dev libtool make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
+      $ sudo apt install autoconf automake check gcc git libdebuginfod-dev libkdumpfile-dev liblzma-dev libelf-dev libdw-dev libtool make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
 
-  Optionally, install libkdumpfile from source if you want support for the
-  makedumpfile format.
+  On Debian <= 11 (Bullseye) and Ubuntu <= 22.04 (Jammy Jellyfish),
+  ``libkdumpfile-dev`` is not available, so you must install libkdumpfile from
+  source if you want support for the makedumpfile format.
 
 * Arch Linux
 
   .. code-block:: console
 
-      $ sudo pacman -S --needed autoconf automake check gcc git libelf libkdumpfile libtool make pkgconf python python-pip python-setuptools
+      $ sudo pacman -S --needed autoconf automake check gcc git libelf libkdumpfile libtool make pkgconf python python-pip python-setuptools xz
 
 * Gentoo
 
   .. code-block:: console
 
-      $ sudo emerge --noreplace --oneshot dev-build/autoconf dev-build/automake dev-libs/check dev-libs/elfutils sys-devel/gcc dev-vcs/git dev-libs/libkdumpfile dev-build/libtool dev-build/make dev-python/pip virtual/pkgconfig dev-lang/python dev-python/setuptools
+      $ sudo emerge --noreplace --oneshot dev-build/autoconf dev-build/automake dev-libs/check dev-libs/elfutils sys-devel/gcc dev-vcs/git dev-libs/libkdumpfile dev-build/libtool dev-build/make dev-python/pip virtual/pkgconfig dev-lang/python dev-python/setuptools app-arch/xz-utils
 
 * openSUSE
 
   .. code-block:: console
 
-      $ sudo zypper install autoconf automake check-devel gcc git libdw-devel libelf-devel libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools
+      $ sudo zypper install autoconf automake check-devel gcc git libdebuginfod-devel libdw-devel libelf-devel libkdumpfile-devel libtool make pkgconf python3 python3-devel python3-pip python3-setuptools xz-devel
 
 Then, run:
 
@@ -233,20 +230,20 @@ Quick Start
 
 .. start-quick-start
 
-drgn debugs the running kernel by default; run ``sudo drgn``. To debug a
-running program, run ``sudo drgn -p $PID``. To debug a core dump (either a
-kernel vmcore or a userspace core dump), run ``drgn -c $PATH``. Make sure to
-`install debugging symbols
+drgn debugs the running kernel by default; simply run ``drgn``. To debug a
+running program, run ``drgn -p $PID``. To debug a core dump (either a kernel
+vmcore or a userspace core dump), run ``drgn -c $PATH``. Make sure to `install
+debugging symbols
 <https://drgn.readthedocs.io/en/latest/getting_debugging_symbols.html>`_ for
 whatever you are debugging.
 
-Then, you can access variables in the program with ``prog['name']`` and access
+Then, you can access variables in the program with ``prog["name"]`` and access
 structure members with ``.``:
 
 .. code-block:: pycon
 
-    $ sudo drgn
-    >>> prog['init_task'].comm
+    $ drgn
+    >>> prog["init_task"].comm
     (char [16])"swapper/0"
 
 You can use various predefined helpers:
@@ -260,14 +257,14 @@ You can use various predefined helpers:
     [b'findmnt', b'-p']
 
 You can get stack traces with ``stack_trace()`` and access parameters or local
-variables with ``trace['name']``:
+variables with ``trace["name"]``:
 
 .. code-block:: pycon
 
     >>> trace = stack_trace(task)
     >>> trace[5]
     #5 at 0xffffffff8a5a32d0 (do_sys_poll+0x400/0x578) in do_poll at ./fs/select.c:961:8 (inlined)
-    >>> poll_list = trace[5]['list']
+    >>> poll_list = trace[5]["list"]
     >>> file = fget(task, poll_list.entries[0].fd)
     >>> d_path(file.f_path.address_of_())
     b'/proc/115/mountinfo'

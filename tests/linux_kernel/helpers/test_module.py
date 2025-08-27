@@ -6,13 +6,15 @@ from drgn.helpers.linux.module import (
     for_each_module,
     module_address_regions,
     module_percpu_region,
+    module_taints,
 )
 from tests.linux_kernel import LinuxKernelTestCase, skip_unless_have_test_kmod
 
 
 class TestListModules(LinuxKernelTestCase):
     def test_for_each_module(self):
-        sys_modules = set(line.split(maxsplit=1)[0] for line in open("/proc/modules"))
+        with open("/proc/modules") as f:
+            sys_modules = set(line.split(maxsplit=1)[0] for line in f)
         drgn_modules = set()
         for module in for_each_module(self.prog):
             drgn_modules.add(module.name.string_().decode())
@@ -52,3 +54,6 @@ class TestModules(LinuxKernelTestCase):
         assertInRegions(self.prog.symbol("drgn_test_empty_list").address)
         # constant variable (should be in .rodata)
         assertInRegions(self.prog.symbol("drgn_test_have_maple_tree").address)
+
+    def test_module_taints(self):
+        self.assertIn("O", module_taints(self.mod))

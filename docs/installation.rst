@@ -8,7 +8,7 @@ Dependencies
 
 drgn depends on:
 
-- `Python <https://www.python.org/>`_ 3.6 or newer
+- `Python <https://www.python.org/>`_ 3.8 or newer
 - `elfutils <https://sourceware.org/elfutils/>`_ 0.165 or newer
 
 It optionally depends on:
@@ -16,6 +16,9 @@ It optionally depends on:
 - `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_ for `makedumpfile
   <https://github.com/makedumpfile/makedumpfile>`_ compressed kernel core dump
   format support
+- `liblzma <https://tukaani.org/xz/>`_ for `MiniDebuginfo
+  <https://sourceware.org/gdb/current/onlinedocs/gdb.html/MiniDebugInfo.html>`_
+  support
 
 The build requires:
 

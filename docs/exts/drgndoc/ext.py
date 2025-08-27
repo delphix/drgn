@@ -55,6 +55,7 @@ import sphinx.util.docutils
 import sphinx.util.logging
 import sphinx.util.nodes
 
+from drgndoc.commands import CommandFormatter
 from drgndoc.format import Formatter
 from drgndoc.namespace import Namespace, ResolvedNode
 from drgndoc.parse import (
@@ -76,6 +77,7 @@ logger = sphinx.util.logging.getLogger(__name__)
 class DrgnDocBuildEnvironment(sphinx.environment.BuildEnvironment):
     drgndoc_namespace: Namespace
     drgndoc_formatter: Formatter
+    drgndoc_command_formatter: CommandFormatter
 
 
 def drgndoc_init(app: sphinx.application.Sphinx) -> None:
@@ -90,6 +92,7 @@ def drgndoc_init(app: sphinx.application.Sphinx) -> None:
             for pattern, repl in app.config.drgndoc_substitutions
         ],
     )
+    env.drgndoc_command_formatter = CommandFormatter(env.drgndoc_namespace)
 
 
 # Sphinx looks up type annotations as py:class references. This doesn't work
@@ -107,6 +110,17 @@ def missing_reference(
         reftarget = node.get("reftarget")
         if reftarget and node.get("reftype") == "class":
             resolved = env.drgndoc_namespace.resolve_global_name(reftarget)
+            if not isinstance(resolved, ResolvedNode):
+                py_module = node.get("py:module", "")
+                if py_module:
+                    resolved = env.drgndoc_namespace.resolve_global_name(
+                        dot_join(py_module, reftarget)
+                    )
+                classes = node.get("classes")
+                if not isinstance(resolved, ResolvedNode) and classes:
+                    resolved = env.drgndoc_namespace.resolve_global_name(
+                        dot_join(py_module, *classes, reftarget)
+                    )
             if (
                 isinstance(resolved, ResolvedNode)
                 and isinstance(resolved.node, Variable)
@@ -255,12 +269,14 @@ class DrgnDocDirective(sphinx.util.docutils.SphinxDirective):
         except KeyError:
             have_old_py_module = False
 
+        module_name = dot_join(top_name, attr_name)
+
         sourcename = node.path or ""
         if sourcename:
             self.env.note_dependency(sourcename)
         contents = docutils.statemachine.StringList(
             [
-                ".. py:module:: " + dot_join(top_name, attr_name),
+                ".. py:module:: " + module_name,
                 "",
                 *node.docstring.splitlines(),
             ],
@@ -277,7 +293,32 @@ class DrgnDocDirective(sphinx.util.docutils.SphinxDirective):
                 section = child
                 break
 
+        attrs = []
+        submodules = []
         for attr in resolved.attrs():
+            if isinstance(attr.node, Module):
+                submodules.append(attr)
+            else:
+                attrs.append(attr)
+
+        # Submodules are initially sorted by name (guaranteed by
+        # parse_package()). Apply any sorting configuration.
+        for module_pattern, sort_key_patterns in self.config.drgndoc_submodule_sort:
+            if re.fullmatch(module_pattern, module_name):
+                # list.sort() is stable, so this preserves the previous order
+                # for submodules with the same key.
+                def sort_key(attr: ResolvedNode[Node]) -> Any:
+                    for pattern, key in sort_key_patterns:
+                        if re.fullmatch(pattern, attr.name):
+                            return key
+                    return 0
+
+                submodules.sort(key=sort_key)
+
+        # Normal attributes go before submodules.
+        attrs.extend(submodules)
+
+        for attr in attrs:
             self._run(
                 top_name, dot_join(attr_name, attr.name), attr.name, attr, section
             )
@@ -287,6 +328,166 @@ class DrgnDocDirective(sphinx.util.docutils.SphinxDirective):
             del self.env.ref_context["py:module"]
 
 
+class DrgnCommandDirective(sphinx.util.docutils.SphinxDirective):
+    env: DrgnDocBuildEnvironment
+
+    required_arguments = 1
+    optional_arguments = 0
+    has_content = True
+
+    def run(self) -> Any:
+        before, sep, after = self.arguments[0].partition(".")
+        if sep:
+            namespace_name = before
+            command_name = after
+        else:
+            namespace_name = ""
+            command_name = before
+
+        if namespace_name:
+            name = f"{namespace_name}.{command_name}"
+        elif "." in command_name:
+            name = f".{command_name}"
+        else:
+            name = command_name
+
+        self.env.ref_context["std:program"] = name
+
+        # parse_content_to_nodes() was added in Sphinx 7.4. Fall back to an
+        # equivalent on older versions.
+        if hasattr(self, "parse_content_to_nodes"):
+            nodes = self.parse_content_to_nodes(allow_section_headings=True)
+        else:
+            node = docutils.nodes.Element()
+            node.document = self.state.document
+            sphinx.util.nodes.nested_parse_with_titles(self.state, self.content, node)
+            nodes = node.children
+
+        if nodes:
+            node_id = sphinx.util.nodes.make_id(
+                self.env, self.state.document, "drgncommand", name
+            )
+            target = cast(docutils.nodes.Element, nodes[0])
+            target["ids"].append(node_id)
+            self.state.document.note_explicit_target(target)
+
+            std = self.env.get_domain("std")
+            std.note_object(  # type: ignore[attr-defined]
+                "drgncommand", name, node_id, location=target
+            )
+
+        return nodes
+
+
+class DrgnDocCommandDirective(sphinx.util.docutils.SphinxDirective):
+    env: DrgnDocBuildEnvironment
+
+    required_arguments = 1
+    optional_arguments = 0
+
+    def run(self) -> Any:
+        before, sep, after = self.arguments[0].partition(".")
+        if sep:
+            namespace_name = before
+            command_name = after
+        else:
+            namespace_name = ""
+            command_name = before
+
+        try:
+            namespace = self.env.drgndoc_command_formatter.command_namespaces[
+                namespace_name
+            ]
+        except KeyError:
+            logger.warning("drgn command namespace %r not found", namespace_name)
+            return []
+
+        try:
+            command = namespace[command_name]
+        except KeyError:
+            if namespace_name:
+                logger.warning(
+                    "drgn command %r not found in namespace %r",
+                    command_name,
+                    namespace_name,
+                )
+            else:
+                logger.warning("drgn command %r not found", command_name)
+            return []
+
+        docnode = docutils.nodes.section()
+        lines = self.env.drgndoc_command_formatter.format(command)
+        if not lines:
+            return []
+
+        lines = [
+            f".. drgncommand:: {self.arguments[0]}",
+            "",
+            *("    " + line if line else line for line in lines),
+        ]
+
+        sourcename = ""
+        if command.func.modules and command.func.modules[-1].node.path:
+            sourcename = command.func.modules[-1].node.path
+        if sourcename:
+            self.env.note_dependency(sourcename)
+        contents = docutils.statemachine.StringList(lines, sourcename)
+        contents.append("", sourcename)
+        sphinx.util.nodes.nested_parse_with_titles(self.state, contents, docnode)
+        return docnode.children
+
+
+class DrgnDocCommandNamespaceDirective(sphinx.util.docutils.SphinxDirective):
+    env: DrgnDocBuildEnvironment
+
+    required_arguments = 0
+    optional_arguments = 1
+    option_spec = {
+        "enabled": docutils.parsers.rst.directives.unchanged,
+    }
+
+    def run(self) -> Any:
+        namespace_name = self.arguments[0] if self.arguments else ""
+        try:
+            namespace = self.env.drgndoc_command_formatter.command_namespaces[
+                namespace_name
+            ]
+        except KeyError:
+            logger.warning("drgn command namespace %r not found", namespace_name)
+            return []
+
+        enabled = re.compile(self.options.get("enabled", ""))
+
+        command_names = [
+            name
+            for name, command in namespace.items()
+            if enabled.fullmatch(command.enabled)
+        ]
+        command_names.sort()
+
+        lines = []
+        for i, command_name in enumerate(command_names):
+            if i != 0:
+                lines.append("----")
+                lines.append("")
+
+            if namespace_name:
+                name = f"{namespace_name}.{command_name}"
+            elif "." in command_name:
+                name = f".{command_name}"
+            else:
+                name = command_name
+            lines.append(f".. drgndoc-command:: {name}")
+            lines.append("")
+
+        docnode = docutils.nodes.section()
+        if lines:
+            contents = docutils.statemachine.StringList(lines, "")
+            contents.append("", "")
+            sphinx.util.nodes.nested_parse_with_titles(self.state, contents, docnode)
+        return docnode.children
+
+
 def setup(app: sphinx.application.Sphinx) -> Dict[str, Any]:
     app.connect("builder-inited", drgndoc_init)
     app.connect("missing-reference", missing_reference)
@@ -294,5 +495,22 @@ def setup(app: sphinx.application.Sphinx) -> Dict[str, Any]:
     app.add_config_value("drgndoc_paths", [], "env")
     # List of (regex pattern, substitution) to apply to resolved names.
     app.add_config_value("drgndoc_substitutions", [], "env")
+    # List of (parent regex pattern, list of (submodule regex pattern, key))
+    # controlling sort order of submodules.
+    #
+    # Submodules are initially sorted by name. For each parent regex pattern
+    # matching the fully qualified name of the parent module, the list of
+    # submodules is sorted. The sort key is given by the first submodule regex
+    # pattern matching the relative name of the subvolume, or 0 if no patterns
+    # match.
+    app.add_config_value("drgndoc_submodule_sort", [], "env")
     app.add_directive("drgndoc", DrgnDocDirective)
+    # Create a drgncommand object type...
+    app.add_object_type("drgncommand", "drgncommand")
+    # ... but override the directive with our own.
+    app.add_directive_to_domain(
+        "std", "drgncommand", DrgnCommandDirective, override=True
+    )
+    app.add_directive("drgndoc-command", DrgnDocCommandDirective)
+    app.add_directive("drgndoc-command-namespace", DrgnDocCommandNamespaceDirective)
     return {"env_version": 1, "parallel_read_safe": True, "parallel_write_safe": True}

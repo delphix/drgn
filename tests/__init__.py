@@ -3,6 +3,7 @@
 
 import contextlib
 import functools
+import logging
 import os
 import sys
 from typing import Any, Mapping, NamedTuple, Optional
@@ -10,12 +11,14 @@ import unittest
 from unittest.mock import Mock
 
 from drgn import (
+    AbsenceReason,
     Architecture,
     FindObjectFlags,
     Language,
     Object,
     Platform,
     PlatformFlags,
+    PrimitiveType,
     Program,
     Type,
     TypeEnumerator,
@@ -124,7 +127,9 @@ def assertReprPrettyEqualsStr(obj):
 
 _IDENTICAL_EQ_TYPES = (
     type(None),
+    AbsenceReason,
     Language,
+    PrimitiveType,
     Program,
     TypeEnumerator,
     TypeKind,
@@ -196,6 +201,7 @@ def identical(a, b):
                     "prog_",
                     "type_",
                     "address_",
+                    "absence_reason_",
                     "bit_offset_",
                     "bit_field_size_",
                 ),
@@ -290,57 +296,8 @@ class IdenticalMatcher:
         return identical(self._obj, other)
 
 
-if sys.version_info < (3, 8):
-
-    # Class cleanups need to be called even if setUpClass() fails.
-    # Unfortunately, we need to wrap setUpClass() to do that reliably.
-    def classCleanups(setUpClass):
-        @functools.wraps(setUpClass)
-        def wrapper(cls):
-            cls._class_cleanups = []
-            try:
-                setUpClass(cls)
-            except Exception:
-                cls.doClassCleanups()
-                raise
-
-        return wrapper
-
-else:
-
-    def classCleanups(setUpClass):
-        return setUpClass
-
-
 class TestCase(unittest.TestCase):
-    # "Backport" addClassCleanup(), doClassCleanups(), enterContext(), and
-    # enterClassContext().
-    if sys.version_info < (3, 8):
-
-        @classmethod
-        def addClassCleanup(cls, function, *args, **kwargs):
-            # Note that this will fail if the @classCleanups decorator wasn't
-            # used. This is intentional.
-            cls._class_cleanups.append((function, args, kwargs))
-
-        @classmethod
-        def doClassCleanups(cls):
-            if hasattr(cls, "_class_cleanups"):
-                exceptions = []
-                while cls._class_cleanups:
-                    function, args, kwargs = cls._class_cleanups.pop()
-                    try:
-                        function(*args, **kwargs)
-                    except Exception as e:
-                        exceptions.append(e)
-                if exceptions:
-                    raise Exception(exceptions)
-
-        @classmethod
-        def tearDownClass(cls):
-            cls.doClassCleanups()
-            super().tearDownClass()
-
+    # "Backport" enterContext() and enterClassContext().
     if sys.version_info < (3, 11):
 
         def enterContext(self, cm):
@@ -455,3 +412,14 @@ def modifyenv(vars: Mapping[str, Optional[str]]):
                 del os.environ[key]
             else:
                 os.environ[key] = old_value
+
+
+@contextlib.contextmanager
+def drgn_log_level(level: int):
+    logger = logging.getLogger("drgn")
+    old_level = logger.getEffectiveLevel()
+    logger.setLevel(level)
+    try:
+        yield
+    finally:
+        logger.setLevel(old_level)

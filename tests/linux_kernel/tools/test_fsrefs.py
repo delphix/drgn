@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 
+from drgn import container_of
 from drgn.helpers.linux.fs import fget
 from drgn.helpers.linux.pid import find_task
 from tests.linux_kernel import (
@@ -25,6 +26,7 @@ from tests.linux_kernel import (
     MS_NOEXEC,
     MS_NOSUID,
     LinuxKernelTestCase,
+    fallocate,
     fork_and_stop,
     iter_mounts,
     losetup,
@@ -231,6 +233,50 @@ class TestFsRefs(LinuxKernelTestCase):
                         ),
                     )
 
+    @skip_unless_have_test_disk
+    def test_btrfs_subvolume(self):
+        disk = os.environ["DRGN_TEST_DISK"]
+        with contextlib.ExitStack() as exit_stack:
+            subprocess.check_call(["mkfs.btrfs", "-qf", disk])
+
+            mount(disk, self._tmp, "btrfs")
+            exit_stack.callback(umount, self._tmp)
+
+            subvol = self._tmp / "subvol"
+            subprocess.check_call(["btrfs", "subvolume", "create", subvol])
+
+            top_file = self._tmp / "file"
+            top_fd = os.open(top_file, os.O_CREAT | os.O_WRONLY, 0o600)
+            exit_stack.callback(os.close, top_fd)
+            top_regex = rf"pid {os.getpid()} \(.*\) fd {top_fd} \(struct file \*\)0x[0-9a-f]+ {re.escape(str(top_file))}"
+
+            subvol_file = subvol / "file"
+            subvol_fd = os.open(subvol_file, os.O_CREAT | os.O_WRONLY, 0o600)
+            exit_stack.callback(os.close, subvol_fd)
+            subvol_regex = rf"pid {os.getpid()} \(.*\) fd {subvol_fd} \(struct file \*\)0x[0-9a-f]+ {re.escape(str(subvol_file))}"
+
+            subvol_output = self.run_and_capture(
+                "--check", "tasks", "--btrfs-subvolume", str(subvol)
+            )
+            self.assertRegex(subvol_output, subvol_regex)
+            self.assertNotRegex(subvol_output, top_regex)
+
+            top_root = container_of(
+                fget(find_task(self.prog, os.getpid()), top_fd).f_inode,
+                "struct btrfs_inode",
+                "vfs_inode",
+            ).root
+            top_output = self.run_and_capture(
+                "--check", "tasks", "--btrfs-subvolume-pointer", hex(top_root)
+            )
+            self.assertRegex(top_output, top_regex)
+            self.assertNotRegex(top_output, subvol_regex)
+
+    def test_not_btrfs(self):
+        with self.assertRaises(SystemExit) as cm:
+            main(self.prog, ["--check", "tasks", "--btrfs-subvolume", "/proc"])
+        self.assertIn("not on Btrfs", cm.exception.code)
+
     def test_binfmt_misc(self):
         for mnt in iter_mounts():
             if mnt.fstype == "binfmt_misc":
@@ -330,7 +376,8 @@ class TestFsRefs(LinuxKernelTestCase):
             exit_stack.callback(umount, self._tmp)
 
             path = self._tmp / "swap_file"
-            mkswap(path, 1024 * 1024)
+            fallocate(path, 0, 1024 * 1024)
+            mkswap(path)
             swapon(path)
             exit_stack.callback(swapoff, path)
 

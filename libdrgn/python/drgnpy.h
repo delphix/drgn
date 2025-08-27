@@ -19,29 +19,25 @@
 #include "../pp.h"
 #include "../program.h"
 #include "../symbol.h"
+#include "../vector.h"
 
-/* These were added in Python 3.7. */
-#ifndef Py_UNREACHABLE
-#define Py_UNREACHABLE() abort()
-#endif
-#ifndef Py_RETURN_RICHCOMPARE
-#define Py_RETURN_RICHCOMPARE(val1, val2, op)                               \
-    do {                                                                    \
-        switch (op) {                                                       \
-        case Py_EQ: if ((val1) == (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        case Py_NE: if ((val1) != (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        case Py_LT: if ((val1) < (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;   \
-        case Py_GT: if ((val1) > (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;   \
-        case Py_LE: if ((val1) <= (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        case Py_GE: if ((val1) >= (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        default:                                                            \
-            Py_UNREACHABLE();                                               \
-        }                                                                   \
-    } while (0)
+#if PY_VERSION_HEX < 0x030900a1
+static inline PyObject *PyObject_CallNoArgs(PyObject *func)
+{
+	return PyObject_CallFunctionObjArgs(func, NULL);
+}
+static inline PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg)
+{
+	return PyObject_CallFunctionObjArgs(callable, arg, NULL);
+}
 #endif
 
 #if PY_VERSION_HEX < 0x030d00a1
 #define PyThreadState_GetUnchecked _PyThreadState_UncheckedGet
+#endif
+
+#if PY_VERSION_HEX < 0x030e00a5
+#define Py_HashPointer _Py_HashPointer
 #endif
 
 #define DRGNPY_PUBLIC __attribute__((__visibility__("default")))
@@ -78,6 +74,18 @@
 		Py_RETURN_TRUE;		\
 	else				\
 		Py_RETURN_FALSE;	\
+} while (0)
+
+/**
+ * Return from a PyGetSetDef setter with an error if attempting to delete the
+ * attribute.
+ */
+#define SETTER_NO_DELETE(name, value) do {				\
+	if (!(value)) {							\
+		PyErr_Format(PyExc_AttributeError,			\
+			     "can't delete '%s' attribute", (name));	\
+		return -1;						\
+	}								\
 } while (0)
 
 static inline void pydecrefp(void *p)
@@ -131,6 +139,26 @@ typedef struct {
 
 typedef struct {
 	PyObject_HEAD
+	struct drgn_module *module;
+} Module;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module_iterator *it;
+} ModuleIterator;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module *module;
+} ModuleSectionAddresses;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module_section_address_iterator *it;
+} ModuleSectionAddressesIterator;
+
+typedef struct {
+	PyObject_HEAD
 	DrgnObject *obj;
 	uint64_t length, index;
 } ObjectIterator;
@@ -146,12 +174,21 @@ typedef struct {
 	PyObject_HEAD
 	struct drgn_program prog;
 	PyObject *cache;
+	PyObject *config;
 	/*
 	 * Set of objects that we need to hold a reference to during the
 	 * lifetime of the Program.
 	 */
 	struct pyobjectp_set objects;
 } Program;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_debug_info_options *options;
+	// If this is a Program's default debug info options, the Program.
+	// Otherwise, NULL.
+	Program *prog;
+} DebugInfoOptions;
 
 typedef struct {
 	PyObject_HEAD
@@ -232,38 +269,60 @@ typedef struct {
 	PyObject *is_default;
 } TypeTemplateParameter;
 
+extern PyObject *AbsenceReason_class;
 extern PyObject *Architecture_class;
 extern PyObject *FindObjectFlags_class;
+extern PyObject *KmodSearchMethod_class;
+extern PyObject *ModuleFileStatus_class;
+extern PyObject *ModuleSectionAddresses_class;
 extern PyObject *PlatformFlags_class;
 extern PyObject *PrimitiveType_class;
 extern PyObject *ProgramFlags_class;
 extern PyObject *Qualifiers_class;
+extern PyObject *SupplementaryFileKind_class;
 extern PyObject *SymbolBinding_class;
 extern PyObject *SymbolKind_class;
 extern PyObject *TypeKind_class;
+extern PyTypeObject DebugInfoOptions_type;
 extern PyTypeObject DrgnObject_type;
 extern PyTypeObject DrgnType_type;
+extern PyTypeObject ExtraModule_type;
 extern PyTypeObject FaultError_type;
 extern PyTypeObject Language_type;
+extern PyTypeObject MainModule_type;
+extern PyTypeObject ModuleIteratorWithNew_type;
+extern PyTypeObject ModuleIterator_type;
+extern PyTypeObject ModuleSectionAddressesIterator_type;
+extern PyTypeObject Module_type;
 extern PyTypeObject ObjectIterator_type;
+extern PyTypeObject ObjectNotFoundError_type;
 extern PyTypeObject Platform_type;
 extern PyTypeObject Program_type;
 extern PyTypeObject Register_type;
+extern PyTypeObject RelocatableModule_type;
+extern PyTypeObject SharedLibraryModule_type;
 extern PyTypeObject StackFrame_type;
 extern PyTypeObject StackTrace_type;
-extern PyTypeObject Symbol_type;
 extern PyTypeObject SymbolIndex_type;
-extern PyTypeObject Thread_type;
+extern PyTypeObject Symbol_type;
 extern PyTypeObject ThreadIterator_type;
+extern PyTypeObject Thread_type;
 extern PyTypeObject TypeEnumerator_type;
-extern PyTypeObject TypeKindSet_type;
 extern PyTypeObject TypeKindSetIterator_type;
+extern PyTypeObject TypeKindSet_type;
 extern PyTypeObject TypeMember_type;
 extern PyTypeObject TypeParameter_type;
 extern PyTypeObject TypeTemplateParameter_type;
+extern PyTypeObject VdsoModule_type;
 extern PyObject *MissingDebugInfoError;
 extern PyObject *ObjectAbsentError;
 extern PyObject *OutOfBoundsError;
+
+PyGILState_STATE drgn_initialize_python(bool *success_ret);
+
+#define drgn_initialize_python_guard(success_ret)				\
+	__attribute__((__cleanup__(PyGILState_Releasep), __unused__))		\
+	PyGILState_STATE PP_UNIQUE(gstate) = drgn_initialize_python(success_ret)
 
 int add_module_constants(PyObject *m);
 int init_logging(void);
@@ -276,6 +335,16 @@ void *set_error_type_name(const char *format,
 			  struct drgn_qualified_type qualified_type);
 
 #define call_tp_alloc(type) ((type *)type##_type.tp_alloc(&type##_type, 0))
+
+PyObject *Module_wrap(struct drgn_module *module);
+static inline Program *Module_prog(Module *module)
+{
+	struct drgn_program *prog = drgn_module_program(module->module);
+	return container_of(prog, Program, prog);
+}
+
+int add_WantedSupplementaryFile(PyObject *m);
+int init_module_section_addresses(void);
 
 PyObject *Language_wrap(const struct drgn_language *language);
 int language_converter(PyObject *o, void *p);
@@ -341,7 +410,10 @@ DrgnType *Program_array_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_function_type(Program *self, PyObject *args, PyObject *kwds);
 
 int append_string(PyObject *parts, const char *s);
+int append_u64_hex(PyObject *parts, uint64_t value);
 int append_format(PyObject *parts, const char *format, ...);
+int append_attr_repr(PyObject *parts, PyObject *obj, const char *attr_name);
+int append_attr_str(PyObject *parts, PyObject *obj, const char *attr_name);
 PyObject *join_strings(PyObject *parts);
 // Implementation of _repr_pretty_() for IPython/Jupyter that just calls str().
 PyObject *repr_pretty_from_str(PyObject *self, PyObject *args, PyObject *kwds);
@@ -375,6 +447,22 @@ void path_cleanup(struct path_arg *path);
 	__attribute__((__cleanup__(path_cleanup)))	\
 	struct path_arg name = { __VA_ARGS__ }
 
+DEFINE_VECTOR_TYPE(path_arg_vector, struct path_arg);
+
+struct path_sequence_arg {
+	bool allow_none;
+	bool null_terminate;
+	struct path_arg_vector args;
+	const char **paths;
+};
+int path_sequence_converter(PyObject *o, void *p);
+void path_sequence_cleanup(struct path_sequence_arg *paths);
+size_t path_sequence_size(struct path_sequence_arg *paths);
+
+#define PATH_SEQUENCE_ARG(name, ...)						\
+	__attribute__((__cleanup__(path_sequence_cleanup)))			\
+	struct path_sequence_arg name = { .args = VECTOR_INIT, __VA_ARGS__ }
+
 struct enum_arg {
 	PyObject *type;
 	unsigned long value;
@@ -396,6 +484,8 @@ DrgnObject *drgnpy_linux_helper_task_thread_info(PyObject *self, PyObject *args,
 						 PyObject *kwds);
 PyObject *drgnpy_linux_helper_task_cpu(PyObject *self, PyObject *args,
 				       PyObject *kwds);
+PyObject *drgnpy_linux_helper_task_on_cpu(PyObject *self, PyObject *args,
+					  PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_xa_load(PyObject *self, PyObject *args,
 					PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_idr_find(PyObject *self, PyObject *args,

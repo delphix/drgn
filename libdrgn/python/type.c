@@ -465,6 +465,7 @@ static PyGetSetDef DrgnType_getset[] = {
 
 static void DrgnType_dealloc(DrgnType *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_XDECREF(self->attr_cache);
 	if (self->type)
 		Py_DECREF(DrgnType_prog(self));
@@ -610,6 +611,24 @@ static PyObject *DrgnType_type_name(DrgnType *self)
 	return PyUnicode_FromString(str);
 }
 
+static PyObject *DrgnType_variable_declaration(DrgnType *self, PyObject *args,
+					       PyObject *kwds)
+{
+	static char *keywords[] = {"name", NULL};
+	const char *name;
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "s:variable_declaration",
+					 keywords, &name))
+		return NULL;
+
+	_cleanup_free_ char *str = NULL;
+	struct drgn_error *err =
+		drgn_format_variable_declaration(DrgnType_unwrap(self), name,
+						 &str);
+	if (err)
+		return set_drgn_error(err);
+	return PyUnicode_FromString(str);
+}
+
 static PyObject *DrgnType_is_complete(DrgnType *self)
 {
 	Py_RETURN_BOOL(drgn_type_is_complete(self->type));
@@ -692,6 +711,8 @@ static PyObject *DrgnType_has_member(DrgnType *self, PyObject *args,
 static PyMethodDef DrgnType_methods[] = {
 	{"type_name", (PyCFunction)DrgnType_type_name, METH_NOARGS,
 	 drgn_Type_type_name_DOC},
+	{"variable_declaration", (PyCFunction)DrgnType_variable_declaration,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Type_variable_declaration_DOC},
 	{"is_complete", (PyCFunction)DrgnType_is_complete, METH_NOARGS,
 	 drgn_Type_is_complete_DOC},
 	{"qualified", (PyCFunction)DrgnType_qualified,
@@ -746,6 +767,7 @@ static TypeEnumerator *TypeEnumerator_new(PyTypeObject *subtype, PyObject *args,
 
 static void TypeEnumerator_dealloc(TypeEnumerator *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_XDECREF(self->value);
 	Py_XDECREF(self->name);
 	Py_TYPE(self)->tp_free((PyObject *)self);
@@ -809,6 +831,12 @@ static PyMemberDef TypeEnumerator_members[] = {
 	{},
 };
 
+static int LazyObject_traverse(LazyObject *self, visitproc visit, void *arg)
+{
+	Py_VISIT(self->obj);
+	return 0;
+}
+
 PyTypeObject TypeEnumerator_type = {
 	PyVarObject_HEAD_INIT(NULL, 0)
 	.tp_name = "_drgn.TypeEnumerator",
@@ -816,7 +844,8 @@ PyTypeObject TypeEnumerator_type = {
 	.tp_dealloc = (destructor)TypeEnumerator_dealloc,
 	.tp_repr = (reprfunc)TypeEnumerator_repr,
 	.tp_as_sequence = &TypeEnumerator_as_sequence,
-	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+	.tp_traverse = (traverseproc)LazyObject_traverse,
 	.tp_doc = drgn_TypeEnumerator_DOC,
 	.tp_richcompare = (richcmpfunc)TypeEnumerator_richcompare,
 	.tp_members = TypeEnumerator_members,
@@ -829,7 +858,8 @@ static DrgnObject *DrgnType_to_absent_DrgnObject(DrgnType *type)
 	if (!obj)
 		return NULL;
 	struct drgn_error *err =
-		drgn_object_set_absent(&obj->obj, DrgnType_unwrap(type), 0);
+		drgn_object_set_absent(&obj->obj, DrgnType_unwrap(type),
+				       DRGN_ABSENCE_REASON_OTHER, 0);
 	if (err)
 		return set_drgn_error(err);
 	return_ptr(obj);
@@ -1026,6 +1056,7 @@ static TypeMember *TypeMember_new(PyTypeObject *subtype, PyObject *args,
 
 static void TypeMember_dealloc(TypeMember *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_XDECREF(self->bit_offset);
 	Py_XDECREF(self->name);
 	LazyObject_dealloc((LazyObject *)self);
@@ -1098,7 +1129,8 @@ PyTypeObject TypeMember_type = {
 	.tp_basicsize = sizeof(TypeMember),
 	.tp_dealloc = (destructor)TypeMember_dealloc,
 	.tp_repr = (reprfunc)TypeMember_repr,
-	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+	.tp_traverse = (traverseproc)LazyObject_traverse,
 	.tp_doc = drgn_TypeMember_DOC,
 	.tp_members = TypeMember_members,
 	.tp_getset = TypeMember_getset,
@@ -1141,6 +1173,7 @@ static TypeParameter *TypeParameter_new(PyTypeObject *subtype, PyObject *args,
 
 static void TypeParameter_dealloc(TypeParameter *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_XDECREF(self->name);
 	LazyObject_dealloc((LazyObject *)self);
 }
@@ -1181,7 +1214,8 @@ PyTypeObject TypeParameter_type = {
 	.tp_basicsize = sizeof(TypeParameter),
 	.tp_dealloc = (destructor)TypeParameter_dealloc,
 	.tp_repr = (reprfunc)TypeParameter_repr,
-	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+	.tp_traverse = (traverseproc)LazyObject_traverse,
 	.tp_doc = drgn_TypeParameter_DOC,
 	.tp_members = TypeParameter_members,
 	.tp_getset = TypeParameter_getset,
@@ -1229,6 +1263,7 @@ static TypeTemplateParameter *TypeTemplateParameter_new(PyTypeObject *subtype,
 
 static void TypeTemplateParameter_dealloc(TypeTemplateParameter *self)
 {
+	PyObject_GC_UnTrack(self);
 	Py_XDECREF(self->is_default);
 	Py_XDECREF(self->name);
 	LazyObject_dealloc((LazyObject *)self);
@@ -1287,7 +1322,8 @@ PyTypeObject TypeTemplateParameter_type = {
 	.tp_basicsize = sizeof(TypeTemplateParameter),
 	.tp_dealloc = (destructor)TypeTemplateParameter_dealloc,
 	.tp_repr = (reprfunc)TypeTemplateParameter_repr,
-	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+	.tp_traverse = (traverseproc)LazyObject_traverse,
 	.tp_doc = drgn_TypeTemplateParameter_DOC,
 	.tp_members = TypeTemplateParameter_members,
 	.tp_getset = TypeTemplateParameter_getset,

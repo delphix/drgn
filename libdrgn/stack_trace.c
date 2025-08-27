@@ -117,9 +117,10 @@ drgn_format_stack_trace(struct drgn_stack_trace *trace, char **ret)
 
 		struct drgn_register_state *regs = trace->frames[frame].regs;
 		struct optional_uint64 pc;
-		const char *name = drgn_stack_frame_name(trace, frame);
-		if (name) {
-			if (!string_builder_append(&str, name))
+		const char *function_name =
+			drgn_stack_frame_function_name(trace, frame);
+		if (function_name) {
+			if (!string_builder_append(&str, function_name))
 				return &drgn_enomem;
 		} else if ((pc = drgn_register_state_get_pc(regs)).has_value) {
 			_cleanup_symbol_ struct drgn_symbol *sym = NULL;
@@ -198,8 +199,9 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 			return &drgn_enomem;
 	}
 
-	const char *name = drgn_stack_frame_name(trace, frame);
-	if (name && !string_builder_appendf(&str, " in %s", name))
+	const char *function_name = drgn_stack_frame_function_name(trace, frame);
+	if (function_name
+	    && !string_builder_appendf(&str, " in %s", function_name))
 		return &drgn_enomem;
 
 	int line, column;
@@ -224,8 +226,42 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 	return NULL;
 }
 
-LIBDRGN_PUBLIC const char *drgn_stack_frame_name(struct drgn_stack_trace *trace,
-						 size_t frame)
+LIBDRGN_PUBLIC
+struct drgn_error *drgn_stack_frame_name(struct drgn_stack_trace *trace,
+					 size_t frame, char **ret)
+{
+	struct drgn_error *err;
+	char *name;
+	const char *function_name = drgn_stack_frame_function_name(trace, frame);
+	if (function_name) {
+		name = strdup(function_name);
+	} else {
+		struct drgn_register_state *regs = trace->frames[frame].regs;
+		struct optional_uint64 pc = drgn_register_state_get_pc(regs);
+		if (pc.has_value) {
+			_cleanup_symbol_ struct drgn_symbol *sym = NULL;
+			err = drgn_program_find_symbol_by_address_internal(trace->prog,
+									   pc.value - !regs->interrupted,
+									   &sym);
+			if (err)
+				return err;
+			if (sym)
+				name = strdup(sym->name);
+			else if (asprintf(&name, "0x%" PRIx64, pc.value) < 0)
+				name = NULL;
+		} else {
+			name = strdup("???");
+		}
+	}
+	if (!name)
+		return &drgn_enomem;
+	*ret = name;
+	return NULL;
+}
+
+LIBDRGN_PUBLIC
+const char *drgn_stack_frame_function_name(struct drgn_stack_trace *trace,
+					   size_t frame)
 {
 	Dwarf_Die *scopes = trace->frames[frame].scopes;
 	size_t num_scopes = trace->frames[frame].num_scopes;
@@ -463,11 +499,12 @@ drgn_stack_frame_find_object(struct drgn_stack_trace *trace, size_t frame_i,
 	}
 	if (!die.addr) {
 not_found:;
-		const char *frame_name = drgn_stack_frame_name(trace, frame_i);
-		if (frame_name) {
+		const char *function_name =
+			drgn_stack_frame_function_name(trace, frame_i);
+		if (function_name) {
 			return drgn_error_format(DRGN_ERROR_LOOKUP,
 						 "could not find '%s' in '%s'",
-						 name, frame_name);
+						 name, function_name);
 		} else {
 			return drgn_error_format(DRGN_ERROR_LOOKUP,
 						 "could not find '%s'", name);
@@ -733,33 +770,22 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 		if (err)
 			return err;
 		if (!found) {
-			return drgn_error_create(DRGN_ERROR_LOOKUP,
-						 "task not found");
+			if (tid == 0) {
+				return drgn_error_create(DRGN_ERROR_LOOKUP,
+							 "task not found; "
+							 "use stack_trace(idle_task(cpu)) for PID 0");
+			} else {
+				return drgn_error_create(DRGN_ERROR_LOOKUP,
+							 "task not found");
+			}
 		}
 	}
 
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 		bool on_cpu;
-		err = drgn_object_member_dereference(&tmp, &obj, "on_cpu");
-		if (!err) {
-			err = drgn_object_bool(&tmp, &on_cpu);
-			if (err)
-				return err;
-		} else if (err->code == DRGN_ERROR_LOOKUP) {
-			// The kernel must be !SMP. We have to check cpu_curr(0)
-			// instead.
-			drgn_error_destroy(err);
-			err = linux_helper_cpu_curr(&tmp, 0);
-			if (err)
-				return err;
-			int cmp;
-			err = drgn_object_cmp(&tmp, &obj, &cmp);
-			if (err)
-				return err;
-			on_cpu = cmp == 0;
-		} else {
+		err = linux_helper_task_on_cpu(&obj, &on_cpu);
+		if (err)
 			return err;
-		}
 		if (on_cpu) {
 			if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
 				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
@@ -780,6 +806,9 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 		}
 		return prog->platform.arch->linux_kernel_get_initial_registers(&obj,
 									       ret);
+	} else if (drgn_program_is_userspace_process(prog)) {
+		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
+					"stack unwinding is not yet supported for live processes");
 	} else {
 		struct nstring prstatus;
 		err = drgn_program_find_prstatus(prog, tid, &prstatus);
@@ -1024,6 +1053,10 @@ drgn_unwind_one_register(struct drgn_program *prog, struct drgn_elf_file *file,
 	}
 	case DRGN_CFI_RULE_AT_DWARF_EXPRESSION:
 	case DRGN_CFI_RULE_DWARF_EXPRESSION:
+		// It is possible for file to be NULL when using built-in ORC.
+		// However, it should be impossible to encounter a DWARF
+		// expression for built-in ORC.
+		assert(file != NULL);
 		err = drgn_eval_cfi_dwarf_expression(prog, file, rule, regs,
 						     buf, size);
 		break;
@@ -1139,6 +1172,17 @@ drgn_unwind_with_cfi(struct drgn_program *prog, struct drgn_cfi_row **row,
 	return NULL;
 }
 
+static bool drgn_is_bad_call(const struct drgn_register_state *regs)
+{
+	// If the program counter is 0, it's likely that a NULL function pointer
+	// was called. Other than that, it's difficult to differentiate a bad
+	// program counter from a valid program counter that we don't know about
+	// (e.g., because it's JIT compiled). We can add heuristics in the
+	// future.
+	struct optional_uint64 pc = drgn_register_state_get_pc(regs);
+	return pc.has_value && pc.value == 0;
+}
+
 static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 					       uint32_t tid,
 					       const struct drgn_object *obj,
@@ -1150,14 +1194,6 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 	if (!prog->has_platform) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "cannot unwind stack without platform");
-	}
-	if (drgn_program_is_userspace_process(prog)) {
-		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
-					 "stack unwinding is not yet supported for live processes");
-	} else if (!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-		   && !drgn_program_is_userspace_core(prog)) {
-		return drgn_error_create(DRGN_ERROR_NOT_IMPLEMENTED,
-					 "stack unwinding is not supported for this program");
 	}
 
 	size_t trace_capacity = 1;
@@ -1190,8 +1226,16 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 
 		err = drgn_unwind_with_cfi(prog, &row, regs, &regs);
 		if (err == &drgn_not_found) {
-			err = prog->platform.arch->fallback_unwind(prog, regs,
-								   &regs);
+			if (drgn_is_bad_call(regs)
+			    && prog->platform.arch->bad_call_unwind) {
+				err = prog->platform.arch->bad_call_unwind(prog,
+									   regs,
+									   &regs);
+			} else {
+				err = prog->platform.arch->fallback_unwind(prog,
+									   regs,
+									   &regs);
+			}
 		}
 		if (err == &drgn_stop)
 			break;

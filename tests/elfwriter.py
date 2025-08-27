@@ -1,8 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import os
 import struct
-from typing import List, NamedTuple, Optional, Sequence
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
 import zlib
 
 from _drgn_util.elf import ET, PT, SHF, SHN, SHT, STB, STT, STV
@@ -59,10 +60,19 @@ class ElfSymbol(NamedTuple):
 def _create_symtab(
     sections: List[ElfSection],
     symbols: Sequence[ElfSymbol],
+    *,
+    dynamic: bool = False,
     little_endian: bool,
     bits: int,
 ):
-    assert not any(section.name in (".symtab", ".strtab") for section in sections)
+    symtab_name = ".dynsym" if dynamic else ".symtab"
+    strtab_name = ".dynstr" if dynamic else ".strtab"
+    assert not any(section.name in (symtab_name, strtab_name) for section in sections)
+
+    # An empty symbol name is a placeholder for the implicit 0-index entry in
+    # the symbol table. It's used to create a valid, but empty symbol table.
+    if symbols and symbols[0].name == "":
+        symbols = symbols[1:]
 
     endian = "<" if little_endian else ">"
     if bits == 64:
@@ -104,15 +114,15 @@ def _create_symtab(
 
     sections.append(
         ElfSection(
-            name=".symtab",
-            sh_type=SHT.SYMTAB,
+            name=symtab_name,
+            sh_type=SHT.DYNSYM if dynamic else SHT.SYMTAB,
             data=symtab_data,
             sh_link=sum((1 for section in sections if section.name is not None), 2),
             sh_info=sh_info,
             sh_entsize=symbol_struct.size,
         )
     )
-    sections.append(ElfSection(name=".strtab", sh_type=SHT.STRTAB, data=strtab_data))
+    sections.append(ElfSection(name=strtab_name, sh_type=SHT.STRTAB, data=strtab_data))
 
 
 def create_elf_file(
@@ -120,7 +130,14 @@ def create_elf_file(
     sections: Sequence[ElfSection] = (),
     symbols: Sequence[ElfSymbol] = (),
     *,
+    dynamic_symbols: Sequence[ElfSymbol] = (),
     build_id: Optional[bytes] = None,
+    gnu_debuglink: Optional[
+        Tuple[Union[str, bytes, "os.PathLike[str]", "os.PathLike[bytes]"], int]
+    ] = None,
+    gnu_debugaltlink: Optional[
+        Tuple[Union[str, bytes, "os.PathLike[str]", "os.PathLike[bytes]"], bytes]
+    ] = None,
     little_endian: bool = True,
     bits: int = 64,
 ):
@@ -141,6 +158,14 @@ def create_elf_file(
     nhdr_struct = struct.Struct(endian + "3I")
 
     sections = list(sections)
+    if dynamic_symbols:
+        _create_symtab(
+            sections,
+            dynamic_symbols,
+            dynamic=True,
+            little_endian=little_endian,
+            bits=bits,
+        )
     if symbols:
         _create_symtab(sections, symbols, little_endian=little_endian, bits=bits)
     if build_id is not None:
@@ -157,6 +182,32 @@ def create_elf_file(
         sections.append(
             ElfSection(name=".note.gnu.build-id", sh_type=SHT.NOTE, data=build_id_note)
         )
+
+    if gnu_debuglink is not None:
+        gnu_debuglink_path, gnu_debuglink_crc = gnu_debuglink
+        gnu_debuglink_path = os.fsencode(gnu_debuglink_path)
+        sections.append(
+            ElfSection(
+                name=".gnu_debuglink",
+                sh_type=SHT.PROGBITS,
+                data=gnu_debuglink_path
+                + bytes(4 - len(gnu_debuglink_path) % 4)
+                + gnu_debuglink_crc.to_bytes(4, "little"),
+            )
+        )
+
+    if gnu_debugaltlink is not None:
+        gnu_debugaltlink_path, gnu_debugaltlink_build_id = gnu_debugaltlink
+        sections.append(
+            ElfSection(
+                name=".gnu_debugaltlink",
+                sh_type=SHT.PROGBITS,
+                data=os.fsencode(gnu_debugaltlink_path)
+                + b"\0"
+                + gnu_debugaltlink_build_id,
+            )
+        )
+
     shnum = 0
     phnum = 0
     shstrtab = bytearray(1)

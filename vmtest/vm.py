@@ -1,13 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import contextlib
 import enum
 import os
 from pathlib import Path
 import re
 import shlex
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -41,10 +41,10 @@ export DRGN_TEST_DISK=/dev/vda
 {kdump_needs_nosmp}
 
 # On exit, power off. We don't use the poweroff command because very minimal
-# installations don't have it (e.g., the debootstrap minbase variant). The
-# magic SysRq returns immediately without waiting for the poweroff, so we sleep
-# for a while and panic if it takes longer than that.
-trap 'echo o > /proc/sysrq-trigger && sleep 60' exit
+# installations don't have it (e.g., the debootstrap minbase variant). We don't
+# use the "o" magic SysRq because it returns immediately. Since we run QEMU
+# with -no-reboot, we can use the "b" magic SysRq, which is synchronous.
+trap 'echo b > /proc/sysrq-trigger' exit
 
 umask 022
 
@@ -195,6 +195,18 @@ def _build_onoatimehack(dir: Path) -> Path:
     return onoatimehack_so
 
 
+def _have_setpriv_pdeathsig() -> bool:
+    # util-linux supports setpriv --pdeathsig since v2.33. BusyBox doesn't
+    # support it as of v1.37.
+    try:
+        help = subprocess.run(
+            ["setpriv", "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        ).stdout
+    except FileNotFoundError:
+        return False
+    return b"--pdeathsig" in help
+
+
 class TestKmodMode(enum.Enum):
     NONE = 0
     BUILD = 1
@@ -213,6 +225,7 @@ def run_in_vm(
     *,
     extra_qemu_options: Sequence[str] = (),
     test_kmod: TestKmodMode = TestKmodMode.NONE,
+    interactive: bool = False,
 ) -> int:
     if root_dir is None:
         if kernel.arch is HOST_ARCHITECTURE:
@@ -239,6 +252,14 @@ def run_in_vm(
         onoatimehack_so = _build_onoatimehack(build_dir)
         env["LD_PRELOAD"] = f"{str(onoatimehack_so)}:{env.get('LD_PRELOAD', '')}"
 
+    # Kill the child QEMU process if we die. If we die between the fork() and
+    # the prctl(PR_SET_PDEATHSIG), then the signal won't be delivered, but then
+    # QEMU will fail to connect to our socket and exit.
+    if _have_setpriv_pdeathsig():
+        setpriv_args = ["setpriv", "--pdeathsig=TERM"]
+    else:
+        setpriv_args = []
+
     kvm_args = []
     if HOST_ARCHITECTURE is not None and kernel.arch.name == HOST_ARCHITECTURE.name:
         if os.access("/dev/kvm", os.R_OK | os.W_OK):
@@ -249,17 +270,30 @@ def run_in_vm(
                 file=sys.stderr,
             )
 
+    if interactive:
+        serial_args = ["-serial", "mon:stdio"]
+        infile = None
+    else:
+        serial_args = [
+            "-chardev",
+            "stdio,id=stdio,signal=off",
+            "-serial",
+            "chardev:stdio",
+        ]
+        infile = subprocess.DEVNULL
+
     virtfs_options = "security_model=none,readonly=on"
     # multidevs was added in QEMU 4.2.0.
     if qemu_version >= (4, 2):
         virtfs_options += ",multidevs=remap"
     _9pfs_mount_options = f"trans=virtio,cache=loose,msize={1024 * 1024}"
 
-    with tempfile.TemporaryDirectory(prefix="drgn-vmtest-") as temp_dir, socket.socket(
-        socket.AF_UNIX
-    ) as server_sock:
-        temp_path = Path(temp_dir)
+    with contextlib.ExitStack() as exit_stack:
+        temp_path = Path(
+            exit_stack.enter_context(tempfile.TemporaryDirectory(prefix="drgn-vmtest-"))
+        )
         socket_path = temp_path / "socket"
+        server_sock = exit_stack.enter_context(socket.socket(socket.AF_UNIX))
         server_sock.bind(str(socket_path))
         server_sock.listen()
 
@@ -302,30 +336,26 @@ def run_in_vm(
         else:
             stty_command = ""
 
-        with init_path.open("w") as init_file:
-            init_file.write(
-                _INIT_TEMPLATE.format(
-                    cwd=shlex.quote(host_dir_prefix + os.getcwd()),
-                    kernel_dir=shlex.quote(
-                        host_dir_prefix + str(kernel.path.resolve())
-                    ),
-                    command=shlex.quote(command),
-                    kdump_needs_nosmp="" if kvm_args else "export KDUMP_NEEDS_NOSMP=1",
-                    test_kmod=test_kmod_command,
-                    stty=stty_command,
-                )
+        init_path.write_text(
+            _INIT_TEMPLATE.format(
+                cwd=shlex.quote(host_dir_prefix + os.getcwd()),
+                kernel_dir=shlex.quote(host_dir_prefix + str(kernel.path.resolve())),
+                command=shlex.quote(command),
+                kdump_needs_nosmp="" if kvm_args else "export KDUMP_NEEDS_NOSMP=1",
+                test_kmod=test_kmod_command,
+                stty=stty_command,
             )
+        )
         init_path.chmod(0o755)
 
         disk_path = temp_path / "disk"
         with disk_path.open("wb") as f:
             os.ftruncate(f.fileno(), 1024 * 1024 * 1024)
 
-        signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
-
         proc = subprocess.Popen(
             [
                 # fmt: off
+                *setpriv_args,
                 *unshare_args,
 
                 qemu_exe, *kvm_args,
@@ -333,7 +363,7 @@ def run_in_vm(
                 # Limit the number of cores to 8, otherwise we can reach an OOM troubles.
                 "-smp", str(min(nproc(), 8)), "-m", "2G",
 
-                "-display", "none", "-serial", "mon:stdio",
+                "-display", "none", *serial_args,
 
                 # This along with -append panic=-1 ensures that we exit on a
                 # panic instead of hanging.
@@ -362,27 +392,25 @@ def run_in_vm(
                 # fmt: on
             ],
             env=env,
+            stdin=infile,
         )
         try:
             server_sock.settimeout(5)
             try:
-                sock = server_sock.accept()[0]
+                sock = exit_stack.enter_context(server_sock.accept()[0])
             except socket.timeout:
                 raise LostVMError(
                     f"QEMU did not connect within {server_sock.gettimeout()} seconds"
                 )
-            try:
-                status_buf = bytearray()
-                while True:
-                    try:
-                        buf = sock.recv(4)
-                    except ConnectionResetError:
-                        buf = b""
-                    if not buf:
-                        break
-                    status_buf.extend(buf)
-            finally:
-                sock.close()
+            status_buf = bytearray()
+            while True:
+                try:
+                    buf = sock.recv(4)
+                except ConnectionResetError:
+                    buf = b""
+                if not buf:
+                    break
+                status_buf.extend(buf)
         except BaseException:
             proc.terminate()
             raise
@@ -518,6 +546,7 @@ if __name__ == "__main__":
                 args.directory,
                 extra_qemu_options=args.qemu_options,
                 test_kmod=args.test_kmod,
+                interactive=True,
             )
         )
     except LostVMError as e:

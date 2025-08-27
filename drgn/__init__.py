@@ -44,19 +44,27 @@ import io
 import pkgutil
 import sys
 import types
-from typing import Union
+from typing import Any, Dict, Optional, Union
 
 from _drgn import (
     NULL,
+    AbsenceReason,
     Architecture,
+    DebugInfoOptions,
+    ExtraModule,
     FaultError,
     FindObjectFlags,
     IntegerLike,
+    KmodSearchMethod,
     Language,
+    MainModule,
     MissingDebugInfoError,
+    Module,
+    ModuleFileStatus,
     NoDefaultProgramError,
     Object,
     ObjectAbsentError,
+    ObjectNotFoundError,
     OutOfBoundsError,
     Path,
     Platform,
@@ -66,8 +74,11 @@ from _drgn import (
     ProgramFlags,
     Qualifiers,
     Register,
+    RelocatableModule,
+    SharedLibraryModule,
     StackFrame,
     StackTrace,
+    SupplementaryFileKind,
     Symbol,
     SymbolBinding,
     SymbolIndex,
@@ -80,6 +91,8 @@ from _drgn import (
     TypeMember,
     TypeParameter,
     TypeTemplateParameter,
+    VdsoModule,
+    WantedSupplementaryFile,
     alignof,
     cast,
     container_of,
@@ -100,21 +113,32 @@ from _drgn import (
 # isort: split
 from _drgn import (  # noqa: F401
     _elfutils_version as _elfutils_version,
+    _enable_dlopen_debuginfod as _enable_dlopen_debuginfod,
+    _have_debuginfod as _have_debuginfod,
     _with_libkdumpfile as _with_libkdumpfile,
+    _with_lzma as _with_lzma,
 )
 from drgn.internal.version import __version__ as __version__  # noqa: F401
 
 __all__ = (
+    "AbsenceReason",
     "Architecture",
+    "DebugInfoOptions",
+    "ExtraModule",
     "FaultError",
     "FindObjectFlags",
     "IntegerLike",
+    "KmodSearchMethod",
     "Language",
+    "MainModule",
     "MissingDebugInfoError",
+    "Module",
+    "ModuleFileStatus",
     "NULL",
     "NoDefaultProgramError",
     "Object",
     "ObjectAbsentError",
+    "ObjectNotFoundError",
     "OutOfBoundsError",
     "Path",
     "Platform",
@@ -124,8 +148,11 @@ __all__ = (
     "ProgramFlags",
     "Qualifiers",
     "Register",
+    "RelocatableModule",
+    "SharedLibraryModule",
     "StackFrame",
     "StackTrace",
+    "SupplementaryFileKind",
     "Symbol",
     "SymbolBinding",
     "SymbolIndex",
@@ -138,6 +165,8 @@ __all__ = (
     "TypeMember",
     "TypeParameter",
     "TypeTemplateParameter",
+    "VdsoModule",
+    "WantedSupplementaryFile",
     "alignof",
     "cast",
     "container_of",
@@ -157,15 +186,6 @@ __all__ = (
 )
 
 
-if sys.version_info >= (3, 8):
-    _open_code = io.open_code  # novermin
-else:
-    from typing import BinaryIO
-
-    def _open_code(path: str) -> BinaryIO:
-        return open(path, "rb")
-
-
 # From https://docs.python.org/3/reference/import.html#import-related-module-attributes.
 _special_globals = frozenset(
     [
@@ -180,7 +200,7 @@ _special_globals = frozenset(
 )
 
 
-def execscript(path: str, *args: str) -> None:
+def execscript(path: str, *args: str, globals: Optional[Dict[str, Any]] = None) -> None:
     """
     Execute a script.
 
@@ -222,6 +242,7 @@ def execscript(path: str, *args: str) -> None:
     :param path: File path of the script.
     :param args: Zero or more additional arguments to pass to the script. This
         is a :ref:`variable argument list <python:tut-arbitraryargs>`.
+    :param globals: If provided, globals to use instead of the caller's.
     """
     # This is based on runpy.run_path(), which we can't use because we want to
     # update globals even if the script throws an exception.
@@ -237,16 +258,19 @@ def execscript(path: str, *args: str) -> None:
         sys.argv = [path]
         sys.argv.extend(args)
 
-        with _open_code(path) as f:
+        with io.open_code(path) as f:
             code = pkgutil.read_code(f)
         if code is None:
-            with _open_code(path) as f:
+            with io.open_code(path) as f:
                 code = compile(f.read(), path, "exec")
         module.__spec__ = None
         module.__file__ = path
         module.__cached__ = None  # type: ignore[attr-defined]
 
-        caller_globals = sys._getframe(1).f_globals
+        if globals is not None:
+            caller_globals = globals
+        else:
+            caller_globals = sys._getframe(1).f_globals
         caller_special_globals = {
             name: caller_globals[name]
             for name in _special_globals

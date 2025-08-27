@@ -6,6 +6,7 @@ import operator
 import struct
 
 from drgn import (
+    AbsenceReason,
     FaultError,
     Object,
     ObjectAbsentError,
@@ -43,7 +44,7 @@ class TestInit(MockProgramTestCase):
             ValueError, "absent object must have type", Object, self.prog
         )
 
-    def test_address_nand_value(self):
+    def test_address_value_absence_reason_nand(self):
         self.assertRaisesRegex(
             ValueError,
             "object cannot have address and value",
@@ -61,6 +62,34 @@ class TestInit(MockProgramTestCase):
             "int",
             value=0,
             address=0,
+        )
+        self.assertRaisesRegex(
+            ValueError,
+            "object cannot have address and absence reason",
+            Object,
+            self.prog,
+            "int",
+            address=0,
+            absence_reason=AbsenceReason.OTHER,
+        )
+        self.assertRaisesRegex(
+            ValueError,
+            "object cannot have value and absence reason",
+            Object,
+            self.prog,
+            "int",
+            value=0,
+            absence_reason=AbsenceReason.OTHER,
+        )
+        self.assertRaisesRegex(
+            ValueError,
+            "object cannot have address, value, and absence reason",
+            Object,
+            self.prog,
+            "int",
+            value=0,
+            address=0,
+            absence_reason=AbsenceReason.OTHER,
         )
 
     def test_integer_address(self):
@@ -644,6 +673,7 @@ class TestValue(MockProgramTestCase):
         self.assertIs(obj.prog_, self.prog)
         self.assertIdentical(obj.type_, self.prog.type("int"))
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertIsNone(obj.bit_offset_)
         self.assertIsNone(obj.bit_field_size_)
@@ -677,6 +707,7 @@ class TestValue(MockProgramTestCase):
         self.assertIs(obj.prog_, self.prog)
         self.assertIdentical(obj.type_, self.prog.type("unsigned int"))
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertIsNone(obj.bit_offset_)
         self.assertIsNone(obj.bit_field_size_)
@@ -766,6 +797,7 @@ class TestValue(MockProgramTestCase):
         self.assertIs(obj.prog_, self.prog)
         self.assertIdentical(obj.type_, self.prog.int_type("__int128", 16, True))
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertIsNone(obj.bit_offset_)
         self.assertIsNone(obj.bit_field_size_)
@@ -799,6 +831,7 @@ class TestValue(MockProgramTestCase):
             obj.type_, self.prog.int_type("unsigned __int128", 16, False)
         )
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertIsNone(obj.bit_offset_)
         self.assertIsNone(obj.bit_field_size_)
@@ -863,6 +896,7 @@ class TestValue(MockProgramTestCase):
         self.assertIs(obj.prog_, self.prog)
         self.assertIdentical(obj.type_, self.prog.type("double"))
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertEqual(obj.value_(), 3.14)
         self.assertEqual(repr(obj), "Object(prog, 'double', value=3.14)")
@@ -1118,6 +1152,7 @@ class TestValue(MockProgramTestCase):
     def test_pointer(self):
         obj = Object(self.prog, "int *", value=0xFFFF0000)
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertEqual(obj.value_(), 0xFFFF0000)
         self.assertEqual(repr(obj), "Object(prog, 'int *', value=0xffff0000)")
@@ -1129,6 +1164,7 @@ class TestValue(MockProgramTestCase):
             value=0xFFFF0000,
         )
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
         self.assertEqual(obj.value_(), 0xFFFF0000)
         self.assertEqual(repr(obj), "Object(prog, 'INTP', value=0xffff0000)")
@@ -1136,6 +1172,7 @@ class TestValue(MockProgramTestCase):
     def test_array(self):
         obj = Object(self.prog, "int [2]", value=[1, 2])
         self.assertFalse(obj.absent_)
+        self.assertIsNone(obj.absence_reason_)
         self.assertIsNone(obj.address_)
 
         self.assertIdentical(obj[0], Object(self.prog, "int", value=1))
@@ -1215,6 +1252,9 @@ class TestAbsent(MockProgramTestCase):
             self.assertIs(obj.prog_, self.prog)
             self.assertIdentical(obj.type_, self.prog.type("int"))
             self.assertTrue(obj.absent_)
+            self.assertEqual(
+                Object(self.prog, "int").absence_reason_, AbsenceReason.OTHER
+            )
             self.assertIsNone(obj.address_)
             self.assertIsNone(obj.bit_offset_)
             self.assertIsNone(obj.bit_field_size_)
@@ -1222,6 +1262,13 @@ class TestAbsent(MockProgramTestCase):
             self.assertEqual(repr(obj), "Object(prog, 'int')")
 
             self.assertRaises(ObjectAbsentError, obj.read_)
+
+    def test_reason(self):
+        obj = Object(self.prog, "int", absence_reason=AbsenceReason.OPTIMIZED_OUT)
+        self.assertEqual(obj.absence_reason_, AbsenceReason.OPTIMIZED_OUT)
+        self.assertEqual(
+            repr(obj), "Object(prog, 'int', absence_reason=AbsenceReason.OPTIMIZED_OUT)"
+        )
 
     def test_bit_field(self):
         obj = Object(self.prog, "int", bit_field_size=1)
@@ -1740,6 +1787,131 @@ class TestGenericOperators(MockProgramTestCase):
         obj = Object(self.prog, "int", value=0)
         self.assertRaises(TypeError, obj.__getitem__, 0)
 
+    def test_negative_subscript(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(obj[-1], Object(self.prog, "int", address=0xFFFEFFFC))
+
+        obj = arr.read_()
+        self.assertRaisesRegex(OutOfBoundsError, "out of bounds", obj.__getitem__, -1)
+
+    def test_slice(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(
+                obj[1:3], Object(self.prog, "int [2]", address=0xFFFF0004)
+            )
+
+        obj = arr.read_()
+        self.assertIdentical(obj[1:3], Object(self.prog, "int [2]", [1, 2]))
+
+    def test_slice_step(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(
+                obj[1:3:1], Object(self.prog, "int [2]", address=0xFFFF0004)
+            )
+
+    def test_slice_invalid_step(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        with self.assertRaisesRegex(ValueError, "object slice step must be 1"):
+            arr[0:4:2]
+
+    def test_slice_negative_start(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(
+                obj[-2:2], Object(self.prog, "int [4]", address=0xFFFEFFF8)
+            )
+
+        obj = arr.read_()
+        with self.assertRaisesRegex(OutOfBoundsError, "out of bounds"):
+            obj[-2:2]
+
+    def test_slice_both_negative(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(
+                obj[-4:-2], Object(self.prog, "int [2]", address=0xFFFEFFF0)
+            )
+
+        obj = arr.read_()
+        with self.assertRaisesRegex(OutOfBoundsError, "out of bounds"):
+            obj[-4:-2]
+
+    def test_slice_both_none(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+
+        self.assertIdentical(arr[:], Object(self.prog, "int [4]", address=0xFFFF0000))
+        with self.assertRaisesRegex(TypeError, "has no length"):
+            incomplete_arr[:]
+        with self.assertRaisesRegex(TypeError, "has no length"):
+            ptr[:]
+
+        self.assertIdentical(arr.read_()[:], Object(self.prog, "int [4]", [0, 1, 2, 3]))
+
+    def test_slice_start_none(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(
+                obj[:3], Object(self.prog, "int [3]", address=0xFFFF0000)
+            )
+
+        self.assertIdentical(arr.read_()[:3], Object(self.prog, "int [3]", [0, 1, 2]))
+
+    def test_slice_stop_none(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+
+        self.assertIdentical(arr[1:], Object(self.prog, "int [3]", address=0xFFFF0004))
+        with self.assertRaisesRegex(TypeError, "has no length"):
+            incomplete_arr[1:]
+        with self.assertRaisesRegex(TypeError, "has no length"):
+            ptr[1:]
+
+        self.assertIdentical(arr.read_()[1:], Object(self.prog, "int [3]", [1, 2, 3]))
+
+    def test_slice_start_negative_stop_none(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+
+        self.assertIdentical(arr[-2:], Object(self.prog, "int [6]", address=0xFFFEFFF8))
+        with self.assertRaisesRegex(TypeError, "has no length"):
+            incomplete_arr[-2:]
+        with self.assertRaisesRegex(TypeError, "has no length"):
+            ptr[-2:]
+
+        obj = arr.read_()
+        with self.assertRaisesRegex(OutOfBoundsError, "out of bounds"):
+            obj[-2:]
+
+    def test_slice_start_none_stop_negative(self):
+        arr = Object(self.prog, "int [4]", address=0xFFFF0000)
+        incomplete_arr = Object(self.prog, "int []", address=0xFFFF0000)
+        ptr = Object(self.prog, "int *", value=0xFFFF0000)
+        for obj in [arr, incomplete_arr, ptr]:
+            self.assertIdentical(
+                obj[:-2], Object(self.prog, "int [0]", address=0xFFFF0000)
+            )
+
+        self.assertIdentical(arr.read_()[:-2], Object(self.prog, "int [0]", []))
+
     def test_cast_primitive_value(self):
         obj = Object(self.prog, "long", value=2**32 + 1)
         self.assertIdentical(cast("int", obj), Object(self.prog, "int", value=1))
@@ -2143,6 +2315,27 @@ class TestGenericOperators(MockProgramTestCase):
             "must be an array or pointer",
             Object(self.prog, "int", value=1).string_,
         )
+
+    def test_format_invalid_integer_base(self):
+        obj = Object(self.prog, "int", 1)
+        for integer_base in (
+            0,
+            1,
+            -(2**31),
+            2**31 - 1,
+            -(2**32),
+            2**32,
+            2**128,
+            -(2**128),
+        ):
+            with self.subTest(integer_base=integer_base):
+                self.assertRaisesRegex(
+                    ValueError,
+                    "invalid integer base",
+                    obj.format_,
+                    integer_base=integer_base,
+                )
+        self.assertRaises(TypeError, obj.format_, integer_base="hex")
 
 
 class TestSpecialMethods(MockProgramTestCase):
