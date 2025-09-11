@@ -12,14 +12,14 @@ import socket
 import subprocess
 import sys
 import tempfile
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, TextIO
 
 from util import nproc, out_of_date
 from vmtest.config import HOST_ARCHITECTURE, Kernel, local_kernel
 from vmtest.download import (
     DOWNLOAD_KERNEL_ARGPARSE_METAVAR,
+    Downloader,
     DownloadKernel,
-    download,
     download_kernel_argparse_type,
 )
 from vmtest.kmod import build_kmod
@@ -226,6 +226,7 @@ def run_in_vm(
     extra_qemu_options: Sequence[str] = (),
     test_kmod: TestKmodMode = TestKmodMode.NONE,
     interactive: bool = False,
+    outfile: Optional[TextIO] = None,
 ) -> int:
     if root_dir is None:
         if kernel.arch is HOST_ARCHITECTURE:
@@ -234,7 +235,7 @@ def run_in_vm(
             root_dir = build_dir / kernel.arch.name / "rootfs"
 
     if test_kmod != TestKmodMode.NONE:
-        kmod = build_kmod(build_dir, kernel)
+        kmod = build_kmod(build_dir, kernel, outfile=outfile)
 
     qemu_exe = "qemu-system-" + kernel.arch.name
     match = re.search(
@@ -360,8 +361,9 @@ def run_in_vm(
 
                 qemu_exe, *kvm_args,
 
-                # Limit the number of cores to 8, otherwise we can reach an OOM troubles.
-                "-smp", str(min(nproc(), 8)), "-m", "2G",
+                # Limit the number of cores to 2. We want to test SMP, but each additional
+                # virtualized CPU costs memory and CPU time, so 2 is enaugh.
+                "-smp", str(min(nproc(), 2)), "-m", "2G",
 
                 "-display", "none", *serial_args,
 
@@ -392,6 +394,8 @@ def run_in_vm(
                 # fmt: on
             ],
             env=env,
+            stdout=outfile,
+            stderr=outfile,
             stdin=infile,
         )
         try:
@@ -527,10 +531,16 @@ if __name__ == "__main__":
     if not hasattr(args, "test_kmod"):
         args.test_kmod = TestKmodMode.NONE
 
+    downloader = Downloader(args.directory)
+    if args.test_kmod != TestKmodMode.NONE:
+        downloader.download_compiler(downloader.resolve_compiler(args.kernel.arch))
+
     if args.kernel.pattern.startswith(".") or args.kernel.pattern.startswith("/"):
         kernel = local_kernel(args.kernel.arch, Path(args.kernel.pattern))
     else:
-        kernel = next(download(args.directory, [args.kernel]))  # type: ignore[assignment]
+        kernel = downloader.download_kernel(
+            downloader.resolve_kernel(args.kernel.arch, args.kernel.pattern)
+        )
 
     try:
         command = (
