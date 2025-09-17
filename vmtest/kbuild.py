@@ -26,12 +26,11 @@ from vmtest.config import (
     HOST_ARCHITECTURE,
     KERNEL_FLAVORS,
     Architecture,
-    Compiler,
     KernelFlavor,
     kconfig,
     kconfig_localversion,
 )
-from vmtest.download import COMPILER_URL, DownloadCompiler, download
+from vmtest.download import COMPILER_URL, Downloader
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +179,14 @@ _PATCHES = (
             (None, KernelVersion("5.4.262")),
         ),
     ),
+    _Patch(
+        name="kbuild-Only-add-fno-var-tracking-assignments-for-old.patch",
+        versions=((KernelVersion("5.1"), KernelVersion("5.10")),),
+    ),
+    _Patch(
+        name="4.19-kbuild-Only-add-fno-var-tracking-assignments-for-old.patch",
+        versions=((None, KernelVersion("5.1")),),
+    ),
 )
 
 
@@ -209,6 +216,7 @@ async def apply_patches(kernel_dir: Path) -> None:
             cwd=kernel_dir,
             stderr=asyncio.subprocess.PIPE,
         )
+        assert proc.stderr is not None  # for mypy
         stderr = await proc.stderr.read()
         if await proc.wait() != 0:
             try:
@@ -514,9 +522,15 @@ MODULE_LICENSE("GPL");
                 stderr=asyncio.subprocess.PIPE,
                 env=self._env,
             )
+            assert proc.stdout is not None  # for mypy
+            assert proc.stderr is not None  # for mypy
             try:
-                stdout_task = asyncio.create_task(proc.stdout.readline())
-                stderr_task = asyncio.create_task(proc.stderr.readline())
+                stdout_task: Optional[asyncio.Task[bytes]] = asyncio.create_task(
+                    proc.stdout.readline()
+                )
+                stderr_task: Optional[asyncio.Task[bytes]] = asyncio.create_task(
+                    proc.stderr.readline()
+                )
                 error = False
                 while stdout_task is not None or stderr_task is not None:
                     aws = []
@@ -771,8 +785,8 @@ async def main() -> None:
     if hasattr(args, "download_compiler"):
         if args.download_compiler is None:
             args.download_compiler = default_download_compiler_directory
-        downloaded = next(download(args.download_compiler, [DownloadCompiler(arch)]))
-        assert isinstance(downloaded, Compiler)
+        downloader = Downloader(args.download_compiler)
+        downloaded = downloader.download_compiler(downloader.resolve_compiler(arch))
         env = {**os.environ, **downloaded.env()}
     else:
         env = None
