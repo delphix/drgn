@@ -20,6 +20,7 @@
 
 #include "array.h"
 #include "binary_buffer.h"
+#include "bitops.h"
 #include "cleanup.h"
 #include "debug_info.h"
 #include "drgn_internal.h"
@@ -34,6 +35,7 @@
 #include "log.h"
 #include "platform.h"
 #include "program.h"
+#include "symbol.h"
 #include "type.h"
 #include "util.h"
 
@@ -153,46 +155,140 @@ struct drgn_error *read_vmcoreinfo_fallback(struct drgn_program *prog)
 	return drgn_program_parse_vmcoreinfo(prog, buf + 24, nhdr->n_descsz);
 }
 
-static struct drgn_error *linux_kernel_get_page_shift(struct drgn_program *prog,
-						      struct drgn_object *ret)
-{
-	struct drgn_error *err;
-	struct drgn_qualified_type qualified_type;
-	err = drgn_program_find_primitive_type(prog, DRGN_C_TYPE_INT,
-					       &qualified_type.type);
-	if (err)
-		return err;
-	qualified_type.qualifiers = 0;
-	return drgn_object_set_signed(ret, qualified_type,
-				      prog->vmcoreinfo.page_shift, 0);
+#define LINUX_KERNEL_GET_PRIMITIVE(name, primitive_type, signed_unsigned, expr)	\
+static struct drgn_error *linux_kernel_get_##name(struct drgn_program *prog,	\
+						  struct drgn_object *ret)	\
+{										\
+	struct drgn_error *err;							\
+	struct drgn_qualified_type qualified_type;				\
+	err = drgn_program_find_primitive_type(prog, (primitive_type),		\
+					       &qualified_type.type);		\
+	if (err)								\
+		return err;							\
+	qualified_type.qualifiers = 0;						\
+	return drgn_object_set_##signed_unsigned(ret, qualified_type, (expr),	\
+						 0);				\
 }
 
-static struct drgn_error *linux_kernel_get_page_size(struct drgn_program *prog,
-						     struct drgn_object *ret)
+#define LINUX_KERNEL_GET_PRIMITIVE_WRAPPER(name, primitive_type)		\
+static struct drgn_error *linux_kernel_get_##name(struct drgn_program *prog,	\
+						  struct drgn_object *ret)	\
+{										\
+	struct drgn_error *err;							\
+	typeof(_Generic(&linux_kernel_get_##name##_impl,			\
+			struct drgn_error *(*)(struct drgn_program *,		\
+					       uint64_t *): (uint64_t)0,	\
+			struct drgn_error *(*)(struct drgn_program *,		\
+					       int64_t *): (int64_t)0))		\
+	value;									\
+	err = linux_kernel_get_##name##_impl(prog, &value);			\
+	if (err)								\
+		return err;							\
+	struct drgn_qualified_type qualified_type;				\
+	err = drgn_program_find_primitive_type(prog, (primitive_type),		\
+					       &qualified_type.type);		\
+	if (err)								\
+		return err;							\
+	qualified_type.qualifiers = 0;						\
+	return _Generic(value,							\
+			uint64_t: drgn_object_set_unsigned,			\
+			int64_t: drgn_object_set_signed)			\
+		       (ret, qualified_type, value, 0);				\
+}
+
+LINUX_KERNEL_GET_PRIMITIVE(page_shift, DRGN_C_TYPE_INT, signed,
+			   prog->vmcoreinfo.page_shift)
+
+LINUX_KERNEL_GET_PRIMITIVE(page_size, DRGN_C_TYPE_UNSIGNED_LONG, unsigned,
+			   prog->vmcoreinfo.page_size)
+
+LINUX_KERNEL_GET_PRIMITIVE(page_mask, DRGN_C_TYPE_UNSIGNED_LONG, unsigned,
+			   ~(prog->vmcoreinfo.page_size - 1))
+
+static struct drgn_error *linux_kernel_get_thread_size(struct drgn_program *prog,
+						       struct drgn_object *ret)
 {
 	struct drgn_error *err;
-	struct drgn_qualified_type qualified_type;
+	struct drgn_qualified_type qualified_type, thread_union;
+	qualified_type.qualifiers = 0;
 	err = drgn_program_find_primitive_type(prog, DRGN_C_TYPE_UNSIGNED_LONG,
 					       &qualified_type.type);
 	if (err)
 		return err;
-	qualified_type.qualifiers = 0;
-	return drgn_object_set_unsigned(ret, qualified_type,
-					prog->vmcoreinfo.page_size, 0);
-}
 
-static struct drgn_error *linux_kernel_get_page_mask(struct drgn_program *prog,
-						     struct drgn_object *ret)
-{
-	struct drgn_error *err;
-	struct drgn_qualified_type qualified_type;
-	err = drgn_program_find_primitive_type(prog, DRGN_C_TYPE_UNSIGNED_LONG,
-					       &qualified_type.type);
-	if (err)
+	if (prog->thread_size_cached)
+		return drgn_object_set_unsigned(ret, qualified_type,
+						prog->thread_size_cached, 0);
+
+	/* Prior to 0500871f21b23 ("Construct init thread stack in the linker
+	 * script rather than by union") in v4.16, the file init/init_task.c
+	 * defined a variable of type "union thread_union" which contains a
+	 * member "stack" whose size is THREAD_SIZE. After that commit, it is
+	 * defined via the linker script, and so the variable disappears from
+	 * debuginfo, along with its type. Thankfully, the linker script defines
+	 * symbols that can also be used to infer THREAD_SIZE.
+	 *
+	 * Normally, we optimize for recent kernels by putting their cases first
+	 * in the code. But in this case, the "__{start,end}_init_task" symbols
+	 * do exist on some architectures (e.g. ppc64) prior to v4.16. However,
+	 * prior to v4.16, they aren't guaranteed to have the correct value of
+	 * THREAD_SIZE. So, we need to check for "union thread_union" first, to
+	 * get the most accurate value for those architectures prior to v4.16.
+	 */
+	err = drgn_program_find_type(prog, "union thread_union", NULL,
+					&thread_union);
+	if (!err) {
+		struct drgn_type_member *stack_member;
+		uint64_t bit_offset_unused;
+		err = drgn_type_find_member(thread_union.type, "stack",
+					    &stack_member, &bit_offset_unused);
+		if (err)
+			return err;
+
+		struct drgn_qualified_type stack_type;
+		err = drgn_member_type(stack_member, &stack_type, NULL);
+		if (err)
+			return err;
+
+		err = drgn_type_sizeof(stack_type.type, &prog->thread_size_cached);
+		if (err)
+			return err;
+
+		return drgn_object_set_unsigned(ret, qualified_type,
+						prog->thread_size_cached, 0);
+	} else if (!drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
 		return err;
-	qualified_type.qualifiers = 0;
-	return drgn_object_set_unsigned(ret, qualified_type,
-					~(prog->vmcoreinfo.page_size - 1), 0);
+	}
+
+#define SYMBOL_START_END(symname_start, symname_end) do { \
+		struct drgn_symbol _cleanup_symbol_ *sym_start = NULL; \
+		struct drgn_symbol _cleanup_symbol_ *sym_end = NULL; \
+		err = drgn_program_find_symbol_by_name(prog, symname_start, &sym_start); \
+		if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) \
+			break; \
+		else if (err) \
+			return err; \
+		err = drgn_program_find_symbol_by_name(prog, symname_end, &sym_end); \
+		if (err) \
+			return err; \
+		prog->thread_size_cached = sym_end->address - sym_start->address; \
+		return drgn_object_set_unsigned(ret, qualified_type, \
+						prog->thread_size_cached, 0); \
+	} while (0)
+
+	/* From Linux 4.16 up to 6.10's commit 8f69cba096b5c ("x86: Rename
+	 * __{start,end}_init_task to __{start,end}_init_stack"), the symbols
+	 * were named __{start,end}_init_task. Though the commit message
+	 * indicates that the init_task is only used on x86, the symbols are
+	 * present and accurate on other architectures regardless. */
+	SYMBOL_START_END("__start_init_task", "__end_init_task");
+
+	/* For Linux v6.10 and later, we can observe the stack size by the
+	 * __{start,end}_init_stack symbols. */
+	SYMBOL_START_END("__start_init_stack", "__end_init_stack");
+#undef SYMBOL_START_END
+
+	return &drgn_not_found;
 }
 
 static struct drgn_error *
@@ -384,6 +480,165 @@ static struct drgn_error *linux_kernel_get_vmemmap(struct drgn_program *prog,
 	}
 	return drgn_object_copy(ret, &prog->vmemmap);
 }
+
+static struct drgn_error *
+linux_kernel_get_nr_section_roots_impl(struct drgn_program *prog, uint64_t *ret)
+{
+	if (prog->vmcoreinfo.mem_section_length == 0)
+		return &drgn_not_found;
+	*ret = prog->vmcoreinfo.mem_section_length;
+	return NULL;
+}
+LINUX_KERNEL_GET_PRIMITIVE_WRAPPER(nr_section_roots, DRGN_C_TYPE_UNSIGNED_LONG)
+
+static struct drgn_error *
+linux_kernel_get_sections_per_root_impl(struct drgn_program *prog, uint64_t *ret)
+{
+	struct drgn_error *err;
+
+	if (prog->cached_sections_per_root) {
+		*ret = prog->cached_sections_per_root;
+		return NULL;
+	}
+
+	if (!prog->vmcoreinfo.mem_section_length) // !SPARSEMEM
+		return &drgn_not_found;
+
+	DRGN_OBJECT(mem_section, prog);
+	err = drgn_program_find_object(prog, "mem_section", NULL,
+				       DRGN_FIND_OBJECT_VARIABLE, &mem_section);
+	if (err)
+		return err;
+
+	// For SPARSEMEM_STATIC, mem_section is always an array of arrays. For
+	// SPARSEMEM_EXTREME, since Linux kernel commit 83e3c48729d9
+	// ("mm/sparsemem: Allocate mem_section at runtime for
+	// CONFIG_SPARSEMEM_EXTREME=y") (in v4.15), it is a pointer to a pointer
+	// to struct mem_section. Before that, it is an array of pointers to
+	// struct mem_section.
+
+	struct drgn_type *outer_type = drgn_underlying_type(mem_section.type);
+	enum drgn_type_kind outer_kind = drgn_type_kind(outer_type);
+	if (outer_kind != DRGN_TYPE_POINTER && outer_kind != DRGN_TYPE_ARRAY) {
+		return drgn_type_error("mem_section has unrecognized type: %s",
+				       outer_type);
+	}
+
+	struct drgn_type *inner_type =
+		drgn_underlying_type(drgn_type_type(outer_type).type);
+	enum drgn_type_kind inner_kind = drgn_type_kind(inner_type);
+	if (outer_kind == DRGN_TYPE_ARRAY && inner_kind == DRGN_TYPE_ARRAY) {
+		// SPARSEMEM_STATIC: SECTIONS_PER_ROOT = 1
+		*ret = 1;
+		return NULL;
+	}
+	if (inner_kind != DRGN_TYPE_POINTER) {
+		return drgn_type_error("mem_section[0] has unrecognized type: %s",
+				       inner_type);
+	}
+
+	// SPARSEMEM_EXTREME: SECTIONS_PER_ROOT = PAGE_SIZE / sizeof(struct mem_section)
+	uint64_t sizeof_mem_section;
+	err = drgn_type_sizeof(drgn_underlying_type(drgn_type_type(inner_type).type),
+			       &sizeof_mem_section);
+	if (err)
+		return err;
+	if (!is_power_of_two(sizeof_mem_section)) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "struct mem_section has invalid size");
+	}
+	*ret = prog->cached_sections_per_root =
+		prog->vmcoreinfo.page_size / sizeof_mem_section;
+	return err;
+}
+LINUX_KERNEL_GET_PRIMITIVE_WRAPPER(sections_per_root, DRGN_C_TYPE_UNSIGNED_LONG)
+
+static struct drgn_error *
+linux_kernel_get_section_size_bits_impl(struct drgn_program *prog, int64_t *ret)
+{
+	if (prog->vmcoreinfo.section_size_bits) {
+		*ret = prog->vmcoreinfo.section_size_bits;
+		return NULL;
+	}
+	if (!prog->vmcoreinfo.mem_section_length // !SPARSEMEM
+	    || !prog->has_platform
+	    || !prog->platform.arch->linux_kernel_section_size_bits_fallback)
+		return &drgn_not_found;
+	// Before Linux kernel commit 4f5aecdff25f ("crash_core, vmcoreinfo:
+	// append 'SECTION_SIZE_BITS' to vmcoreinfo") (in v5.13), we need
+	// architecture- and version-specific logic to determine
+	// SECTION_SIZE_BITS.
+	*ret = prog->vmcoreinfo.section_size_bits =
+		prog->platform.arch->linux_kernel_section_size_bits_fallback(prog);
+	return NULL;
+}
+LINUX_KERNEL_GET_PRIMITIVE_WRAPPER(section_size_bits, DRGN_C_TYPE_INT)
+
+static struct drgn_error *
+linux_kernel_get_max_physmem_bits_impl(struct drgn_program *prog, int64_t *ret)
+{
+	struct drgn_error *err;
+	if (prog->vmcoreinfo.max_physmem_bits) {
+		*ret = prog->vmcoreinfo.max_physmem_bits;
+		return NULL;
+	}
+
+	if (!prog->vmcoreinfo.mem_section_length) // !SPARSEMEM
+		return &drgn_not_found;
+
+	// Before Linux kernel commit 1d50e5d0c505 ("crash_core, vmcoreinfo:
+	// Append 'MAX_PHYSMEM_BITS' to vmcoreinfo") (in v5.9), we can compute
+	// MAX_PHYSMEM_BITS from NR_SECTION_ROOTS and SECTION_SIZE_BITS. On
+	// architectures where's it's straightforward to figure out
+	// MAX_PHYSMEM_BITS, we can get it that way, too.
+	if (prog->has_platform
+	    && prog->platform.arch->linux_kernel_max_physmem_bits_fallback) {
+		prog->vmcoreinfo.max_physmem_bits =
+			prog->platform.arch->linux_kernel_max_physmem_bits_fallback(prog);
+	} else {
+		// Given:
+		// NR_SECTION_ROOTS = NR_MEM_SECTIONS / SECTIONS_PER_ROOT
+		// NR_MEM_SECTIONS = 1 << SECTIONS_SHIFT
+		// SECTIONS_SHIFT = MAX_PHYSMEM_BITS - SECTION_SIZE_BITS
+		//
+		// Solve for MAX_PHYSMEM_BITS:
+		// => NR_SECTION_ROOTS = (1 << (MAX_PHYSMEM_BITS - SECTION_SIZE_BITS))
+		//                       / SECTIONS_PER_ROOT
+		//
+		// => NR_SECTION_ROOTS * SECTIONS_PER_ROOT
+		//    = (1 << (MAX_PHYSMEM_BITS - SECTION_SIZE_BITS))
+		//
+		// => log2(NR_SECTION_ROOTS * SECTIONS_PER_ROOT)
+		//    = MAX_PHYSMEM_BITS - SECTION_SIZE_BITS
+		//
+		// => MAX_PHYSMEM_BITS = log2(NR_SECTION_ROOTS * SECTIONS_PER_ROOT)
+		//                       + SECTION_SIZE_BITS
+		//
+		// (NR_SECTION_ROOTS and SECTIONS_PER_ROOT are always powers of
+		// two.)
+		//
+		// => MAX_PHYSMEM_BITS = log2(NR_SECTION_ROOTS)
+		//                       + log2(SECTIONS_PER_ROOT)
+		//                       + SECTION_SIZE_BITS
+		uint64_t sections_per_root;
+		err = linux_kernel_get_sections_per_root_impl(prog,
+							      &sections_per_root);
+		if (err)
+			return err;
+		int64_t section_size_bits;
+		err = linux_kernel_get_section_size_bits_impl(prog,
+							      &section_size_bits);
+		if (err)
+			return err;
+		prog->vmcoreinfo.max_physmem_bits =
+			ilog2(prog->vmcoreinfo.mem_section_length)
+			+ ilog2(sections_per_root)
+			+ section_size_bits;
+	}
+	*ret = prog->vmcoreinfo.max_physmem_bits;
+	return NULL;
+}
+LINUX_KERNEL_GET_PRIMITIVE_WRAPPER(max_physmem_bits, DRGN_C_TYPE_INT)
 
 #include "linux_kernel_object_find.inc" // IWYU pragma: keep
 

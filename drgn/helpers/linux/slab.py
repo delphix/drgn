@@ -15,15 +15,17 @@ Linux slab allocator.
     <drgn.helpers.linux.slab.slab_cache_is_merged>`.
 """
 
+import functools
 import operator
 from os import fsdecode
-from typing import Callable, Dict, Iterator, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Iterator, NamedTuple, Optional, Set, Tuple, Union
 
 from drgn import (
     NULL,
     FaultError,
     IntegerLike,
     Object,
+    ObjectNotFoundError,
     Program,
     Type,
     cast,
@@ -44,8 +46,10 @@ from drgn.helpers.linux.mm import (
     page_to_virt,
     virt_to_page,
 )
+from drgn.helpers.linux.nodemask import for_each_online_node, nr_node_ids
 from drgn.helpers.linux.percpu import per_cpu_ptr
 from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
+from drgn.helpers.linux.vmstat import global_node_page_state
 
 __all__ = (
     "find_containing_slab_cache",
@@ -55,7 +59,12 @@ __all__ = (
     "print_slab_caches",
     "slab_cache_for_each_allocated_object",
     "slab_cache_is_merged",
+    "slab_cache_objects_per_slab",
+    "slab_cache_order",
+    "slab_cache_pages_per_slab",
+    "slab_cache_usage",
     "slab_object_info",
+    "slab_total_usage",
 )
 
 
@@ -69,6 +78,66 @@ def _get_slab_type(prog: Program) -> Type:
         return prog.type("struct slab *")
     except LookupError:
         return prog.type("struct page *")
+
+
+_OO_SHIFT = 16
+_OO_MASK = (1 << _OO_SHIFT) - 1
+
+
+def slab_cache_objects_per_slab(slab_cache: Object) -> int:
+    """
+    Get the number of objects in each slab of the given slab cache.
+
+    This is only applicable to the SLUB and SLAB allocators; SLOB is not
+    supported.
+
+    :param slab_cache: ``struct kmem_cache *``
+    """
+    try:
+        oo = slab_cache.oo
+    except AttributeError:
+        try:
+            return slab_cache.num.value_()  # SLAB
+        except AttributeError:
+            raise ValueError("SLOB is not supported") from None
+    else:
+        return oo.x.value_() & _OO_MASK  # SLUB
+
+
+def slab_cache_pages_per_slab(slab_cache: Object) -> int:
+    """
+    Get the number of pages allocated for each slab of the given slab cache.
+
+    This is only applicable to the SLUB and SLAB allocators; SLOB is not
+    supported.
+
+    :param slab_cache: ``struct kmem_cache *``
+    """
+    return 1 << slab_cache_order(slab_cache)
+
+
+def slab_cache_order(slab_cache: Object) -> int:
+    """
+    Get the allocation order (i.e., base 2 logarithm of the number of pages)
+    for each slab of the given slab cache.
+
+    This is only applicable to the SLUB and SLAB allocators; SLOB is not
+    supported.
+
+    >>> 1 << slab_cache_order(slab_cache) == slab_cache_pages_per_slab(slab_cache)
+    True
+
+    :param slab_cache: ``struct kmem_cache *``
+    """
+    try:
+        oo = slab_cache.oo
+    except AttributeError:
+        try:
+            return slab_cache.gfporder.value_()  # SLAB
+        except AttributeError:
+            raise ValueError("SLOB is not supported") from None
+    else:
+        return oo.x.value_() >> _OO_SHIFT  # SLUB
 
 
 def slab_cache_is_merged(slab_cache: Object) -> bool:
@@ -219,6 +288,12 @@ class SlabFreelistCycleError(SlabCorruptionError):
     """
 
 
+class SlabPartialListError(SlabCorruptionError):
+    """
+    Error raised when a corruption is encountered in a list of partial slabs.
+    """
+
+
 # Between SLUB, SLAB, their respective configuration options, and the
 # differences between kernel versions, there is a lot of state that we need to
 # keep track of to inspect the slab allocator. It isn't pretty, but this class
@@ -228,7 +303,14 @@ class _SlabCacheHelper:
     def __init__(self, slab_cache: Object) -> None:
         self._prog = slab_cache.prog_
         self._slab_cache = slab_cache.read_()
-        self._freelist_error: Optional[Exception] = None
+
+    # Not all of the methods need this, so cache it lazily.
+    @functools.cached_property
+    def _slab_cache_size(self) -> int:
+        return self._slab_cache.size.value_()
+
+    def usage(self) -> "SlabCacheUsage":
+        raise NotImplementedError()
 
     def _page_objects(
         self, page: Object, slab: Object, pointer_type: Type
@@ -236,9 +318,6 @@ class _SlabCacheHelper:
         raise NotImplementedError()
 
     def for_each_allocated_object(self, type: Union[str, Type]) -> Iterator[Object]:
-        if self._freelist_error:
-            raise self._freelist_error
-
         pointer_type = self._prog.pointer_type(self._prog.type(type))
         slab_type = _get_slab_type(self._prog)
         # Get the underlying implementation directly to avoid overhead on each
@@ -260,89 +339,136 @@ class _SlabCacheHelper:
         raise NotImplementedError()
 
 
+class _SlubPerCpuInfo(NamedTuple):
+    freelists: Set[int]
+    num_partial_list_free_objs: int
+    error: Optional[Exception]
+
+
 class _SlabCacheHelperSlub(_SlabCacheHelper):
-    def __init__(self, slab_cache: Object) -> None:
-        super().__init__(slab_cache)
-
-        self._slab_cache_size = slab_cache.size.value_()
-
+    @functools.cached_property
+    def _red_left_pad(self) -> int:
         try:
-            self._red_left_pad = slab_cache.red_left_pad.value_()
+            return self._slab_cache.red_left_pad.value_()
         except AttributeError:
-            self._red_left_pad = 0
+            return 0
 
+    def _slub_get_freelist(
+        self, freelist_name: Callable[[], str], freelist: Object, freelist_set: Set[int]
+    ) -> None:
         # In SLUB, the freelist is a linked list with the next pointer located
         # at ptr + slab_cache->offset.
-        freelist_offset = slab_cache.offset.value_()
+        ptr = freelist.value_()
+        while ptr:
+            if ptr in freelist_set:
+                raise SlabFreelistCycleError(
+                    f"{fsdecode(self._slab_cache.name.string_())} {freelist_name()} "
+                    "freelist contains cycle; "
+                    "may be corrupted or in the middle of update"
+                )
+            freelist_set.add(ptr)
+            ptr = self._freelist_dereference(ptr + self._freelist_offset)
 
+    @functools.cached_property
+    def _freelist_offset(self) -> int:
+        return self._slab_cache.offset.value_()
+
+    @functools.cached_property
+    def _freelist_dereference(self) -> Callable[[int], int]:
         # If CONFIG_SLAB_FREELIST_HARDENED is enabled, then the next pointer is
         # obfuscated using slab_cache->random.
         try:
-            freelist_random = slab_cache.random.value_()
+            freelist_random = self._slab_cache.random.value_()
         except AttributeError:
-            self._freelist_dereference: Callable[[int], int] = self._prog.read_word
-        else:
-            ulong_size = sizeof(self._prog.type("unsigned long"))
+            return self._prog.read_word
 
-            # Since Linux kernel commit 1ad53d9fa3f6 ("slub: improve bit
-            # diffusion for freelist ptr obfuscation") in v5.7, a swab() was
-            # added to the freelist dereferencing calculation. This commit was
-            # backported to all stable branches which have
-            # CONFIG_SLAB_FREELIST_HARDENED, but you can still encounter some
-            # older stable kernels which don't have it. Unfortunately, there's
-            # no easy way to detect whether it is in effect, since the commit
-            # adds no struct field or other detectable difference.
-            #
-            # To handle this, we implement both methods, and we start out with a
-            # "trial" function. On the first time we encounter a non-NULL
-            # freelist, we try using the method with the swab(), and test
-            # whether the resulting pointer may be dereferenced. If it can, we
-            # commit to using that method forever. If it cannot, we switch to
-            # the version without swab() and commit to using that.
+        ulong_size = sizeof(self._prog.type("unsigned long"))
 
-            def _freelist_dereference_swab(ptr_addr: int) -> int:
-                # *ptr_addr ^ slab_cache->random ^ byteswap(ptr_addr)
-                return (
-                    self._prog.read_word(ptr_addr)
-                    ^ freelist_random
-                    ^ int.from_bytes(ptr_addr.to_bytes(ulong_size, "little"), "big")
+        # Since Linux kernel commit 1ad53d9fa3f6 ("slub: improve bit diffusion
+        # for freelist ptr obfuscation") in v5.7, a swab() was added to the
+        # freelist dereferencing calculation. This commit was backported to all
+        # stable branches which have CONFIG_SLAB_FREELIST_HARDENED, but you can
+        # still encounter some older stable kernels which don't have it.
+        # Unfortunately, there's no easy way to detect whether it is in effect,
+        # since the commit adds no struct field or other detectable difference.
+        #
+        # To handle this, we implement both methods, and we start out with a
+        # "trial" function. On the first time we encounter a non-NULL freelist,
+        # we try using the method with the swab(), and test whether the
+        # resulting pointer may be dereferenced. If it can, we commit to using
+        # that method forever. If it cannot, we switch to the version without
+        # swab() and commit to using that.
+
+        def _freelist_dereference_swab(ptr_addr: int) -> int:
+            # *ptr_addr ^ slab_cache->random ^ byteswap(ptr_addr)
+            return (
+                self._prog.read_word(ptr_addr)
+                ^ freelist_random
+                ^ int.from_bytes(ptr_addr.to_bytes(ulong_size, "little"), "big")
+            )
+
+        def _freelist_dereference_no_swab(ptr_addr: int) -> int:
+            # *ptr_addr ^ slab_cache->random ^ ptr_addr
+            return self._prog.read_word(ptr_addr) ^ freelist_random ^ ptr_addr
+
+        def _try_hardened_freelist_dereference(ptr_addr: int) -> int:
+            result = _freelist_dereference_swab(ptr_addr)
+            if result:
+                try:
+                    self._prog.read_word(result)
+                    self._freelist_dereference = _freelist_dereference_swab
+                except FaultError:
+                    result = _freelist_dereference_no_swab(ptr_addr)
+                    self._freelist_dereference = _freelist_dereference_no_swab
+            return result
+
+        return _try_hardened_freelist_dereference
+
+    def _num_cpu_partial_list_free_objs(self, cpu: int, cpu_slab: Object) -> int:
+        try:
+            partial = cpu_slab.partial.read_()
+        except AttributeError:
+            # Since Linux kernel commit a93cf07bc3fb ("mm/slub.c: wrap
+            # cpu_slab->partial in CONFIG_SLUB_CPU_PARTIAL") (in v4.13), if
+            # CONFIG_SLUB_CPU_PARTIAL=n, then cpu_slab->partial does not exist.
+            # Override the method on this instance to avoid checking again.
+            self._num_cpu_partial_list_free_objs = lambda cpu, cpu_slab: 0  # type: ignore[method-assign]
+            return 0
+
+        # Since Linux kernel commit bb192ed9aa71 ("mm/slub: Convert most struct
+        # page to struct slab by spatch") (in v5.17), the number of slabs on
+        # the partial list is `->slabs`. Before that, it is `->pages`.
+        nr_slabs_attr = "slabs" if hasattr(partial, "slabs") else "pages"
+
+        free_objs = 0
+        prev_nr_slabs = None
+        while partial:
+            nr_slabs = getattr(partial, nr_slabs_attr).value_()
+            # We could be stricter and check nr_slabs == prev_nr_slabs - 1, but
+            # the main thing we care about is not getting stuck in a cycle.
+            if prev_nr_slabs is not None and nr_slabs >= prev_nr_slabs:
+                raise SlabPartialListError(
+                    f"{fsdecode(self._slab_cache.name.string_())} cpu {cpu} "
+                    "partial slabs count not decreasing; "
+                    "may be corrupted or in the middle of update"
                 )
+            prev_nr_slabs = nr_slabs
 
-            def _freelist_dereference_no_swab(ptr_addr: int) -> int:
-                # *ptr_addr ^ slab_cache->random ^ ptr_addr
-                return self._prog.read_word(ptr_addr) ^ freelist_random ^ ptr_addr
+            free_objs += partial.objects.value_() - partial.inuse.value_()
+            partial = partial.next.read_()
 
-            def _try_hardened_freelist_dereference(ptr_addr: int) -> int:
-                result = _freelist_dereference_swab(ptr_addr)
-                if result:
-                    try:
-                        self._prog.read_word(result)
-                        self._freelist_dereference = _freelist_dereference_swab
-                    except FaultError:
-                        result = _freelist_dereference_no_swab(ptr_addr)
-                        self._freelist_dereference = _freelist_dereference_no_swab
-                return result
+        return free_objs
 
-            self._freelist_dereference = _try_hardened_freelist_dereference
+    def _per_cpu_info(
+        self, *, count_partial_list_free_objs: bool = False, catch_errors: bool = False
+    ) -> _SlubPerCpuInfo:
+        freelists: Set[int] = set()
+        num_partial_list_free_objs = 0
+        error = None
 
-        def _slub_get_freelist(
-            freelist_name: Callable[[], str], freelist: Object, freelist_set: Set[int]
-        ) -> None:
-            ptr = freelist.value_()
-            while ptr:
-                if ptr in freelist_set:
-                    raise SlabFreelistCycleError(
-                        f"{fsdecode(slab_cache.name.string_())} {freelist_name()} "
-                        "freelist contains cycle; "
-                        "may be corrupted or in the middle of update"
-                    )
-                freelist_set.add(ptr)
-                ptr = self._freelist_dereference(ptr + freelist_offset)
-
-        cpu_freelists: Set[int] = set()
         try:
             # cpu_slab doesn't exist for CONFIG_SLUB_TINY.
-            cpu_slab = slab_cache.cpu_slab.read_()
+            cpu_slab = self._slab_cache.cpu_slab.read_()
         except AttributeError:
             pass
         else:
@@ -355,15 +481,65 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
                 for cpu in for_each_online_cpu(self._prog):
                     this_cpu_slab = per_cpu_ptr(cpu_slab, cpu)
                     slab = getattr(this_cpu_slab, cpu_slab_attr).read_()
-                    if slab and slab.slab_cache == slab_cache:
-                        _slub_get_freelist(
-                            lambda: f"cpu {cpu}", this_cpu_slab.freelist, cpu_freelists
+                    if slab and slab.slab_cache == self._slab_cache:
+                        self._slub_get_freelist(
+                            lambda: f"cpu {cpu}", this_cpu_slab.freelist, freelists
+                        )
+
+                    if count_partial_list_free_objs:
+                        num_partial_list_free_objs += (
+                            self._num_cpu_partial_list_free_objs(cpu, this_cpu_slab)
                         )
             except (SlabCorruptionError, FaultError) as e:
-                self._freelist_error = e
+                if not catch_errors:
+                    raise
+                error = e
 
-        self._slub_get_freelist = _slub_get_freelist
-        self._cpu_freelists = cpu_freelists
+        return _SlubPerCpuInfo(
+            freelists=freelists,
+            num_partial_list_free_objs=num_partial_list_free_objs,
+            error=error,
+        )
+
+    def usage(self) -> "SlabCacheUsage":
+        num_slabs = 0
+        num_objs = 0
+        # SLUB doesn't maintain a counter of free objects. Instead, we have to
+        # compute it from three places:
+        #
+        # 1. Per-node partial lists: sum of slab->objects - slab->inuse for
+        #    each slab.
+        # 2. Per-CPU partial lists (ditto).
+        # 3. Per-CPU freelists. We can't use slab->inuse of the per-CPU active
+        #    slabs because it is set to slab->objects for active slabs.
+        per_cpu = self._per_cpu_info(count_partial_list_free_objs=True)
+        free_objs = len(per_cpu.freelists) + per_cpu.num_partial_list_free_objs
+
+        slab_type = _get_slab_type(self._prog).type
+        # Since Linux kernel commit 4da1984edbbe ("mm: combine LRU and main
+        # union in struct page") (in v4.18), the slab list_head is slab_list in
+        # struct slab or struct page. Before that, it is struct page::lru.
+        # (Between that commit and commit 916ac0527837 ("slub: use slab_list
+        # instead of lru") (in v5.2), the SLUB code still uses struct page::lru,
+        # but it is an alias of struct page::slab_list.)
+        slab_list_member = "slab_list" if slab_type.has_member("slab_list") else "lru"
+        for node in self._slab_cache.node[: nr_node_ids(self._prog)]:
+            try:
+                nr_slabs = node.nr_slabs
+            except AttributeError:
+                raise ValueError(
+                    "slab_cache_usage() requires CONFIG_SLUB_DEBUG enabled in the kernel"
+                ) from None
+            num_slabs += nr_slabs.counter.value_()
+            num_objs += node.total_objects.counter.value_()
+            for slab in list_for_each_entry(
+                slab_type, node.partial.address_of_(), slab_list_member
+            ):
+                free_objs += slab.objects.value_() - slab.inuse.value_()
+
+        return SlabCacheUsage(
+            num_slabs=num_slabs, num_objs=num_objs, free_objs=free_objs
+        )
 
     def _page_objects(
         self, page: Object, slab: Object, pointer_type: Type
@@ -377,13 +553,18 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
                 yield Object(self._prog, pointer_type, value=addr)
             addr += self._slab_cache_size
 
+    def for_each_allocated_object(self, type: Union[str, Type]) -> Iterator[Object]:
+        self._cpu_freelists = self._per_cpu_info().freelists
+        return super().for_each_allocated_object(type)
+
     def object_info(self, page: Object, slab: Object, addr: int) -> "SlabObjectInfo":
         first_addr = page_to_virt(page).value_() + self._red_left_pad
         address = (
             first_addr
             + (addr - first_addr) // self._slab_cache_size * self._slab_cache_size
         )
-        if address in self._cpu_freelists:
+        per_cpu = self._per_cpu_info(catch_errors=True)
+        if address in per_cpu.freelists:
             allocated: Optional[bool] = False
         else:
             freelist: Set[int] = set()
@@ -396,7 +577,7 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
             else:
                 if address in freelist:
                     allocated = False
-                elif self._freelist_error:
+                elif per_cpu.error:
                     allocated = None
                 else:
                     allocated = True
@@ -406,24 +587,67 @@ class _SlabCacheHelperSlub(_SlabCacheHelper):
 class _SlabCacheHelperSlab(_SlabCacheHelper):
     def __init__(self, slab_cache: Object) -> None:
         super().__init__(slab_cache)
-
-        self._slab_cache_size = slab_cache.size.value_()
-
         self._freelist_type = self._prog.type("freelist_idx_t *")
+
+    @functools.cached_property
+    def _obj_offset(self) -> int:
         try:
-            self._obj_offset = slab_cache.obj_offset.value_()
+            return self._slab_cache.obj_offset.value_()
         except AttributeError:
-            self._obj_offset = 0
+            return 0
 
-        self._slab_cache_num = slab_cache.num.value_()
+    @functools.cached_property
+    def _slab_cache_num(self) -> int:
+        return self._slab_cache.num.value_()
 
-        cpu_cache = slab_cache.cpu_cache.read_()
-        cpu_caches_avail: Set[int] = set()
+    @staticmethod
+    def _slab_add_array_cache(array_caches: Set[int], ac: Object) -> None:
+        for i in range(ac.avail):
+            array_caches.add(ac.entry[i].value_())
+
+    @functools.cached_property
+    def _array_caches(self) -> Set[int]:
+        array_caches: Set[int] = set()
+
+        cpu_cache = self._slab_cache.cpu_cache.read_()
         for cpu in for_each_online_cpu(self._prog):
-            ac = per_cpu_ptr(cpu_cache, cpu)
-            for i in range(ac.avail):
-                cpu_caches_avail.add(ac.entry[i].value_())
-        self._cpu_caches_avail = cpu_caches_avail
+            self._slab_add_array_cache(array_caches, per_cpu_ptr(cpu_cache, cpu))
+
+        nodes = self._slab_cache.node
+        for nid in for_each_online_node(self._prog):
+            n = nodes[nid].read_()
+            shared = n.shared.read_()
+            if shared:
+                self._slab_add_array_cache(array_caches, shared)
+            alien = n.alien.read_()
+            if alien:
+                for nid2 in for_each_online_node(self._prog):
+                    self._slab_add_array_cache(array_caches, alien[nid2])
+
+        return array_caches
+
+    def usage(self) -> "SlabCacheUsage":
+        num_slabs = 0
+        # SLAB maintains per-node counters of free objects, but the array
+        # caches are not included in those counters.
+        free_objs = len(self._array_caches)
+
+        for node in self._slab_cache.node[: nr_node_ids(self._prog)]:
+            try:
+                num_slabs += node.total_slabs.value_()
+            except AttributeError:
+                # Before Linux kernel commits f728b0a5d72a ("mm, slab: faster
+                # active and free stats") and bf00bd345804 ("mm, slab: maintain
+                # total slab count instead of active count") (in v4.10), struct
+                # kmem_cache_node::total_slabs is named num_slabs instead.
+                num_slabs += node.num_slabs.value_()
+            free_objs += node.free_objects.value_()
+
+        return SlabCacheUsage(
+            num_slabs=num_slabs,
+            num_objs=num_slabs * self._slab_cache_num,
+            free_objs=free_objs,
+        )
 
     def _slab_freelist(self, slab: Object) -> Set[int]:
         # In SLAB, the freelist is an array of free object indices.
@@ -439,7 +663,7 @@ class _SlabCacheHelperSlab(_SlabCacheHelper):
             if i in freelist:
                 continue
             addr = s_mem + i * self._slab_cache_size + self._obj_offset
-            if addr in self._cpu_caches_avail:
+            if addr in self._array_caches:
                 continue
             yield Object(self._prog, pointer_type, value=addr)
 
@@ -451,12 +675,15 @@ class _SlabCacheHelperSlab(_SlabCacheHelper):
             self._slab_cache,
             slab,
             object_address,
-            allocated=object_address not in self._cpu_caches_avail
+            allocated=object_address not in self._array_caches
             and object_index not in self._slab_freelist(slab),
         )
 
 
 class _SlabCacheHelperSlob(_SlabCacheHelper):
+    def usage(self) -> "SlabCacheUsage":
+        raise ValueError("SLOB is not supported")
+
     def for_each_allocated_object(self, type: Union[str, Type]) -> Iterator[Object]:
         raise ValueError("SLOB is not supported")
 
@@ -479,6 +706,38 @@ def _get_slab_cache_helper(slab_cache: Object) -> _SlabCacheHelper:
                 type = _SlabCacheHelperSlob
         prog.cache["slab_cache_helper_type"] = type
     return type(slab_cache)
+
+
+def slab_cache_usage(slab_cache: Object) -> "SlabCacheUsage":
+    """
+    Get statistics for how many slabs and objects are allocated for a given
+    slab cache.
+
+    Only the SLUB and SLAB allocators are supported; SLOB does not track these
+    statistics. Additionally, for SLUB, ``CONFIG_SLUB_DEBUG`` must be enabled
+    in the kernel (this is the default unless ``CONFIG_SLUB_TINY`` is enabled).
+
+    :param slab_cache: ``struct kmem_cache *``
+    """
+    return _get_slab_cache_helper(slab_cache).usage()
+
+
+class SlabCacheUsage(NamedTuple):
+    """Slab cache usage statistics returned by :func:`slab_cache_usage()`."""
+
+    num_slabs: int
+    """Number of slabs allocated for this slab cache."""
+
+    num_objs: int
+    """Total number of objects in this slab cache (free and active)."""
+
+    free_objs: int
+    """Number of free objects in this slab cache."""
+
+    @property
+    def active_objs(self) -> int:
+        """Number of active (allocated) objects in this slab cache."""
+        return self.num_objs - self.free_objs
 
 
 def slab_cache_for_each_allocated_object(
@@ -615,3 +874,35 @@ def find_containing_slab_cache(prog: Program, addr: IntegerLike) -> Object:
     if result is None:
         return NULL(prog, "struct kmem_cache *")
     return result[0].read_()
+
+
+@takes_program_or_default
+def slab_total_usage(prog: Program) -> "SlabTotalUsage":
+    """Get the total number of reclaimable and unreclaimable slab pages."""
+    # The items were renamed in Linux kernel commit d42f3245c7e2 ("mm: memcg:
+    # convert vmstat slab counters to bytes") (in v5.9).
+    try:
+        return SlabTotalUsage(
+            reclaimable_pages=global_node_page_state(prog["NR_SLAB_RECLAIMABLE_B"]),
+            unreclaimable_pages=global_node_page_state(prog["NR_SLAB_UNRECLAIMABLE_B"]),
+        )
+    except ObjectNotFoundError:
+        return SlabTotalUsage(
+            reclaimable_pages=global_node_page_state(prog["NR_SLAB_RECLAIMABLE"]),
+            unreclaimable_pages=global_node_page_state(prog["NR_SLAB_UNRECLAIMABLE"]),
+        )
+
+
+class SlabTotalUsage(NamedTuple):
+    """Slab memory usage returned by :func:`slab_total_usage()`."""
+
+    reclaimable_pages: int
+    """Number of reclaimable slab pages."""
+
+    unreclaimable_pages: int
+    """Number of unreclaimable slab pages."""
+
+    @property
+    def total_pages(self) -> int:
+        """Total number of slab pages."""
+        return self.reclaimable_pages + self.unreclaimable_pages

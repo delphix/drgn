@@ -195,6 +195,18 @@ struct drgn_program {
 				 * `NR_SECTION_ROOTS`).
 				 */
 				uint64_t mem_section_length;
+				/**
+				 * `SECTION_SIZE_BITS` of the kernel. Initially
+				 * 0 if not found in VMCOREINFO, but may be
+				 * determined by other means and cached later.
+				 */
+				int section_size_bits;
+				/**
+				 * `MAX_PHYSMEM_BITS` of the kernel. Initially 0
+				 * if not found in VMCOREINFO, but may be
+				 * determined by other means and cached later.
+				 */
+				int max_physmem_bits;
 				/** `VA_BITS` on AArch64. */
 				uint64_t va_bits;
 				/** `TCR_EL1_T1SZ` on AArch64. */
@@ -223,6 +235,16 @@ struct drgn_program {
 				char *raw;
 				size_t raw_size;
 			} vmcoreinfo;
+			/**
+			 * Value of `THREAD_SIZE` in the kernel, or 0 if not
+			 * cached yet.
+			 */
+			uint64_t thread_size_cached;
+			/**
+			 * Value of `SECTIONS_PER_ROOT` in the kernel, or 0 if
+			 * not cached yet.
+			 */
+			uint64_t cached_sections_per_root;
 			/*
 			 * Difference between a virtual address in the direct
 			 * mapping and the physical address it maps to.

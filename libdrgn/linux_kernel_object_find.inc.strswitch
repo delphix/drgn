@@ -22,6 +22,10 @@ linux_kernel_object_find(const char *name, size_t name_len,
 			if (flags & DRGN_FIND_OBJECT_CONSTANT)
 				return linux_kernel_get_page_mask(prog, ret);
 			break;
+		@case "THREAD_SIZE"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_thread_size(prog, ret);
+			break;
 		@case "UTS_RELEASE"@
 			if (flags & DRGN_FIND_OBJECT_CONSTANT)
 				return linux_kernel_get_uts_release(prog, ret);
@@ -37,6 +41,22 @@ linux_kernel_object_find(const char *name, size_t name_len,
 		@case "vmemmap"@
 			if (flags & DRGN_FIND_OBJECT_CONSTANT)
 				return linux_kernel_get_vmemmap(prog, ret);
+			break;
+		@case "NR_SECTION_ROOTS"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_nr_section_roots(prog, ret);
+			break;
+		@case "SECTIONS_PER_ROOT"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_sections_per_root(prog, ret);
+			break;
+		@case "SECTION_SIZE_BITS"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_section_size_bits(prog, ret);
+			break;
+		@case "MAX_PHYSMEM_BITS"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_max_physmem_bits(prog, ret);
 			break;
 		@endswitch@
 	}

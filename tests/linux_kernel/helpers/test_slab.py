@@ -3,6 +3,7 @@
 
 from collections import defaultdict
 from pathlib import Path
+from typing import NamedTuple
 
 from drgn import NULL
 from drgn.helpers.linux.mm import pfn_to_virt
@@ -13,15 +14,63 @@ from drgn.helpers.linux.slab import (
     get_slab_cache_aliases,
     slab_cache_for_each_allocated_object,
     slab_cache_is_merged,
+    slab_cache_objects_per_slab,
+    slab_cache_pages_per_slab,
+    slab_cache_usage,
     slab_object_info,
+    slab_total_usage,
 )
 from tests.linux_kernel import (
     LinuxKernelTestCase,
+    meminfo_field_in_pages,
     skip_unless_have_full_mm_support,
     skip_unless_have_test_kmod,
 )
 
 SLAB_SYSFS_PATH = Path("/sys/kernel/slab")
+
+
+class Slabinfo(NamedTuple):
+    name: str
+    active_objs: int
+    num_objs: int
+    objsize: int
+    objperslab: int
+    pagesperslab: int
+    limit: int
+    batchcount: int
+    sharedfactor: int
+    active_slabs: int
+    num_slabs: int
+    sharedavail: int
+
+
+def iter_slabinfo():
+    with open("/proc/slabinfo", "r") as f:
+        # Skip the version and header.
+        f.readline()
+        f.readline()
+        for line in f:
+            components = line.split(":")
+            statistics = components[0].split()
+            tunables = components[1].split()
+            assert tunables[0] == "tunables"
+            slabdata = components[2].split()
+            assert slabdata[0] == "slabdata"
+            yield Slabinfo(
+                name=statistics[0],
+                active_objs=int(statistics[1]),
+                num_objs=int(statistics[2]),
+                objsize=int(statistics[3]),
+                objperslab=int(statistics[4]),
+                pagesperslab=int(statistics[5]),
+                limit=int(tunables[1]),
+                batchcount=int(tunables[2]),
+                sharedfactor=int(tunables[3]),
+                active_slabs=int(slabdata[1]),
+                num_slabs=int(slabdata[2]),
+                sharedavail=int(slabdata[3]),
+            )
 
 
 def get_proc_slabinfo_names():
@@ -47,6 +96,52 @@ def fallback_slab_cache_names(prog):
 
 
 class TestSlab(LinuxKernelTestCase):
+    def test_slab_cache_objects_per_slab(self):
+        if self.prog["drgn_test_slob"]:
+            self.assertRaisesRegex(
+                ValueError,
+                "SLOB is not supported",
+                slab_cache_objects_per_slab,
+                self.prog["dentry_cache"],
+            )
+            return
+
+        try:
+            for slabinfo in iter_slabinfo():
+                if slabinfo.objperslab > 1:
+                    # Prefer testing a slab cache with more than one object per
+                    # slab.
+                    break
+        except FileNotFoundError:
+            self.skipTest("/proc/slabinfo does not exist")
+        self.assertEqual(
+            slab_cache_objects_per_slab(find_slab_cache(self.prog, slabinfo.name)),
+            slabinfo.objperslab,
+        )
+
+    def test_slab_cache_pages_per_slab(self):
+        if self.prog["drgn_test_slob"]:
+            self.assertRaisesRegex(
+                ValueError,
+                "SLOB is not supported",
+                slab_cache_pages_per_slab,
+                self.prog["dentry_cache"],
+            )
+            return
+
+        try:
+            for slabinfo in iter_slabinfo():
+                if slabinfo.pagesperslab > 1:
+                    # Prefer testing a slab cache with more than one page per
+                    # slab.
+                    break
+        except FileNotFoundError:
+            self.skipTest("/proc/slabinfo does not exist")
+        self.assertEqual(
+            slab_cache_pages_per_slab(find_slab_cache(self.prog, slabinfo.name)),
+            slabinfo.pagesperslab,
+        )
+
     def _slab_cache_aliases(self):
         if not SLAB_SYSFS_PATH.exists():
             self.skipTest(f"{str(SLAB_SYSFS_PATH)} does not exist")
@@ -137,6 +232,36 @@ class TestSlab(LinuxKernelTestCase):
 
     @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
+    def test_slab_cache_usage(self):
+        for size in ("small", "big"):
+            with self.subTest(size=size):
+                cache = self.prog[f"drgn_test_{size}_kmem_cache"]
+                if self.prog["drgn_test_slob"]:
+                    self.assertRaisesRegex(
+                        ValueError, "SLOB is not supported", slab_cache_usage, cache
+                    )
+                    return
+
+                name = f"drgn_test_{size}"
+                try:
+                    for slabinfo in iter_slabinfo():
+                        if slabinfo.name == name:
+                            break
+                    else:
+                        self.fail(f"couldn't find {name} in slabinfo")
+                except FileNotFoundError:
+                    self.skipTest("/proc/slabinfo does not exist")
+
+                usage = slab_cache_usage(cache)
+                self.assertEqual(
+                    usage.active_objs,
+                    len(self.prog[f"drgn_test_{size}_slab_objects"]),
+                )
+                self.assertEqual(usage.num_objs, slabinfo.num_objs)
+                self.assertEqual(usage.num_slabs, slabinfo.num_slabs)
+
+    @skip_unless_have_full_mm_support
+    @skip_unless_have_test_kmod
     def test_slab_cache_for_each_allocated_object(self):
         for size in ("small", "big"):
             with self.subTest(size=size):
@@ -218,4 +343,17 @@ class TestSlab(LinuxKernelTestCase):
         self.assertEqual(
             find_containing_slab_cache(self.prog, self.prog["drgn_test_va"]),
             NULL(self.prog, "struct kmem_cache *"),
+        )
+
+    def test_slab_total_usage(self):
+        slab_usage = slab_total_usage(self.prog)
+        self.assertAlmostEqual(
+            slab_usage.reclaimable_pages,
+            meminfo_field_in_pages("SReclaimable"),
+            delta=1024 * 1024 * 1024,
+        )
+        self.assertAlmostEqual(
+            slab_usage.unreclaimable_pages,
+            meminfo_field_in_pages("SUnreclaim"),
+            delta=1024 * 1024 * 1024,
         )

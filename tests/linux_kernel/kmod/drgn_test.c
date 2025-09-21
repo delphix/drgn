@@ -25,8 +25,10 @@
 #define HAVE_MAPLE_TREE 0
 #endif
 #include <linux/mm.h>
+#include <linux/mmzone.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
+#include <linux/nodemask.h>
 #include <linux/plist.h>
 #include <linux/radix-tree.h>
 #include <linux/rbtree.h>
@@ -123,6 +125,41 @@ static u32 drgn_test_prng32(u32 x)
 	x ^= x >> 17;
 	x ^= x << 5;
 	return x;
+}
+
+// constants
+
+unsigned long drgn_test_THREAD_SIZE;
+#ifdef NR_SECTION_ROOTS
+unsigned long drgn_test_NR_SECTION_ROOTS;
+#endif
+#ifdef SECTIONS_PER_ROOT
+unsigned long drgn_test_SECTIONS_PER_ROOT;
+#endif
+#ifdef SECTION_SIZE_BITS
+unsigned long drgn_test_SECTION_SIZE_BITS;
+#endif
+#ifdef MAX_PHYSMEM_BITS
+unsigned long drgn_test_MAX_PHYSMEM_BITS;
+#endif
+
+static void drgn_test_constants_init(void)
+{
+	// Some of these aren't actually compile-time constants, so we
+	// initialize all of them at runtime.
+	drgn_test_THREAD_SIZE = THREAD_SIZE;
+#ifdef NR_SECTION_ROOTS
+	drgn_test_NR_SECTION_ROOTS = NR_SECTION_ROOTS;
+#endif
+#ifdef SECTIONS_PER_ROOT
+	drgn_test_SECTIONS_PER_ROOT = SECTIONS_PER_ROOT;
+#endif
+#ifdef SECTION_SIZE_BITS
+	drgn_test_SECTION_SIZE_BITS = SECTION_SIZE_BITS;
+#endif
+#ifdef MAX_PHYSMEM_BITS
+	drgn_test_MAX_PHYSMEM_BITS = MAX_PHYSMEM_BITS;
+#endif
 }
 
 // list
@@ -508,6 +545,17 @@ static void drgn_test_mm_exit(void)
 		__free_pages(drgn_test_page, 0);
 }
 
+// mmzone
+
+int drgn_test_nid;
+struct pglist_data *drgn_test_pgdat;
+
+static void drgn_test_mmzone_init(void)
+{
+	drgn_test_nid = first_online_node;
+	drgn_test_pgdat = NODE_DATA(drgn_test_nid);
+}
+
 // net
 
 struct net_device *drgn_test_netdev;
@@ -591,6 +639,7 @@ static void drgn_test_page_pool_exit(void)
 DEFINE_PER_CPU(u32, drgn_test_percpu_static);
 u32 __percpu *drgn_test_percpu_dynamic;
 struct percpu_counter drgn_test_percpu_counter;
+struct percpu_counter drgn_test_percpu_counter_negative;
 
 struct drgn_test_percpu_struct {
 	int cpu;
@@ -642,11 +691,18 @@ static int drgn_test_percpu_init(void)
 		return ret;
 	percpu_counter_add(&drgn_test_percpu_counter, 3);
 
+	ret = percpu_counter_init(&drgn_test_percpu_counter_negative,
+				  33, GFP_KERNEL);
+	if (ret)
+		return ret;
+	percpu_counter_sub(&drgn_test_percpu_counter_negative, 99);
+
 	return 0;
 }
 
 static void drgn_test_percpu_exit(void)
 {
+	percpu_counter_destroy(&drgn_test_percpu_counter_negative);
 	percpu_counter_destroy(&drgn_test_percpu_counter);
 	free_percpu(drgn_test_percpu_dynamic);
 }
@@ -838,7 +894,14 @@ static void drgn_test_slab_ctor(void *arg)
 
 static int drgn_test_slab_init(void)
 {
-	size_t i;
+	size_t num_tmp_objs;
+	size_t i, j;
+
+	// We want objects in the drgn_test_small cache to be spread out over
+	// multiple slabs. To accomplish that, we allocate a bunch of temporary
+	// objects in the middle of the allocations we intend to keep, then free
+	// the temporary objects.
+	num_tmp_objs = PAGE_SIZE / sizeof(struct drgn_test_small_slab_object);
 
 	drgn_test_small_kmem_cache =
 		kmem_cache_create("drgn_test_small",
@@ -848,11 +911,42 @@ static int drgn_test_slab_init(void)
 	if (!drgn_test_small_kmem_cache)
 		return -ENOMEM;
 	for (i = 0; i < ARRAY_SIZE(drgn_test_small_slab_objects); i++) {
+		const bool alloc_tmp_objs =
+			i == ARRAY_SIZE(drgn_test_small_slab_objects) / 2;
+		void **tmp_objs;
+		int error = 0;
+
+		if (alloc_tmp_objs) {
+			tmp_objs = kmalloc_array(num_tmp_objs,
+						 sizeof(*tmp_objs), GFP_KERNEL);
+			if (!tmp_objs)
+				return -ENOMEM;
+			for (j = 0; j < num_tmp_objs; j++) {
+				tmp_objs[j] = kmem_cache_alloc(drgn_test_small_kmem_cache,
+							       GFP_KERNEL);
+				// We check for allocation failures below to
+				// avoid duplicating cleanup code.
+			}
+		}
+
 		drgn_test_small_slab_objects[i] =
 			kmem_cache_alloc(drgn_test_small_kmem_cache,
 					 GFP_KERNEL);
 		if (!drgn_test_small_slab_objects[i])
+			error = -ENOMEM;
+
+		if (alloc_tmp_objs) {
+			for (j = 0; j < num_tmp_objs; j++) {
+				if (!tmp_objs[j])
+					error = -ENOMEM;
+				kmem_cache_free(drgn_test_small_kmem_cache,
+						tmp_objs[j]);
+			}
+			kfree(tmp_objs);
+		}
+		if (error)
 			return -ENOMEM;
+
 		drgn_test_small_slab_objects[i]->value = i;
 	}
 	drgn_test_big_kmem_cache =
@@ -1715,6 +1809,7 @@ static int __init drgn_test_init(void)
 {
 	int ret;
 
+	drgn_test_constants_init();
 	drgn_test_list_init();
 	drgn_test_llist_init();
 	drgn_test_plist_init();
@@ -1724,6 +1819,7 @@ static int __init drgn_test_init(void)
 	ret = drgn_test_mm_init();
 	if (ret)
 		goto out;
+	drgn_test_mmzone_init();
 	ret = drgn_test_net_init();
 	if (ret)
 		goto out;

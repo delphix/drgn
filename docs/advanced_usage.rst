@@ -394,6 +394,18 @@ core dumps. These special objects include:
 
     This is *not* available without debugging information.
 
+``THREAD_SIZE``
+    Object type: ``unsigned long``
+
+    This corresponds to the macro of the same name in the Linux kernel source
+    code. The thread size is the number of bytes used for kernel stacks. It's
+    important to note that for many architectures, there may be additional
+    stacks used when handling interrupts, excetpions, or faults. These may have
+    a different, architecture-dependent size. ``THREAD_SIZE`` refers only to the
+    kernel stacks associated with each task.
+
+    This is *not* available without debugging information.
+
 ``vmemmap``
     Object type: ``struct page *``
 
@@ -425,3 +437,16 @@ core dumps. These special objects include:
     distinguish it from the kernel variable ``vmcoreinfo_data``.
 
     This is available without debugging information.
+
+``NR_SECTION_ROOTS``, ``SECTIONS_PER_ROOT``
+    Object type: ``unsigned long``
+
+``SECTION_SIZE_BITS``, ``MAX_PHYSMEM_BITS``
+    Object type: ``int``
+
+    These correspond to the macros of the same name in the Linux kernel source
+    code. They describe the layout of `SPARSEMEM
+    <https://docs.kernel.org/mm/memory-model.html#sparsemem>`_ sections in the
+    kernel.
+
+    These are *not* always available without debugging information.

@@ -9,11 +9,13 @@ The ``drgn.helpers.linux.swap`` module provides helpers for inspecting swap
 partitions and swap files.
 """
 
-from typing import Iterator, NamedTuple
+from typing import Iterator
 
-from drgn import Object, PlatformFlags, Program
+from drgn import Object, ObjectNotFoundError, PlatformFlags, Program
 from drgn.helpers.common.prog import takes_program_or_default
 from drgn.helpers.linux.fs import d_path
+from drgn.helpers.linux.mm import PageUsage
+from drgn.helpers.linux.vmstat import global_node_page_state
 
 __all__ = (
     "for_each_swap_info",
@@ -21,6 +23,7 @@ __all__ = (
     "swap_is_file",
     "swap_total_usage",
     "swap_usage_in_pages",
+    "total_swapcache_pages",
 )
 
 
@@ -86,30 +89,15 @@ def swap_usage_in_pages(si: Object) -> int:
         return counter.value_() & SWAP_USAGE_COUNTER_MASK
 
 
-class SwapUsage(NamedTuple):
-    """Swap usage information returned from :func:`swap_total_usage()`."""
-
-    pages: int
-    """Number of swap pages."""
-
-    free_pages: int
-    """Number of free swap pages."""
-
-    @property
-    def used_pages(self) -> int:
-        """Number of used swaap pages."""
-        return self.pages - self.free_pages
-
-
 @takes_program_or_default
-def swap_total_usage(prog: Program) -> SwapUsage:
+def swap_total_usage(prog: Program) -> PageUsage:
     """
     Get the total number of swap pages and the number of free swap pages on all
     swap devices.
 
     >>> usage = swap_total_usage()
     >>> usage
-    SwapUsage(pages=2097151, free_pages=1704798)
+    PageUsage(pages=2097151, free_pages=1704798)
     >>> usage.used_pages
     392353
     """
@@ -120,7 +108,38 @@ def swap_total_usage(prog: Program) -> SwapUsage:
         if si.flags & mask == SWP_USED:
             nr_to_be_unused += swap_usage_in_pages(si)
 
-    return SwapUsage(
+    return PageUsage(
         pages=prog["total_swap_pages"].value_() + nr_to_be_unused,
         free_pages=prog["nr_swap_pages"].counter.value_() + nr_to_be_unused,
     )
+
+
+@takes_program_or_default
+def total_swapcache_pages(prog: Program) -> int:
+    """
+    Get the number of swap cached pages (pages that are swapped in but still
+    present on a swap device).
+    """
+    # Since Linux kernel commit ("mm: memcg: add swapcache stat for memcg v2")
+    # (in v5.12), we just have to get the NR_SWAPCACHE statistic. Before that,
+    # we have to sum over the swapper spaces.
+    try:
+        NR_SWAPCACHE = prog["NR_SWAPCACHE"]
+    except ObjectNotFoundError:
+        # Since Linux kernel commit 4b3ef9daa4fc ("mm/swap: split swap cache
+        # into 64MB trunks") (in v4.11), there are multiple swapper spaces per
+        # swap file. Before that, there was only one per swap file.
+        try:
+            nr_swapper_spaces = prog["nr_swapper_spaces"]
+        except ObjectNotFoundError:
+            # Before Linux kernel commit 4b3ef9daa4fc ("mm/swap: split swap
+            # cache into 64MB trunks") (in v4.11),
+            return sum(space.nrpages.value_() for space in prog["swapper_spaces"])
+        else:
+            return sum(
+                spaces[j].nrpages.value_()
+                for nr, spaces in zip(nr_swapper_spaces, prog["swapper_spaces"])
+                for j in range(nr)
+            )
+    else:
+        return global_node_page_state(NR_SWAPCACHE)

@@ -232,31 +232,6 @@ get_registers_from_frame_pointer(struct drgn_program *prog,
 	return NULL;
 }
 
-
-static struct drgn_error *
-fallback_unwind_x86_64(struct drgn_program *prog,
-		       struct drgn_register_state *regs,
-		       struct drgn_register_state **ret)
-{
-	struct drgn_error *err;
-
-	struct optional_uint64 rbp =
-		drgn_register_state_get_u64(prog, regs, rbp);
-	if (!rbp.has_value)
-		return &drgn_stop;
-
-	err = get_registers_from_frame_pointer(prog, rbp.value, ret);
-	if (err) {
-		if (err->code == DRGN_ERROR_FAULT) {
-			drgn_error_destroy(err);
-			err = &drgn_stop;
-		}
-		return err;
-	}
-	drgn_register_state_set_cfa(prog, regs, rbp.value + 16);
-	return NULL;
-}
-
 // Unwind a single call instruction.
 static struct drgn_error *
 bad_call_unwind_x86_64(struct drgn_program *prog,
@@ -333,6 +308,51 @@ get_initial_registers_from_struct_x86_64(struct drgn_program *prog,
 	drgn_register_state_set_pc_from_register(prog, regs, rip);
 
 	*ret = regs;
+	return NULL;
+}
+
+static struct drgn_error *
+fallback_unwind_x86_64(struct drgn_program *prog,
+		       struct drgn_register_state *regs,
+		       struct drgn_register_state **ret)
+{
+	struct drgn_error *err;
+
+	struct optional_uint64 rbp =
+		drgn_register_state_get_u64(prog, regs, rbp);
+	if (!rbp.has_value)
+		return &drgn_stop;
+
+	if ((prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) && (rbp.value & 1)) {
+		// A frame pointer value with the LSB set is unaligned, and so
+		// it would likely be garbage. The x86_64 Linux kernel uses this
+		// to signal an "encoded" pt_regs (see decode_frame_pointer()).
+		// Try to treat this as an encoded frame pointer. On failure,
+		// don't bother trying the frame pointer unwind due to the
+		// unaligned RBP.
+		uint64_t regs_addr = rbp.value & ~1UL;
+		char pt_regs[168];
+		err = drgn_program_read_memory(prog, &pt_regs, regs_addr,
+					       sizeof(pt_regs), false);
+		if (err) {
+			if (drgn_error_catch(&err, DRGN_ERROR_FAULT))
+				err = &drgn_stop;
+			return err;
+		}
+		err = get_initial_registers_from_struct_x86_64(prog, &pt_regs,
+							       sizeof(pt_regs),
+							       false, ret);
+		if (err)
+			return err;
+	} else {
+		err = get_registers_from_frame_pointer(prog, rbp.value, ret);
+		if (err) {
+			if (drgn_error_catch(&err, DRGN_ERROR_FAULT))
+				err = &drgn_stop;
+			return err;
+		}
+		drgn_register_state_set_cfa(prog, regs, rbp.value + 16);
+	}
 	return NULL;
 }
 
@@ -652,6 +672,24 @@ linux_kernel_pgtable_iterator_next_x86_64(struct drgn_program *prog,
 	}
 }
 
+static int
+linux_kernel_section_size_bits_fallback_x86_64(struct drgn_program *prog)
+{
+	// This hasn't changed since Linux kernel commit bbfceef47fb9 ("[PATCH]
+	// add x86-64 specific support for sparsemem") (in v2.6.13).
+	return 27;
+}
+
+static int
+linux_kernel_max_physmem_bits_fallback_x86_64(struct drgn_program *prog)
+{
+	// This hasn't changed since Linux kernel commits 4c7c44837be7 ("x86/mm:
+	// Define virtual memory map for 5-level paging") (in v4.12) and
+	// c898faf91b3e ("x86: 46 bit physical address support on 64 bits") (in
+	// v2.6.31).
+	return prog->vmcoreinfo.pgtable_l5_enabled ? 52 : 46;
+}
+
 const struct drgn_architecture_info arch_info_x86_64 = {
 	.name = "x86-64",
 	.arch = DRGN_ARCH_X86_64,
@@ -677,4 +715,8 @@ const struct drgn_architecture_info arch_info_x86_64 = {
 		linux_kernel_pgtable_iterator_init_x86_64,
 	.linux_kernel_pgtable_iterator_next =
 		linux_kernel_pgtable_iterator_next_x86_64,
+	.linux_kernel_section_size_bits_fallback =
+		linux_kernel_section_size_bits_fallback_x86_64,
+	.linux_kernel_max_physmem_bits_fallback =
+		linux_kernel_max_physmem_bits_fallback_x86_64,
 };
