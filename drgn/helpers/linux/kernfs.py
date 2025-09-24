@@ -87,12 +87,28 @@ def kernfs_path(kn: Object) -> bytes:
     return b"/".join(names)
 
 
-def kernfs_walk(parent: Object, path: Path) -> Object:
+def _kernfs_node_type(kn: Object, node_type: str) -> bool:
+    KERNFS_TYPE_MASK = 0x000F
+    return kn.flags & KERNFS_TYPE_MASK == kn.prog_.constant(node_type)
+
+
+def _kernfs_follow_symlink(parent: Object) -> Object:
+    while _kernfs_node_type(parent, "KERNFS_LINK"):
+        parent = parent.symlink.target_kn
+    return parent
+
+
+def kernfs_walk(parent: Object, path: Path, follow_symlinks: bool = True) -> Object:
     """
     Find the kernfs node with the given path from the given parent kernfs node.
 
     :param parent: ``struct kernfs_node *``
     :param path: Path name.
+    :param follow_symlinks: If True (default), all symbolic links encountered
+        in the path, including the final component, are followed and the
+        function returns the target node. If False, all intermediate symlinks
+        are still followed, but if the final component is a symlink, the
+        function returns the symlink node itself rather than its target.
     :return: ``struct kernfs_node *`` (``NULL`` if not found)
     """
     kernfs_nodep_type = parent.type_
@@ -100,6 +116,8 @@ def kernfs_walk(parent: Object, path: Path) -> Object:
     for name in os.fsencode(path).split(b"/"):
         if not name:
             continue
+
+        parent = _kernfs_follow_symlink(parent)
 
         for parent in rbtree_inorder_for_each_entry(
             kernfs_node_type, parent.dir.children.address_of_(), "rb"
@@ -111,6 +129,10 @@ def kernfs_walk(parent: Object, path: Path) -> Object:
                 break
         else:
             return NULL(parent.prog_, kernfs_nodep_type)
+
+    if follow_symlinks:
+        parent = _kernfs_follow_symlink(parent)
+
     return parent
 
 
@@ -122,10 +144,7 @@ def kernfs_children(kn: Object) -> Optional[Iterator[Object]]:
     :param kn: ``struct kernfs_node *``
     :return: Iterator of ``struct kernfs_node *`` objects.
     """
-    KERNFS_TYPE_MASK = 0x000F
-    kernfs_dir = kn.prog_.constant("KERNFS_DIR")
-
-    if (kn.flags & KERNFS_TYPE_MASK) != kernfs_dir:
+    if not _kernfs_node_type(kn, "KERNFS_DIR"):
         raise ValueError("not a directory")
 
     return rbtree_inorder_for_each_entry(
