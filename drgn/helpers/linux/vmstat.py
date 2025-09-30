@@ -16,6 +16,7 @@ __all__ = (
     "global_node_page_state",
     "global_zone_page_state",
     "nr_free_pages",
+    "zone_page_state",
 )
 
 
@@ -35,6 +36,9 @@ def global_node_page_state(prog: Program, item: IntegerLike) -> int:
 def zone_page_state(zone: Object, item: IntegerLike) -> int:
     """
     Get the value of a zone VM statistic in a single zone.
+
+    :param zone: ``struct zone *``
+    :param item: ``enum zone_stat_item``
     """
     return max(zone.vm_stat[item].counter.value_(), 0)
 
