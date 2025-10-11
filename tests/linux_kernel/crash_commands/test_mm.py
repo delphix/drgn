@@ -1,13 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2025, Kylin Software, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 import mmap
 import os
 from pathlib import Path
 import re
+import tempfile
 import unittest
 
-from drgn.helpers.linux.mm import PageUsage
+from drgn import Object
+from drgn.commands.crash import CRASH_COMMAND_NAMESPACE
+from drgn.helpers.linux.cpumask import for_each_online_cpu
+from drgn.helpers.linux.mm import PageUsage, phys_to_virt
+from drgn.helpers.linux.percpu import per_cpu_ptr
 from drgn.helpers.linux.slab import SlabTotalUsage
 from tests.linux_kernel import (
     possible_cpus,
@@ -56,6 +62,76 @@ class TestPtob(CrashCommandTestCase):
         self.assertEqual(cmd.drgn_option.globals["phys_addr"], addr2)
 
 
+class TestPtov(CrashCommandTestCase):
+    def test_phy_to_virt(self):
+        """Test physical address to virtual address conversion."""
+        phys_addr = 0x123
+        virt_addr = phys_to_virt(self.prog, phys_addr)
+        virt_addr_int = virt_addr.value_()
+
+        cmd = self.check_crash_command(f"ptov {hex(phys_addr)}")
+        self.assertRegex(cmd.stdout, r"(?m)^\s*VIRTUAL\s+PHYSICAL")
+        self.assertRegex(cmd.stdout, rf"(?m)^\s*{virt_addr_int:016x}\s+{phys_addr:x}")
+
+    def test_per_cpu_offset_single_cpu(self):
+        """Test per-CPU offset conversion for a single CPU."""
+        offset = 0x100
+        cpu = 0
+        ptr = Object(self.prog, "unsigned long", offset)
+        virt_ptr = per_cpu_ptr(ptr, cpu)
+        virt_int = virt_ptr.value_()
+
+        cmd = self.check_crash_command(f"ptov {hex(offset)}:{cpu}")
+        self.assertRegex(cmd.stdout, rf"(?m)^\s*PER-CPU OFFSET:\s+{offset:x}")
+        self.assertRegex(cmd.stdout, r"(?m)^\s*CPU\s+VIRTUAL")
+        self.assertRegex(cmd.stdout, rf"(?m)^\s*\[{cpu}\]\s+{virt_int:016x}")
+
+    def test_per_cpu_offset_all_cpus(self):
+        """Test per-CPU offset conversion for all CPUs."""
+        offset = 0x200
+        cmd = self.check_crash_command(f"ptov {hex(offset)}:a")
+
+        self.assertRegex(cmd.stdout, rf"(?m)^\s*PER-CPU OFFSET:\s+{offset:x}")
+        self.assertRegex(cmd.stdout, r"(?m)^\s*CPU\s+VIRTUAL")
+
+        ptr = Object(self.prog, "unsigned long", offset)
+        for cpu in for_each_online_cpu(self.prog):
+            virt = per_cpu_ptr(ptr, cpu)
+            self.assertRegex(cmd.stdout, rf"(?m)^\s*\[{cpu}\]\s+{virt.value_():016x}")
+
+    def test_per_cpu_offset_cpu_list(self):
+        """Test per-CPU offset conversion for a CPU list."""
+        offset = 0x300
+        cpus = sorted(os.sched_getaffinity(0))
+        cmd = self.check_crash_command(f"ptov {hex(offset)}:{','.join(map(str, cpus))}")
+
+        self.assertRegex(cmd.stdout, rf"(?m)^\s*PER-CPU OFFSET:\s+{offset:x}")
+        self.assertRegex(cmd.stdout, r"(?m)^\s*CPU\s+VIRTUAL")
+
+        ptr = Object(self.prog, "unsigned long", offset)
+        for cpu in cpus:
+            virt = per_cpu_ptr(ptr, cpu)
+            self.assertRegex(cmd.stdout, rf"(?m)^\s*\[{cpu}\]\s+{virt.value_():016x}")
+
+    def test_invalid_address(self):
+        """Test invalid physical address input."""
+        with self.assertRaises(Exception) as cm:
+            self.check_crash_command("ptov invalid_address")
+        msg = str(cm.exception).lower()
+        self.assertTrue(
+            "invalid literal" in msg or "base 16" in msg,
+            f"Unexpected error message: {msg}",
+        )
+
+    def test_invalid_cpu_spec(self):
+        """Test invalid per-CPU specifier."""
+        offset = 0x400
+        with self.assertRaises(Exception) as cm:
+            self.check_crash_command(f"ptov {hex(offset)}:invalid")
+        msg = str(cm.exception).lower()
+        self.assertIn("invalid cpuspec", msg, f"Unexpected error message: {msg}")
+
+
 skip_unless_kmem_s_supported = unittest.skipUnless(
     # Good enough approximation for kmem -s support.
     Path("/proc/slabinfo").exists(),
@@ -64,9 +140,8 @@ skip_unless_kmem_s_supported = unittest.skipUnless(
 
 
 class TestKmem(CrashCommandTestCase):
-    def test_f(self):
-        cmd = self.check_crash_command("kmem -f")
-
+    def _test_free_common(self, flag):
+        cmd = self.check_crash_command(f"kmem -{flag}")
         expected = set(
             re.findall(
                 r"^Node\s+([0-9]+)\s*,\s*zone\s+(\w+)",
@@ -104,8 +179,8 @@ class TestKmem(CrashCommandTestCase):
             "order",
             "block_size",
             "migrate_type",
-            "blocks",
-            "pages",
+            "num_blocks",
+            "num_pages",
         ):
             self.assertIn(variable, cmd.drgn_option.globals)
         for variable in (
@@ -113,6 +188,15 @@ class TestKmem(CrashCommandTestCase):
             "actual_free_pages",
         ):
             self.assertIsInstance(cmd.drgn_option.globals[variable], int)
+        if flag == "F":
+            self.assertRegex(cmd.stdout, r"(?m)^[0-9a-f]+$")
+            self.assertIsInstance(cmd.drgn_option.globals["page"], Object)
+
+    def test_f(self):
+        self._test_free_common("f")
+
+    def test_F(self):
+        self._test_free_common("F")
 
     def test_i(self):
         cmd = self.check_crash_command("kmem -i")
@@ -293,6 +377,42 @@ class TestKmem(CrashCommandTestCase):
             ):
                 self.assertIn(variable, cmd.drgn_option.globals)
 
+    def test_z(self):
+        cmd = self.check_crash_command("kmem -z")
+
+        expected = set(
+            re.findall(
+                r"^Node\s+([0-9]+)\s*,\s*zone\s+(\w+)",
+                Path("/proc/zoneinfo").read_text(),
+                flags=re.MULTILINE,
+            )
+        )
+        actual = set(
+            re.findall(
+                r'^NODE: ([0-9]+).*NAME: "([^"]+)"',
+                cmd.stdout,
+                flags=re.MULTILINE,
+            )
+        )
+        # Since Linux kernel commit b2bd8598195f ("mm, vmstat: print
+        # non-populated zones in zoneinfo") (in v4.12), these should be equal,
+        # but before that, /proc/zoneinfo doesn't include all zones.
+        self.assertGreaterEqual(actual, expected)
+
+        for variable in (
+            "node",
+            "zone",
+            "size",
+            "present",
+            "min_watermark",
+            "low_watermark",
+            "high_watermark",
+            "stat_name",
+            "stat_item",
+            "stat_value",
+        ):
+            self.assertIn(variable, cmd.drgn_option.globals)
+
     def test_o(self):
         cmd = self.check_crash_command("kmem -o")
         for cpu in possible_cpus():
@@ -316,6 +436,66 @@ class TestKmem(CrashCommandTestCase):
             )
             for variable in ("size", "free", "total", "name"):
                 self.assertIn(variable, cmd.drgn_option.globals)
+
+    # For kmem -p and kmem -m, printing every page is too slow. Just get the
+    # first few.
+    def test_p(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "file"
+            CRASH_COMMAND_NAMESPACE.run(self.prog, f"kmem -p | head > {path}")
+            for line in path.read_text().splitlines()[1:]:
+                self.assertRegex(
+                    line,
+                    # PAGE
+                    r"^[0-9a-f]+\s+"
+                    # PHYSICAL
+                    r"[0-9a-f]+\s+"
+                    # MAPPING
+                    r"[0-9a-f]+\s+"
+                    # INDEX
+                    r"[0-9a-f]+\s+"
+                    # CNT
+                    r"-?[0-9]+\s+"
+                    # FLAGS
+                    r"[0-9a-f]+( [\w,]+)?$",
+                )
+
+        drgn_option = self.run_crash_command("kmem -p --drgn")
+        drgn_option_globals = {"prog": self.prog}
+        with self.with_default_prog():
+            exec(drgn_option.stdout + "\n    break", drgn_option_globals)
+        for variable in ("physical", "mapping", "index", "cnt", "flags"):
+            self.assertIsInstance(drgn_option_globals[variable], Object)
+        self.assertIsInstance(drgn_option_globals["decoded_flags"], str)
+
+    def test_m(self):
+        members = "mapping,private,_refcount,lru,flags"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "file"
+            CRASH_COMMAND_NAMESPACE.run(self.prog, f"kmem -m {members} | head > {path}")
+            for line in path.read_text().splitlines()[1:]:
+                self.assertRegex(
+                    line,
+                    # PAGE
+                    r"^[0-9a-f]+\s+"
+                    # mapping
+                    r"[0-9a-f]+\s+"
+                    # private
+                    r"-?[0-9]+\s+"
+                    # _refcount
+                    r"-?[0-9]+\s+"
+                    # lru
+                    r"[0-9a-f]+,[0-9a-f]+\s+"
+                    # flags
+                    r"[0-9a-f]+$",
+                )
+
+        drgn_option = self.run_crash_command(f"kmem -m {members} --drgn")
+        drgn_option_globals = {"prog": self.prog}
+        with self.with_default_prog():
+            exec(drgn_option.stdout + "\n    break", drgn_option_globals)
+        for variable in ("mapping", "private", "_refcount", "lru", "flags"):
+            self.assertIsInstance(drgn_option_globals[variable], Object)
 
     def _test_s_common(self, cmd):
         self.assertEqual(
@@ -402,6 +582,25 @@ class TestKmem(CrashCommandTestCase):
         self.assertEqual(
             cmd.drgn_option.globals["cache"].type_.type_name(), "struct kmem_cache *"
         )
+
+    def test_g_value(self):
+        value = (1 << self.prog["PG_locked"].value_()) | (
+            1 << self.prog["PG_uptodate"].value_()
+        )
+        cmd = self.check_crash_command(f"kmem -g {value:x}")
+        self.assertIn("FLAGS:", cmd.stdout)
+        self.assertIn("PG_locked", cmd.stdout)
+        self.assertIn("PG_uptodate", cmd.stdout)
+        self.assertNotIn("PG_dirty", cmd.stdout)
+        self.assertIn("decode_page_flags_value", cmd.drgn_option.stdout)
+        self.assertIn("PG_locked", cmd.drgn_option.globals["flags"])
+
+    def test_g_no_value(self):
+        cmd = self.check_crash_command("kmem -g")
+        self.assertIn("PG_uptodate", cmd.stdout)
+        self.assertIn(".enumerators", cmd.drgn_option.stdout)
+        for variable in ("name", "bit", "value"):
+            self.assertIn(variable, cmd.drgn_option.globals)
 
 
 class TestSwap(CrashCommandTestCase):

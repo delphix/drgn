@@ -143,6 +143,12 @@ struct drgn_program {
 	struct drgn_thread *main_thread;
 	struct drgn_thread *crashed_thread;
 	/*
+	 * Cached offsetof(struct pt_regs, stackframe) for aarch64, or 0 if not
+	 * yet cached.
+	 */
+	uint64_t aarch64_stackframe_offset_cached;
+
+	/*
 	 * AArch64 instruction pointer authentication code mask, parsed either
 	 * from NT_ARM_PAC_MASK or VMCOREINFO.
 	 */
@@ -254,6 +260,8 @@ struct drgn_program {
 			uint64_t direct_mapping_offset;
 			/** Cached value of `MOD_TEXT` in the kernel. */
 			uint64_t mod_text;
+			/** Cached array of per-cpu __irq_regs values */
+			uint64_t *irq_regs_cached;
 			/**
 			 * Whether @ref drgn_program::arch_pfn_offset has been
 			 * cached.
@@ -391,17 +399,6 @@ drgn_program_is_64_bit(struct drgn_program *prog, bool *ret)
 					 "program word size is not known");
 	}
 	*ret = drgn_platform_is_64_bit(&prog->platform);
-	return NULL;
-}
-
-static inline struct drgn_error *
-drgn_program_address_size(struct drgn_program *prog, uint8_t *ret)
-{
-	if (!prog->has_platform) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "program address size is not known");
-	}
-	*ret = drgn_platform_address_size(&prog->platform);
 	return NULL;
 }
 

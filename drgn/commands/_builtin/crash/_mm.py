@@ -1,13 +1,17 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2025, Kylin Software, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 """Memory management-related crash commands."""
 
 import argparse
+import functools
+import re
 import sys
-from typing import AbstractSet, Any, List, Optional, Sequence
+import textwrap
+from typing import AbstractSet, Any, Callable, List, Optional, Sequence
 
-from drgn import NULL, FaultError, Program, ProgramFlags
+from drgn import NULL, FaultError, Object, Program, ProgramFlags, TypeKind, sizeof
 from drgn.commands import (
     CommandArgumentError,
     _repr_black,
@@ -15,15 +19,24 @@ from drgn.commands import (
     drgn_argument,
     mutually_exclusive_group,
 )
-from drgn.commands.crash import CrashDrgnCodeBuilder, crash_command
+from drgn.commands.crash import (
+    _MEMBER_PATTERN,
+    CrashDrgnCodeBuilder,
+    _sanitize_member_name,
+    crash_command,
+    parse_cpuspec,
+)
 from drgn.helpers import ValidationError
 from drgn.helpers.common.format import (
     CellFormat,
     RowOptions,
+    _print_table_row,
+    double_quote_ascii_string,
     escape_ascii_string,
     number_in_binary_units,
     print_table,
 )
+from drgn.helpers.common.type import typeof_member
 from drgn.helpers.linux.block import nr_blockdev_pages
 from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.device import dev_name
@@ -32,14 +45,22 @@ from drgn.helpers.linux.hugetlb import (
     huge_page_size,
     hugetlb_total_usage,
 )
-from drgn.helpers.linux.list import validate_list_count_nodes
+from drgn.helpers.linux.list import (
+    validate_list_count_nodes,
+    validate_list_for_each_entry,
+)
 from drgn.helpers.linux.mm import (
     PFN_PHYS,
     decode_memory_block_state,
+    decode_page_flags_value,
     for_each_memory_block,
+    for_each_valid_pfn_and_page,
     for_each_vmap_area,
     memory_block_size_bytes,
+    page_flags,
+    page_index,
     pfn_to_page,
+    phys_to_virt,
     totalram_pages,
     vm_commit_limit,
     vm_memory_committed,
@@ -49,6 +70,9 @@ from drgn.helpers.linux.mmzone import (
     decode_section_flags,
     for_each_online_pgdat,
     for_each_present_section,
+    high_wmark_pages,
+    low_wmark_pages,
+    min_wmark_pages,
     section_decode_mem_map,
     section_mem_map_addr,
     section_nr_to_pfn,
@@ -156,10 +180,111 @@ def _crash_cmd_ptob(
         print(f"{pfn:x}: {pfn << PAGE_SHIFT:x}")
 
 
-def _kmem_free(prog: Program, drgn_arg: bool) -> None:
+@crash_command(
+    description="physical or per-CPU to virtual",
+    long_description="""This command translates a hexadecimal physical address into a
+                        kernel virtual address. Alternatively, a hexadecimal per-cpu
+                        offset and cpu specifier will be translated into kernel virtual
+                        addresses for each cpu specified.""",
+    arguments=(
+        argument(
+            "address",
+            metavar="address|offset:cpuspec",
+            nargs="+",
+            help="hexadecimal physical address or hexadecimal per-CPU offset and CPU specifier",
+        ),
+        drgn_argument,
+    ),
+)
+def _crash_cmd_ptov(
+    prog: Program, name: str, args: argparse.Namespace, **kwargs: Any
+) -> None:
+    if args.drgn:
+        # Create a single builder for all addresses
+        builder = CrashDrgnCodeBuilder(prog)
+        physical_addresses = []
+        per_cpu_offsets = []
+
+        for address in args.address:
+            if ":" in address:
+                # Add imports only once
+                builder.add_from_import("drgn", "Object")
+                builder.add_from_import("drgn.helpers.linux.percpu", "per_cpu_ptr")
+                builder.add_from_import(
+                    "drgn.helpers.linux.cpumask", "for_each_possible_cpu"
+                )
+                # Parse the cpuspec in the actual command code
+                offset_str, cpu_spec = address.split(":", 1)
+                offset = int(offset_str, 16)
+                per_cpu_offsets.append((offset, parse_cpuspec(cpu_spec)))
+            else:
+                # Add imports only once
+                builder.add_from_import("drgn.helpers.linux.mm", "phys_to_virt")
+                physical_addresses.append(int(address, 16))
+
+        # Generate code for physical addresses
+        if physical_addresses:
+            builder.append("addresses = [")
+            builder.append(", ".join(f"0x{addr:x}" for addr in physical_addresses))
+            builder.append("]\n")
+            builder.append("for address in addresses:\n")
+            builder.append("    virt = phys_to_virt(address)\n")
+
+        # Generate code for per-CPU offsets
+        for offset, cpuspec in per_cpu_offsets:
+            builder.append(f"\noffset = {offset:#x}\n")
+            builder.append_cpuspec(
+                cpuspec,
+                """
+    virt = per_cpu_ptr(Object(prog, 'void *', offset), cpu)
+                """,
+            )
+
+        # Print the generated code once at the end
+        builder.print()
+        return
+
+    # Handle direct execution without --drgn
+    for i, address in enumerate(args.address):
+        if i > 0:
+            print()  # Add a blank line between outputs for multiple addresses
+
+        if ":" in address:
+            # Handle per-CPU offset case
+            offset_str, cpu_spec = address.split(":", 1)
+            offset = int(offset_str, 16)
+
+            # Parse CPU specifier using parse_cpuspec
+            cpus = parse_cpuspec(cpu_spec)
+
+            # Print offset information
+            print(f"PER-CPU OFFSET: {offset:x}")  # Directly print offset information
+
+            # Prepare data for print_table()
+            rows = [("  CPU", "  VIRTUAL")]  # Add CPU and VIRTUAL header
+            ptr = Object(prog, "void *", offset)  # Changed type to "void *"
+            for cpu in cpus.cpus(prog):
+                virt = per_cpu_ptr(ptr, cpu)
+                rows.append((f"  [{cpu}]", f"{virt.value_():016x}"))
+
+            # Print the table
+            print_table(rows)
+        else:
+            # Handle physical address case
+            phys = int(address, 16)
+            virt = phys_to_virt(prog, phys)
+            virt_int = virt.value_()
+
+            # Prepare data for print_table()
+            rows = [("VIRTUAL", "PHYSICAL"), (f"{virt_int:016x}", f"{phys:x}")]
+
+            # Print the table
+            print_table(rows)
+
+
+def _kmem_free(prog: Program, drgn_arg: bool, show_pages: bool = False) -> None:
     if drgn_arg:
         code = CrashDrgnCodeBuilder(prog)
-        code.add_from_import("drgn.helpers.linux.list", "validate_list_count_nodes")
         code.add_from_import("drgn.helpers.linux.mm", "PFN_PHYS", "pfn_to_page")
         code.add_from_import("drgn.helpers.linux.mmzone", "for_each_online_pgdat")
         code.add_from_import(
@@ -184,6 +309,22 @@ for pgdat in for_each_online_pgdat():
             for migrate_type, free_list in enumerate(free_area.free_list):
 """
         )
+        if show_pages:
+            code.add_from_import(
+                "drgn.helpers.linux.list", "validate_list_for_each_entry"
+            )
+            loop_body = """\
+                num_blocks = 0
+                for page in validate_list_for_each_entry(
+                    "struct page", free_list.address_of_(), "lru"
+                ):
+                    num_blocks += 1
+"""
+        else:
+            code.add_from_import("drgn.helpers.linux.list", "validate_list_count_nodes")
+            loop_body = """\
+                num_blocks = validate_list_count_nodes(free_list.address_of_())
+"""
         if prog.flags & ProgramFlags.IS_LIVE:
             code.add_from_import("drgn", "FaultError")
             code.add_from_import("drgn.helpers", "ValidationError")
@@ -193,13 +334,10 @@ for pgdat in for_each_online_pgdat():
                 num_attempts = 10
                 for attempt in range(num_attempts):
                     try:
-        """
-            )
-        code.append(
-            """\
-                blocks = validate_list_count_nodes(free_list.address_of_())
 """
-        )
+            )
+            loop_body = textwrap.indent(loop_body, "        ")
+        code.append(loop_body)
         if prog.flags & ProgramFlags.IS_LIVE:
             code.append(
                 """\
@@ -211,8 +349,8 @@ for pgdat in for_each_online_pgdat():
             )
         code.append(
             """\
-                pages = blocks << order
-                actual_free_pages += pages
+                num_pages = num_blocks << order
+                actual_free_pages += num_pages
 
 expected_free_pages = nr_free_pages()
 """
@@ -233,6 +371,16 @@ expected_free_pages = nr_free_pages()
         node_header: Sequence[Any] = (CellFormat("NODE", ">"),)
     else:
         node_header = ()
+
+    free_list_header = [
+        CellFormat("ORDER", "^"),
+        CellFormat("SIZE", ">"),
+        "MIGRATE",
+        CellFormat("FREE_LIST", "^"),
+    ]
+    if not show_pages:
+        free_list_header.append(CellFormat("BLOCKS", ">"))
+        free_list_header.append(CellFormat("PAGES", ">"))
 
     rows: List[Sequence[Any]] = []
     first = True
@@ -293,43 +441,54 @@ expected_free_pages = nr_free_pages()
             if size == 0:
                 continue
 
-            rows.append(
-                (
-                    CellFormat("ORDER", "^"),
-                    CellFormat("SIZE", ">"),
-                    "MIGRATE",
-                    CellFormat("FREE_LIST", "^"),
-                    CellFormat("BLOCKS", ">"),
-                    CellFormat("PAGES", ">"),
-                )
-            )
+            if not show_pages:
+                rows.append(free_list_header)
             for order, free_area in enumerate(zone.free_area):
                 size = (prog["PAGE_SIZE"].value_() << order) // 1024
                 size_cell = CellFormat(f"{size}k", ">")
                 for migrate_type, free_list in enumerate(free_area.free_list):
-                    blocks: Any = "[CORRUPTED]"
-                    pages: Any = ""
+                    num_blocks: Any = "[CORRUPTED]"
+                    num_pages: Any = ""
                     # Walking free lists is racy. Retry a limited number of
                     # times on live kernels.
                     for _ in range(10):
                         try:
-                            blocks = validate_list_count_nodes(free_list.address_of_())
+                            if show_pages:
+                                pages = list(
+                                    validate_list_for_each_entry(
+                                        "struct page", free_list.address_of_(), "lru"
+                                    )
+                                )
+                                num_blocks = len(pages)
+                            else:
+                                num_blocks = validate_list_count_nodes(
+                                    free_list.address_of_()
+                                )
                         except (FaultError, ValidationError):
                             if not (prog.flags & ProgramFlags.IS_LIVE):
                                 break
                         else:
-                            pages = blocks << order
-                            total_free_pages += pages
-                    rows.append(
-                        (
-                            CellFormat(order, "^"),
-                            size_cell,
-                            migrate_types[migrate_type],
-                            CellFormat(free_list.address_, "^x"),
-                            blocks,
-                            pages,
-                        ),
-                    )
+                            num_pages = num_blocks << order
+                            total_free_pages += num_pages
+                            break
+                    if show_pages:
+                        rows.append(free_list_header)
+                    row = [
+                        CellFormat(order, "^"),
+                        size_cell,
+                        migrate_types[migrate_type],
+                        CellFormat(free_list.address_, "^x"),
+                    ]
+                    if not show_pages:
+                        row.append(num_blocks)
+                        row.append(num_pages)
+                    rows.append(row)
+
+                    if show_pages:
+                        for page in pages:
+                            rows.append(
+                                RowOptions((CellFormat(page.value_(), "x"),), group=2)
+                            )
     print_table(rows)
 
     free_pages = nr_free_pages(prog)
@@ -340,10 +499,7 @@ expected_free_pages = nr_free_pages()
     print(f"\nnr_free_pages: {free_pages}  ({verified})")
 
 
-def _kmem_info(
-    prog: Program,
-    drgn_arg: bool,
-) -> None:
+def _kmem_info(prog: Program, drgn_arg: bool) -> None:
     if drgn_arg:
         code = CrashDrgnCodeBuilder(prog)
         code.add_from_import("drgn.helpers.linux.block", "nr_blockdev_pages")
@@ -510,10 +666,7 @@ committed = vm_memory_committed()
     print_table(rows)
 
 
-def _kmem_vmalloc(
-    prog: Program,
-    drgn_arg: bool,
-) -> None:
+def _kmem_vmalloc(prog: Program, drgn_arg: bool) -> None:
     if drgn_arg:
         sys.stdout.write(
             """\
@@ -923,10 +1076,90 @@ if "memory_subsys" in prog:  # Check for CONFIG_MEMORY_HOTPLUG.
         print_table(rows)
 
 
-def _kmem_per_cpu_offset(
-    prog: Program,
-    drgn_arg: bool,
-) -> None:
+def _kmem_zones(prog: Program, drgn_arg: bool) -> None:
+    if drgn_arg:
+        code = CrashDrgnCodeBuilder(prog)
+        code.add_from_import(
+            "drgn.helpers.linux.mmzone",
+            "for_each_online_pgdat",
+            "high_wmark_pages",
+            "low_wmark_pages",
+            "min_wmark_pages",
+        )
+        code.add_from_import("drgn.helpers.linux.vmstat", "zone_page_state")
+        code.append(
+            """\
+for pgdat in for_each_online_pgdat():
+    node = pgdat.node_id
+    for zone in pgdat.node_zones:
+        zone = zone.address_of_()
+        name = zone.name
+        size = zone.spanned_pages
+        if size == 0:
+            continue
+
+        present = zone.present_pages
+        min_watermark = min_wmark_pages(zone)
+        low_watermark = low_wmark_pages(zone)
+        high_watermark = high_wmark_pages(zone)
+
+        for stat_name, stat_item in prog.type("enum zone_stat_item").enumerators:
+            if stat_name == "NR_VM_ZONE_STAT_ITEMS":
+                continue
+            stat_value = zone_page_state(zone, stat_item)
+"""
+        )
+        code.print()
+        return
+
+    separator = ""
+    for pgdat in for_each_online_pgdat(prog):
+        nid = pgdat.node_id.value_()
+        for i, zone in enumerate(pgdat.node_zones):
+            # Separate with one newline after an unpopulated zone, two after
+            # populated.
+            sys.stdout.write(separator)
+
+            zone = zone.address_of_()
+            print(
+                f"NODE: {nid}  ZONE: {i}  ADDR: {zone.value_():x}  NAME: {double_quote_ascii_string(zone.name.string_())}"
+            )
+
+            size = zone.spanned_pages.value_()
+            if not size:
+                print("  [unpopulated]")
+                separator = "\n"
+                continue
+
+            present = zone.present_pages.value_()
+            if present < size:
+                present_column = f"  PRESENT: {present}"
+            else:
+                present_column = ""
+
+            minw = min_wmark_pages(zone)
+            loww = low_wmark_pages(zone)
+            highw = high_wmark_pages(zone)
+
+            print(
+                f"  SIZE: {size}{present_column}  MIN/LOW/HIGH: {minw}/{loww}/{highw}\n  VM_STAT:"
+            )
+
+            rows: List[Sequence[Any]] = []
+            for name, item in prog.type("enum zone_stat_item").enumerators:  # type: ignore[union-attr]
+                if name == "NR_VM_ZONE_STAT_ITEMS":
+                    continue
+                rows.append(
+                    (
+                        CellFormat("  " + name, ">"),
+                        CellFormat(zone_page_state(zone, item), "<"),
+                    )
+                )
+            print_table(rows)
+            separator = "\n\n"
+
+
+def _kmem_per_cpu_offset(prog: Program, drgn_arg: bool) -> None:
     if drgn_arg:
         sys.stdout.write(
             """\
@@ -948,10 +1181,7 @@ for cpu in for_each_possible_cpu():
         print(f"{cpu_field:>7}: {per_cpu_ptr(nullptr, cpu).value_():x}")
 
 
-def _kmem_hstate(
-    prog: Program,
-    drgn_arg: bool,
-) -> None:
+def _kmem_hstate(prog: Program, drgn_arg: bool) -> None:
     if drgn_arg:
         sys.stdout.write(
             """\
@@ -988,6 +1218,160 @@ for hstate in for_each_hstate(prog):
         )
 
     print_table(rows)
+
+
+def _page_flags_and_decoded_flags(pfn: int, page: Object) -> str:
+    flags = page_flags(page).read_()
+    decoded_flags = decode_page_flags_value(flags).replace("|", ",").replace("PG_", "")
+    return f"{flags.value_():x} {decoded_flags}"
+
+
+def _page_flags_member(pfn: int, page: Object) -> str:
+    flags = page_flags(page)
+    return f"{flags.value_():0{sizeof(flags) * 2}x}"
+
+
+def _page_list_head_member(member: str, pfn: int, page: Object) -> str:
+    node = page[0].subobject_(member)
+    next = node.next
+    prev = node.prev
+    return f"{next.value_():0{sizeof(next) * 2}x},{prev.value_():0{sizeof(prev) * 2}x}"
+
+
+def _page_callback_head_member(member: str, pfn: int, page: Object) -> str:
+    head = page[0].subobject_(member)
+    next = head.next
+    func = head.func
+    return f"{next.value_():0{sizeof(next) * 2}x},{func.value_():0{sizeof(func) * 2}x}"
+
+
+def _page_decimal_member(member: str, pfn: int, page: Object) -> str:
+    return str(page[0].subobject_(member).value_())
+
+
+def _page_hex_member(member: str, pfn: int, page: Object) -> str:
+    object = page[0].subobject_(member)
+    return f"{object.value_():0{sizeof(object) * 2}x}"
+
+
+def _kmem_pages(
+    prog: Program, drgn_arg: bool, *, members: Optional[str] = None
+) -> None:
+    if drgn_arg:
+        code = CrashDrgnCodeBuilder(prog)
+        code.add_from_import("drgn.helpers.linux.mm", "for_each_valid_pfn_and_page")
+        code.append(
+            """\
+for pfn, page in for_each_valid_pfn_and_page():
+"""
+        )
+        if members is None:
+            code.add_from_import(
+                "drgn.helpers.linux.mm",
+                "PFN_PHYS",
+                "decode_page_flags_value",
+                "page_flags",
+                "page_index",
+            )
+            code.append(
+                """\
+    physical = PFN_PHYS(pfn)
+    mapping = page.mapping
+    index = page_index(page)
+    cnt = page._refcount.counter
+    flags = page_flags(page)
+    decoded_flags = decode_page_flags_value(flags)
+"""
+            )
+        else:
+            for member in members.split(","):
+                if not re.fullmatch(_MEMBER_PATTERN, member):
+                    raise ValueError(f"invalid member name: {member}")
+                if member == "flags":
+                    code.add_from_import("drgn.helpers.linux.mm", "page_flags")
+                    code.append("    flags = page_flags(page)\n")
+                else:
+                    code.append(
+                        f"    {_sanitize_member_name(member)} = " f"page.{member}\n"
+                    )
+        code.print()
+        return
+
+    address_size = prog.address_size()
+    PAGE_SHIFT = prog["PAGE_SHIFT"].value_()
+
+    # print_table() requires having all rows available ahead of time. With a
+    # row per page, this would take too much time and memory. Instead, we
+    # compute the column widths and print each row manually.
+    header: List[Any] = [CellFormat("PAGE", "^")]
+    widths = [address_size * 2]
+    getters: List[Callable[[int, Object], Any]] = [
+        lambda pfn, page: f"{page.value_():0{address_size * 2}x}"
+    ]
+
+    if members is None:
+        header.append(CellFormat("PHYSICAL", ">"))
+        widths.append(len(hex(prog["max_pfn"].value_() << PAGE_SHIFT)) - 2)
+        getters.append(lambda pfn, page: CellFormat(pfn << PAGE_SHIFT, "x"))
+
+        header.append(CellFormat("MAPPING", "^"))
+        widths.append(address_size * 2)
+        getters.append(lambda pfn, page: CellFormat(page.mapping.value_(), "x"))
+
+        header.append(CellFormat("INDEX", ">"))
+        widths.append(12)
+        getters.append(lambda pfn, page: CellFormat(page_index(page).value_(), "x"))
+
+        header.append(CellFormat("CNT", ">"))
+        widths.append(3)
+        getters.append(lambda pfn, page: page._refcount.counter.value_())
+
+        header.append("FLAGS")
+        widths.append(5)
+        getters.append(_page_flags_and_decoded_flags)
+    else:
+        struct_page = prog.type("struct page")
+        integer_base = prog.config.get("crash_radix", 10)
+        for member in members.split(","):
+            if not re.fullmatch(_MEMBER_PATTERN, member):
+                raise ValueError(f"invalid member name: {member}")
+            header.append(member)
+
+            if member == "flags":
+                widths.append(address_size * 2)
+                getters.append(_page_flags_member)
+                continue
+
+            member_type = typeof_member(struct_page, member)
+            member_type_kind = member_type.unaliased_kind()
+            member_type_name = member_type.type_name()
+            if member_type_name == "struct list_head":
+                widths.append(max(address_size * 4 + 1, len(member)))
+                getters.append(functools.partial(_page_list_head_member, member))
+            elif member_type_name == "struct callback_head":
+                widths.append(max(address_size * 4 + 1, len(member)))
+                getters.append(functools.partial(_page_callback_head_member, member))
+            elif member_type_name == "atomic_t" or member_type_name == "atomic_long_t":
+                widths.append(max(12, len(member)))
+                getters.append(
+                    functools.partial(_page_decimal_member, member + ".counter")
+                )
+            elif (
+                member_type_kind == TypeKind.INT and integer_base == 16
+            ) or member_type_kind == TypeKind.POINTER:
+                widths.append(max(sizeof(member_type) * 2, len(member)))
+                getters.append(functools.partial(_page_hex_member, member))
+            elif member_type_kind == TypeKind.INT:
+                widths.append(max(12, len(member)))
+                getters.append(functools.partial(_page_decimal_member, member))
+            else:
+                raise NotImplementedError(
+                    f"formatting {member_type_name!r} not implemented"
+                )
+
+    _print_table_row(header, widths=widths)
+    for pfn, page in for_each_valid_pfn_and_page(prog):
+        _print_table_row([getter(pfn, page) for getter in getters], widths=widths)
 
 
 def _kmem_slab(
@@ -1117,6 +1501,46 @@ if cache:
     print_table(rows)
 
 
+def _kmem_page_flags(prog: Program, drgn_arg: bool, flags: Optional[int]) -> None:
+    if drgn_arg:
+        if flags is None:
+            sys.stdout.write(
+                """\
+for name, bit in prog.type("enum pageflags").enumerators:
+    if name == "__NR_PAGEFLAGS":
+        continue
+    value = 1 << bit
+"""
+            )
+        else:
+            sys.stdout.write(
+                f"""\
+from drgn.helpers.linux.mm import decode_page_flags_value
+
+
+flags = decode_page_flags_value(0x{flags:x})
+"""
+            )
+        return
+
+    if flags is None:
+        prefix = ""
+    else:
+        print(f"FLAGS: {flags:x}")
+        prefix = "  "
+    rows: List[Sequence[Any]] = [
+        (prefix + "PAGE-FLAG", CellFormat("BIT", ">"), "VALUE")
+    ]
+    width = len(hex((1 << prog["__NR_PAGEFLAGS"].value_()) - 1)) - 2
+    for name, bit in prog.type("enum pageflags").enumerators:  # type: ignore[union-attr]
+        if name == "__NR_PAGEFLAGS":
+            continue
+        value = 1 << bit
+        if flags is None or flags & value:
+            rows.append((prefix + name, bit, f"{value:0{width}x}"))
+    print_table(rows)
+
+
 @crash_command(
     description="kernel memory",
     long_description="""
@@ -1129,6 +1553,12 @@ if cache:
                 dest="free",
                 action="store_true",
                 help="display and verify page allocator free lists",
+            ),
+            argument(
+                "-F",
+                dest="free_pages",
+                action="store_true",
+                help="like -f, but also display each page on the free lists",
             ),
             argument(
                 "-i",
@@ -1155,6 +1585,12 @@ if cache:
                 help="display NUMA nodes, SPARSEMEM sections, and memory blocks",
             ),
             argument(
+                "-z",
+                dest="zones",
+                action="store_true",
+                help="display per-zone memory statistics",
+            ),
+            argument(
                 "-o",
                 dest="per_cpu_offset",
                 action="store_true",
@@ -1170,10 +1606,38 @@ if cache:
                 help="display HugeTLB state",
             ),
             argument(
+                "-p",
+                dest="pages",
+                action="store_true",
+                help="""
+                display every valid struct page, including its physical
+                address, mapping, index, refcount, and flags
+                """,
+            ),
+            argument(
+                "-m",
+                dest="page_members",
+                help="""
+                display the given comma-separated members of every valid struct page
+                """,
+            ),
+            argument(
                 "-s",
                 dest="slab",
                 action="store_true",
                 help="display an overview of slab caches",
+            ),
+            argument(
+                "-g",
+                dest="page_flags",
+                metavar="FLAGS",
+                type="hexadecimal",
+                nargs="?",
+                default=argparse.SUPPRESS,
+                help="""
+                display the flags set on a hexadecimal page flags value, or
+                display all of the possible flags if no value is given
+                """,
             ),
             required=True,
         ),
@@ -1217,6 +1681,8 @@ def _crash_cmd_kmem(
 
     if args.free:
         return _kmem_free(prog, args.drgn)
+    if args.free_pages:
+        return _kmem_free(prog, args.drgn, show_pages=True)
     if args.info:
         return _kmem_info(prog, args.drgn)
     if args.vmalloc:
@@ -1225,14 +1691,22 @@ def _crash_cmd_kmem(
         return _kmem_vmstat(prog, args.drgn)
     if args.nodes:
         return _kmem_nodes(prog, args.drgn)
+    if args.zones:
+        return _kmem_zones(prog, args.drgn)
     if args.per_cpu_offset:
         return _kmem_per_cpu_offset(prog, args.drgn)
     if args.hstate:
         return _kmem_hstate(prog, args.drgn)
+    if args.pages:
+        return _kmem_pages(prog, args.drgn)
+    if args.page_members is not None:
+        return _kmem_pages(prog, args.drgn, members=args.page_members)
     if args.slab:
         return _kmem_slab(
             prog, args.drgn, ignore=ignore_slab_caches, names=slab_cache_names
         )
+    if hasattr(args, "page_flags"):
+        return _kmem_page_flags(prog, args.drgn, args.page_flags)
 
 
 @crash_command(
