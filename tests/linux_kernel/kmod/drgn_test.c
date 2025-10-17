@@ -525,6 +525,8 @@ static void drgn_test_maple_tree_exit(void) {}
 // mm
 
 const int drgn_test_vmap_stack_enabled = IS_ENABLED(CONFIG_VMAP_STACK);
+const int drgn_test_slab_stack_enabled =
+	!IS_ENABLED(CONFIG_VMAP_STACK) && THREAD_SIZE < PAGE_SIZE;
 void *drgn_test_va;
 phys_addr_t drgn_test_pa;
 unsigned long drgn_test_pfn;
@@ -579,7 +581,10 @@ size_t drgn_test_num_present_sections;
 static int drgn_test_mm_init(void)
 {
 	u32 fill;
-	size_t i, n;
+	size_t i;
+#ifdef CONFIG_SPARSEMEM
+	size_t n;
+#endif
 
 	drgn_test_page = alloc_page(GFP_KERNEL);
 	if (!drgn_test_page)
@@ -2011,3 +2016,4 @@ module_init(drgn_test_init);
 module_exit(drgn_test_exit);
 
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Module for testing drgn");

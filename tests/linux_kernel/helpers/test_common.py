@@ -4,13 +4,28 @@
 from contextlib import redirect_stdout
 import io
 
+from _drgn_util.platform import NORMALIZED_MACHINE_NAME
 from drgn import offsetof, sizeof
-from drgn.helpers.common.memory import identify_address, print_annotated_memory
+from drgn.helpers.common.memory import (
+    IdentifiedSymbol,
+    identify_address,
+    identify_address_all,
+    print_annotated_memory,
+)
 from drgn.helpers.common.stack import print_annotated_stack
+from drgn.helpers.linux.common import (
+    IdentifiedSlabObject,
+    IdentifiedTaskStack,
+    IdentifiedTaskStruct,
+    IdentifiedVmap,
+)
 from drgn.helpers.linux.mm import pfn_to_virt
+from drgn.helpers.linux.sched import idle_task
 from tests.linux_kernel import (
     HAVE_FULL_MM_SUPPORT,
     LinuxKernelTestCase,
+    online_cpus,
+    skip_if_slob,
     skip_unless_have_full_mm_support,
     skip_unless_have_stack_tracing,
     skip_unless_have_test_kmod,
@@ -22,10 +37,12 @@ class TestIdentifyAddress(LinuxKernelTestCase):
     def test_identify_symbol(self):
         symbol = self.prog.symbol("drgn_test_function")
 
-        self.assertEqual(
-            identify_address(self.prog, symbol.address),
-            "function symbol: drgn_test_function+0x0",
-        )
+        identified = list(identify_address_all(self.prog, symbol.address))
+        self.assertIsInstance(identified[0], IdentifiedSymbol)
+        self.assertEqual(str(identified[0]), "function symbol: drgn_test_function+0x0")
+        # Module symbols are also vmapped.
+        self.assertIsInstance(identified[1], IdentifiedVmap)
+        self.assertEqual(len(identified), 2)
 
         self.assertEqual(
             identify_address(self.prog, symbol.address + 1),
@@ -41,13 +58,65 @@ class TestIdentifyAddress(LinuxKernelTestCase):
 
                 if self.prog["drgn_test_slob"]:
                     for obj in objects:
-                        self.assertIsNone(identify_address(obj))
+                        if size == "small":
+                            self.assertEqual(
+                                identify_address(obj), "unknown slab object"
+                            )
+                        else:
+                            self.assertIsNone(identify_address(obj))
                 else:
                     for obj in objects:
                         self.assertEqual(
                             identify_address(obj),
                             f"slab object: drgn_test_{size}+0x0",
                         )
+
+    @skip_unless_have_full_mm_support
+    @skip_unless_have_test_kmod
+    @skip_if_slob
+    def test_identify_task(self):
+        identified = list(identify_address_all(self.prog["drgn_test_kthread"]))
+        self.assertIsInstance(identified[0], IdentifiedTaskStruct)
+        self.assertEqual(identified[0].task, self.prog["drgn_test_kthread"])
+        self.assertEqual(
+            str(identified[0]),
+            f"task: {self.prog['drgn_test_kthread'].pid.value_()} (drgn_test_kthre)",
+        )
+        self.assertIsInstance(identified[1], IdentifiedSlabObject)
+        self.assertEqual(len(identified), 2)
+
+    @skip_unless_have_full_mm_support
+    @skip_unless_have_test_kmod
+    @skip_if_slob
+    def test_identify_task_member(self):
+        pid_offset = offsetof(self.prog.type("struct task_struct"), "pid")
+        self.assertEqual(
+            identify_address(self.prog, self.prog["drgn_test_kthread"].pid.address_),
+            f"task: {self.prog['drgn_test_kthread'].pid.value_()} (drgn_test_kthre) +{hex(pid_offset)}",
+        )
+
+    def test_identify_idle_task_0(self):
+        identified = list(identify_address_all(self.prog["init_task"].address_of_()))
+        self.assertIsInstance(identified[0], IdentifiedTaskStruct)
+        self.assertEqual(identified[0].task, idle_task(self.prog, 0))
+        self.assertIsInstance(identified[1], IdentifiedSymbol)
+        self.assertGreaterEqual(len(identified), 2)
+
+    @skip_unless_have_full_mm_support
+    @skip_if_slob
+    def test_identify_idle_task_1(self):
+        for cpu in online_cpus():
+            if cpu > 0:
+                break
+        else:
+            self.skipTest("online CPU > 0 not found")
+
+        task = idle_task(self.prog, cpu)
+        identified = list(identify_address_all(task))
+        self.assertIsInstance(identified[0], IdentifiedTaskStruct)
+        self.assertEqual(identified[0].task, task)
+        self.assertIsInstance(identified[1], IdentifiedSlabObject)
+        self.assertEqual(len(identified), 2)
 
     @skip_unless_have_test_kmod
     def test_identify_vmap(self):
@@ -59,20 +128,89 @@ class TestIdentifyAddress(LinuxKernelTestCase):
                     ).startswith("vmap: 0x")
                 )
 
+    @skip_unless_have_full_mm_support
     @skip_unless_have_test_kmod
-    def test_identify_vmap_stack(self):
-        if not self.prog["drgn_test_vmap_stack_enabled"]:
-            self.skipTest("kernel does not use vmap stacks (CONFIG_VMAP_STACK)")
-        for cache in (None, {}):
-            with self.subTest("uncached" if cache is None else "cached"):
-                self.assertEqual(
-                    identify_address(
+    def test_identify_task_stack(self):
+        if self.prog["drgn_test_slob"] and self.prog["drgn_test_slab_stack_enabled"]:
+            self.skipTest("test does not support SLOB")
+
+        for cached in (False, True):
+            with self.subTest("cached" if cached else "uncached"):
+                identified = list(
+                    identify_address_all(
                         self.prog,
                         self.prog["drgn_test_kthread"].stack.value_() + 1234,
-                        cache=cache,
-                    ),
-                    f"vmap stack: {self.prog['drgn_test_kthread'].pid.value_()} (drgn_test_kthre) +0x4d2",
+                        cache={} if cached else None,
+                    )
                 )
+                self.assertIsInstance(identified[0], IdentifiedTaskStack)
+                self.assertEqual(
+                    str(identified[0]),
+                    f"task stack: {self.prog['drgn_test_kthread'].pid.value_()} (drgn_test_kthre) +0x4d2",
+                )
+                if self.prog["drgn_test_vmap_stack_enabled"]:
+                    self.assertIsInstance(identified[1], IdentifiedVmap)
+                    self.assertEqual(len(identified), 2)
+                elif self.prog["drgn_test_slab_stack_enabled"]:
+                    self.assertIsInstance(identified[1], IdentifiedSlabObject)
+                    self.assertEqual(len(identified), 2)
+                else:
+                    self.assertEqual(len(identified), 1)
+
+    @skip_unless_have_full_mm_support
+    def test_identify_idle_task_0_stack(self):
+        identified = list(identify_address_all(self.prog["init_task"].stack))
+        self.assertIsInstance(identified[0], IdentifiedTaskStack)
+        self.assertEqual(identified[0].task, idle_task(self.prog, 0))
+        # s390x between Linux kernel commits ce3dc447493f ("s390: add support
+        # for virtually mapped kernel stacks") (in v4.20) and 944c78376a39
+        # ("s390: use init_thread_union aka initial stack for the first
+        # process") (in v6.4) allocates init_task.stack.
+        if NORMALIZED_MACHINE_NAME == "s390x":
+            if self.prog["drgn_test_vmap_stack_enabled"]:
+                self.assertIsInstance(identified[1], (IdentifiedSymbol, IdentifiedVmap))
+                self.assertEqual(len(identified), 2)
+            elif self.prog["drgn_test_slab_stack_enabled"]:
+                self.assertIsInstance(
+                    identified[1], (IdentifiedSymbol, IdentifiedSlabObject)
+                )
+                self.assertEqual(len(identified), 2)
+            elif len(identified) > 1:
+                self.assertIsInstance(identified[1], IdentifiedSymbol)
+                self.assertEqual(len(identified), 2)
+        else:
+            self.assertIsInstance(identified[1], IdentifiedSymbol)
+            self.assertGreaterEqual(len(identified), 2)
+
+    @skip_unless_have_full_mm_support
+    @skip_unless_have_test_kmod
+    def test_identify_idle_task_1_stack(self):
+        if self.prog["drgn_test_slob"] and self.prog["drgn_test_slab_stack_enabled"]:
+            self.skipTest("test does not support SLOB")
+
+        for cpu in online_cpus():
+            if cpu > 0:
+                break
+        else:
+            self.skipTest("online CPU > 0 not found")
+
+        task = idle_task(self.prog, cpu)
+
+        for cached in (False, True):
+            with self.subTest("cached" if cached else "uncached"):
+                identified = list(
+                    identify_address_all(task.stack, cache={} if cached else None)
+                )
+                self.assertIsInstance(identified[0], IdentifiedTaskStack)
+                self.assertEqual(identified[0].task, task)
+                if self.prog["drgn_test_vmap_stack_enabled"]:
+                    self.assertIsInstance(identified[1], IdentifiedVmap)
+                    self.assertEqual(len(identified), 2)
+                elif self.prog["drgn_test_slab_stack_enabled"]:
+                    self.assertIsInstance(identified[1], IdentifiedSlabObject)
+                    self.assertEqual(len(identified), 2)
+                else:
+                    self.assertEqual(len(identified), 1)
 
     @skip_unless_have_test_kmod
     def test_identify_page(self):
@@ -90,13 +228,10 @@ class TestIdentifyAddress(LinuxKernelTestCase):
     @skip_unless_have_test_kmod
     def test_identify_unrecognized(self):
         start_addr = (pfn_to_virt(self.prog["min_low_pfn"])).value_()
-        end_addr = (pfn_to_virt(self.prog["max_pfn"]) + self.prog["PAGE_SIZE"]).value_()
-
         # On s390x, the start address is 0, and identify_address() doesn't
         # allow a negative address.
         if start_addr > 0:
             self.assertIsNone(identify_address(self.prog, start_addr - 1))
-        self.assertIsNone(identify_address(self.prog, end_addr))
         self.assertIsNone(identify_address(self.prog, self.prog["drgn_test_va"]))
 
 
