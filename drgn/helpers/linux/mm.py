@@ -83,7 +83,6 @@ __all__ = (
     "for_each_valid_pfn_and_page",
     "for_each_vma",
     "for_each_vmap_area",
-    "get_task_rss_info",
     "in_direct_map",
     "memory_block_size_bytes",
     "page_flags",
@@ -96,6 +95,7 @@ __all__ = (
     "pfn_to_virt",
     "phys_to_page",
     "phys_to_virt",
+    "task_rss",
     "totalram_pages",
     "virt_to_page",
     "virt_to_pfn",
@@ -1694,9 +1694,7 @@ def in_direct_map(prog: Program, addr: IntegerLike) -> bool:
 
 
 class TaskRss(NamedTuple):
-    """
-    Represents a task's resident set size in pages. See :func:`get_task_rss_info()`.
-    """
+    """Task's resident set size returned by :func:`task_rss()`."""
 
     file: int
     """Number of resident file pages."""
@@ -1709,32 +1707,37 @@ class TaskRss(NamedTuple):
 
     @property
     def total(self) -> int:
+        """
+        Total number of resident pages (:attr:`file` + :attr:`anon` +
+        :attr:`shmem`).
+        """
         return self.file + self.anon + self.shmem
 
 
 @takes_program_or_default
-def get_task_rss_info(prog: Program, task: Object) -> TaskRss:
+def task_rss(prog: Program, task: Object) -> TaskRss:
     """
-    Return the task's resident set size (RSS) in pages
+    Return a task's resident set size (RSS) in pages.
 
     The task's RSS is the number of pages which are currently resident in
-    memory. The RSS values can be broken down into anonymous pages (not bound to
-    any file), file pages (those associated with memory mapped files), and
+    memory. The RSS values can be broken down into anonymous pages (not bound
+    to any file), file pages (those associated with memory mapped files), and
     shared memory pages (those which aren't associated with on-disk files, but
-    belonging to shared memory mappings). This function returns a tuple
-    containing each category, but the common behavior is to use the "total"
-    value which sums them up.
+    belonging to shared memory mappings). This function returns a named tuple
+    containing each category, but the common behavior is to use the
+    :attr:`~TaskRss.total` value which sums them up.
 
-    :param task: ``struct task_struct *`` for which to compute RSS
-    :returns: the file, anon, and shmem page values
+    :param task: ``struct task_struct *``
     """
 
+    mm = task.mm.read_()
+
     # Kthreads have a NULL mm, simply skip them, returning 0.
-    if not task.mm:
+    if not mm:
         return TaskRss(0, 0, 0, 0)
 
     prog = task.prog_
-    rss_stat = task.mm.rss_stat
+    rss_stat = mm.rss_stat
 
     MM_FILEPAGES = prog.constant("MM_FILEPAGES").value_()
     MM_ANONPAGES = prog.constant("MM_ANONPAGES").value_()
@@ -1748,9 +1751,9 @@ def get_task_rss_info(prog: Program, task: Object) -> TaskRss:
         MM_SHMEMPAGES = -1
 
     if rss_stat.type_.kind == TypeKind.ARRAY:
-        # Since v6.2, f1a7941243c10 ("mm: convert mm's rss stats into
-        # percpu_counter"), the "rss_stat" object is an array of percpu
-        # counters. Simply sum them up!
+        # Since Linux kernel commit f1a7941243c10 ("mm: convert mm's rss stats
+        # into percpu_counter") (in v6.2), the "rss_stat" object is an array of
+        # percpu counters. Simply sum them up!
         filerss = percpu_counter_sum(rss_stat[MM_FILEPAGES].address_of_())
         anonrss = percpu_counter_sum(rss_stat[MM_ANONPAGES].address_of_())
         swapents = percpu_counter_sum(rss_stat[MM_SWAPENTS].address_of_())

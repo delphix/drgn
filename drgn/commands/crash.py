@@ -26,6 +26,7 @@ from drgn.commands import (
     command,
     custom_command,
 )
+from drgn.helpers.common.format import double_quote_ascii_string
 from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.pid import find_task
 from drgn.helpers.linux.sched import task_cpu
@@ -226,6 +227,16 @@ def crash_get_context(
     return task
 
 
+def print_task_header(task: Object) -> None:
+    """Print basic information about a task in the same format as crash."""
+    print(
+        f"PID: {task.pid.value_():<7}  "
+        f"TASK: {task.value_():x}  "
+        f"CPU: {task_cpu(task)}  "
+        f"COMMAND: {double_quote_ascii_string(task.comm.string_())}"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class Cpuspec:
     """Parsed crash CPU specifier."""
@@ -299,6 +310,16 @@ _TYPE_NAME_PATTERN = r"[a-zA-Z_][a-zA-Z0-9_]*"
 _MEMBER_PATTERN = r"[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*|\[[0-9]+\])*"
 
 
+# Parse a type name followed by a "." and a member name.
+def _parse_type_name_and_member(arg: str) -> Tuple[str, str]:
+    name, _, member = arg.partition(".")
+    if not re.fullmatch(_TYPE_NAME_PATTERN, name):
+        raise ValueError(f"invalid type name: {name}")
+    if not re.fullmatch(_MEMBER_PATTERN, member):
+        raise ValueError(f"invalid member name: {member}")
+    return name, member
+
+
 # Parse a type name optionally followed by a "." and one or more
 # comma-separated members.
 def _parse_type_name_and_members(arg: str) -> Tuple[str, List[str]]:
@@ -328,12 +349,7 @@ def _parse_type_offset_arg(arg: str) -> Union[int, Tuple[str, str]]:
             return int(arg, 0)
         except ValueError:
             raise ValueError(f"invalid offset: {arg}") from None
-    name, sep, member = arg.partition(".")
-    if not re.fullmatch(_TYPE_NAME_PATTERN, name):
-        raise ValueError(f"invalid type name: {name}")
-    if not re.fullmatch(_MEMBER_PATTERN, member):
-        raise ValueError(f"invalid member name: {member}")
-    return name, member
+    return _parse_type_name_and_member(arg)
 
 
 # Resolve a type offset parsed with _parse_type_offset_arg() to a number of
@@ -454,6 +470,20 @@ task = Object(prog, "struct task_struct *", address)
         else:
             assert arg[0] == "task"
             self._append_crash_task_context(arg[1])
+
+    def append_task_header(self, indent: str = "") -> None:
+        """Append code for getting basic information about a task."""
+        self.add_from_import("drgn.helpers.linux.sched", "task_cpu")
+        self.append(
+            textwrap.indent(
+                """\
+pid = task.pid
+cpu = task_cpu(task)
+command = task.comm
+""",
+                indent,
+            )
+        )
 
     def append_cpuspec(self, cpuspec: Cpuspec, loop_body: str) -> None:
         """
