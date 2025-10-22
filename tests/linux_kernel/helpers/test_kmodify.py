@@ -2,14 +2,17 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 import os
+from pathlib import Path
 import random
 import unittest
 
 from _drgn_util.platform import NORMALIZED_MACHINE_NAME
-from drgn import FaultError, Object
+from drgn import NULL, FaultError, Object
 from drgn.helpers.experimental.kmodify import (
     call_function,
+    clear_bit,
     pass_pointer,
+    set_bit,
     write_memory,
     write_object,
 )
@@ -272,6 +275,54 @@ class TestWriteMemory(LinuxKernelTestCase):
 
 @skip_unless_have_test_kmod
 @skip_unless_have_kmodify
+class TestSetClearBit(LinuxKernelTestCase):
+    BITMAP_PATH = Path("/sys/module/drgn_test/parameters/kmodify_bitmap")
+
+    def test_set_bit(self):
+        self.BITMAP_PATH.write_text("11389675720307120785,15873051463709375381\n")
+
+        set_bit(3, self.prog["drgn_kmodify_test_bitmap"])
+        self.assertEqual(
+            self.BITMAP_PATH.read_text().strip(),
+            "11389675720307120793,15873051463709375381",
+        )
+
+        set_bit(125, self.prog["drgn_kmodify_test_bitmap"])
+        self.assertEqual(
+            self.BITMAP_PATH.read_text().strip(),
+            "11389675720307120793,18178894472923069333",
+        )
+
+    def test_clear_bit(self):
+        self.BITMAP_PATH.write_text("11389675720307120785,15873051463709375381\n")
+
+        clear_bit(66, self.prog["drgn_kmodify_test_bitmap"])
+        self.assertEqual(
+            self.BITMAP_PATH.read_text().strip(),
+            "11389675720307120785,15873051463709375377",
+        )
+
+        clear_bit(59, self.prog["drgn_kmodify_test_bitmap"])
+        self.assertEqual(
+            self.BITMAP_PATH.read_text().strip(),
+            "10813214968003697297,15873051463709375377",
+        )
+
+    def test_type_error(self):
+        self.assertRaises(TypeError, set_bit, 3, self.prog["drgn_kmodify_test_memory"])
+        self.assertRaises(
+            TypeError,
+            clear_bit,
+            3,
+            self.prog["drgn_kmodify_test_bitmap"].address_,
+        )
+
+    def test_fault(self):
+        self.assertRaises(FaultError, set_bit, 0, NULL(self.prog, "unsigned long *"))
+
+
+@skip_unless_have_test_kmod
+@skip_unless_have_kmodify
 class TestWriteObject(LinuxKernelTestCase):
     def test_python_value(self):
         value = random.randrange(2**31)
@@ -322,4 +373,42 @@ class TestWriteObject(LinuxKernelTestCase):
             self.prog["drgn_kmodify_test_int"],
             0,
             dereference=True,
+        )
+
+    def test_bit_field_size_1(self):
+        for i in range(3):
+            with self.subTest(i=i):
+                write_object(self.prog["drgn_kmodify_test_bit_field"].bit, i)
+                self.assertFalse(self.prog["drgn_kmodify_test_bit_field"].expect0_1)
+                self.assertTrue(self.prog["drgn_kmodify_test_bit_field"].expect1_1)
+                self.assertEqual(
+                    self.prog["drgn_kmodify_test_bit_field"].bit.value_(), i % 2
+                )
+                self.assertFalse(self.prog["drgn_kmodify_test_bit_field"].expect0_2)
+                self.assertTrue(self.prog["drgn_kmodify_test_bit_field"].expect1_2)
+
+    def test_byte_aligned_bit_field(self):
+        for i in range(3):
+            with self.subTest(i=i):
+                write_object(self.prog["drgn_kmodify_test_bit_field"].byte_aligned, i)
+                self.assertFalse(self.prog["drgn_kmodify_test_bit_field"].expect0_1)
+                self.assertTrue(self.prog["drgn_kmodify_test_bit_field"].expect1_1)
+                self.assertEqual(
+                    self.prog["drgn_kmodify_test_bit_field"].byte_aligned.value_(), i
+                )
+                self.assertFalse(self.prog["drgn_kmodify_test_bit_field"].expect0_2)
+                self.assertTrue(self.prog["drgn_kmodify_test_bit_field"].expect1_2)
+
+    def test_unsupported_bit_field(self):
+        self.assertRaises(
+            NotImplementedError,
+            write_object,
+            self.prog["drgn_kmodify_test_bit_field"].two_bits,
+            1,
+        )
+        self.assertRaises(
+            NotImplementedError,
+            write_object,
+            self.prog["drgn_kmodify_test_bit_field"].unaligned,
+            1,
         )
