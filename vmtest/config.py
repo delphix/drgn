@@ -48,7 +48,7 @@ SUPPORTED_KERNEL_VERSIONS = (
     "4.9",
 )
 
-KERNEL_ORG_COMPILER_VERSION = "12.2.0"
+KERNEL_ORG_COMPILER_VERSION = "12.5.0"
 
 
 BASE_KCONFIG = """
@@ -129,6 +129,9 @@ CONFIG_CGROUPS=y
 # CONFIG_SOCK_CGROUP_DATA, but that's only present since Linux kernel commit
 # 3007098494be ("cgroup: add support for eBPF programs") (in v4.10)).
 CONFIG_CGROUP_NET_CLASSID=y
+
+# For ipc tests.
+CONFIG_SYSVIPC=y
 
 # For kconfig tests.
 CONFIG_IKCONFIG=m
@@ -453,7 +456,7 @@ def kconfig_localversion(arch: Architecture, flavor: KernelFlavor, version: str)
     vmtest_kernel_version = [
         # Increment the major version to rebuild every
         # architecture/flavor/version combination.
-        37,
+        38,
         # The minor version makes the default flavor the "latest" version.
         1 if flavor.name == "default" else 0,
     ]
