@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include <assert.h>
+#include <ctype.h>
 #include <elf.h>
 #include <elfutils/libdw.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "cfi.h"
+#include "cleanup.h"
 #include "debug_info.h"
 #include "drgn_internal.h"
 #include "dwarf_constants.h"
@@ -226,6 +229,54 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 	return NULL;
 }
 
+static struct drgn_error *
+drgn_format_stack_frame_source_impl(struct drgn_stack_trace *trace, size_t frame,
+				    struct string_builder *sb)
+{
+	struct drgn_error *err;
+
+	{
+		_cleanup_free_ char *name = NULL;
+		err = drgn_stack_frame_source_name(trace, frame, &name);
+		if (err)
+			return err;
+
+		if (!string_builder_append(sb, name ? name : "???"))
+			return &drgn_enomem;
+	}
+
+	int line, column;
+	const char *filename = drgn_stack_frame_source(trace, frame, &line,
+						       &column);
+	if (filename && column) {
+		if (!string_builder_appendf(sb, " at %s:%d:%d", filename, line,
+					    column))
+			return &drgn_enomem;
+	} else if (filename) {
+		if (!string_builder_appendf(sb, " at %s:%d", filename, line))
+			return &drgn_enomem;
+	} else {
+		if (!string_builder_append(sb, " at ??:?"))
+			return &drgn_enomem;
+	}
+	return NULL;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_format_stack_frame_source(struct drgn_stack_trace *trace, size_t frame,
+			       char **ret)
+{
+	struct drgn_error *err;
+	STRING_BUILDER(sb);
+	err = drgn_format_stack_frame_source_impl(trace, frame, &sb);
+	if (err)
+		return err;
+	if (!string_builder_null_terminate(&sb))
+		return &drgn_enomem;
+	*ret = string_builder_steal(&sb);
+	return NULL;
+}
+
 LIBDRGN_PUBLIC
 struct drgn_error *drgn_stack_frame_name(struct drgn_stack_trace *trace,
 					 size_t frame, char **ret)
@@ -269,6 +320,38 @@ const char *drgn_stack_frame_function_name(struct drgn_stack_trace *trace,
 	if (function_scope >= num_scopes)
 		return NULL;
 	return dwarf_diename(&scopes[function_scope]);
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_stack_frame_source_name(struct drgn_stack_trace *trace, size_t frame,
+			     char **ret)
+{
+	struct drgn_error *err;
+	char *name = NULL;
+	const char *function_name = drgn_stack_frame_function_name(trace, frame);
+	if (function_name) {
+		name = strdup(function_name);
+		if (!name)
+			return &drgn_enomem;
+	} else {
+		struct drgn_register_state *regs = trace->frames[frame].regs;
+		struct optional_uint64 pc = drgn_register_state_get_pc(regs);
+		if (pc.has_value) {
+			_cleanup_symbol_ struct drgn_symbol *sym = NULL;
+			err = drgn_program_find_symbol_by_address_internal(trace->prog,
+									   pc.value - !regs->interrupted,
+									   &sym);
+			if (err)
+				return err;
+			if (sym) {
+				name = strdup(sym->name);
+				if (!name)
+					return &drgn_enomem;
+			}
+		}
+	}
+	*ret = name;
+	return NULL;
 }
 
 LIBDRGN_PUBLIC bool drgn_stack_frame_is_inline(struct drgn_stack_trace *trace,
@@ -351,11 +434,14 @@ drgn_stack_frame_source(struct drgn_stack_trace *trace, size_t frame,
 		Dwarf_Line *line = dwarf_getsrc_die(&cu_die, pc.value);
 		if (!line)
 			return NULL;
-		if (line_ret)
-			dwarf_lineno(line, line_ret);
-		if (column_ret)
-			dwarf_linecol(line, column_ret);
-		return dwarf_linesrc(line, NULL, NULL);
+		const char *filename = dwarf_linesrc(line, NULL, NULL);
+		if (filename) {
+			if (line_ret)
+				dwarf_lineno(line, line_ret);
+			if (column_ret)
+				dwarf_linecol(line, column_ret);
+		}
+		return filename;
 	} else {
 		return NULL;
 	}
@@ -1331,4 +1417,248 @@ drgn_thread_stack_trace(struct drgn_thread *thread,
 				    ? &thread->object : NULL,
 				    thread->prstatus.str ? &thread->prstatus : NULL,
 				    ret);
+}
+
+// struct drgn_source_location_list is a lie. struct drgn_stack_trace already
+// tracks everything we need for it, so we cast it to a fake type and provide
+// functions that operate on that fake type (which mainly wrap stack trace
+// functions).
+static struct drgn_stack_trace *
+locs_to_trace(struct drgn_source_location_list *locs)
+{
+	return (struct drgn_stack_trace *)locs;
+}
+
+LIBDRGN_PUBLIC
+void drgn_source_location_list_destroy(struct drgn_source_location_list *locs)
+{
+	drgn_stack_trace_destroy(locs_to_trace(locs));
+}
+
+LIBDRGN_PUBLIC struct drgn_program *
+drgn_source_location_list_program(struct drgn_source_location_list *locs)
+{
+	return drgn_stack_trace_program(locs_to_trace(locs));
+}
+
+LIBDRGN_PUBLIC
+size_t drgn_source_location_list_length(struct drgn_source_location_list *locs)
+{
+	return locs_to_trace(locs)->num_frames;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_format_source_location_list(struct drgn_source_location_list *locs,
+				 char **ret)
+{
+	struct drgn_error *err;
+	struct drgn_stack_trace *trace = locs_to_trace(locs);
+	STRING_BUILDER(sb);
+	for (size_t frame = 0; frame < trace->num_frames; frame++) {
+		if (trace->num_frames > 1
+		    && !string_builder_appendf(&sb, "#%-2zu ", frame))
+			return &drgn_enomem;
+
+		err = drgn_format_stack_frame_source_impl(trace, frame, &sb);
+		if (err)
+			return err;
+
+		if (frame != trace->num_frames - 1
+		    && !string_builder_appendc(&sb, '\n'))
+			return &drgn_enomem;
+	}
+	if (!string_builder_null_terminate(&sb))
+		return &drgn_enomem;
+	*ret = string_builder_steal(&sb);
+	return NULL;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_format_source_location_list_at(struct drgn_source_location_list *locs,
+				    size_t i, char **ret)
+{
+	struct drgn_error *err;
+	STRING_BUILDER(sb);
+	err = drgn_format_stack_frame_source_impl(locs_to_trace(locs), i, &sb);
+	if (err)
+		return err;
+	if (!string_builder_null_terminate(&sb))
+		return &drgn_enomem;
+	*ret = string_builder_steal(&sb);
+	return NULL;
+}
+
+LIBDRGN_PUBLIC const char *
+drgn_source_location_list_source_at(struct drgn_source_location_list *locs,
+				    size_t i, int *line_ret, int *column_ret)
+{
+	return drgn_stack_frame_source(locs_to_trace(locs), i, line_ret,
+				       column_ret);
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_source_location_list_name_at(struct drgn_source_location_list *locs,
+				  size_t i, char **ret)
+{
+	return drgn_stack_frame_source_name(locs_to_trace(locs), i, ret);
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_program_source_location(struct drgn_program *prog, uint64_t address,
+			     struct drgn_source_location_list **ret)
+{
+	struct drgn_error *err;
+	size_t trace_capacity = 1;
+	struct drgn_stack_trace *trace =
+		malloc_flexible_array(struct drgn_stack_trace, frames,
+				      trace_capacity);
+	if (!trace)
+		return &drgn_enomem;
+
+	trace->prog = prog;
+	trace->num_frames = 0;
+
+	struct drgn_register_state *regs =
+		drgn_register_state_create_impl(0, 0, true);
+	drgn_register_state_set_pc(prog, regs, address);
+	err = drgn_stack_trace_add_frames(&trace, &trace_capacity, regs);
+	if (err) {
+		drgn_stack_trace_destroy(trace);
+		return err;
+	}
+
+	if (!trace->frames[0].num_scopes) {
+		drgn_stack_trace_destroy(trace);
+		return drgn_error_create(DRGN_ERROR_LOOKUP,
+					 "source code location not found");
+	}
+
+	drgn_stack_trace_shrink_to_fit(&trace, trace_capacity);
+	*ret = (struct drgn_source_location_list *)trace;
+	return NULL;
+}
+
+struct drgn_error *drgn_parse_addr2line(const char *address_str,
+					const char **sym_name_ret,
+					size_t *sym_name_len_ret,
+					unsigned long long *offset_ret)
+{
+	const char *p = address_str;
+	while (isspace(*p))
+		p++;
+
+	if (!*p) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "expected symbol name or address");
+	}
+
+	const char *sym_name = p;
+	while (*p && !isspace(*p) && *p != '+')
+		p++;
+	size_t sym_name_len = p - sym_name;
+	if (sym_name_len == 0) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "expected symbol name");
+	}
+
+	while (isspace(*p))
+		p++;
+
+	unsigned long long offset = 0;
+	char *end;
+	if (*p == '+') {
+		p++;
+		while (isspace(*p))
+			p++;
+
+		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+			p += 2;
+			if (!isxdigit(*p)) {
+				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+							 "expected symbol offset");
+			}
+			errno = 0;
+			offset = strtoull(p, &end, 16);
+		} else {
+			if (!isdigit(*p)) {
+				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+							 "expected symbol offset");
+			}
+			errno = 0;
+			offset = strtoull(p, &end, 10);
+		}
+		if (errno == ERANGE) {
+			return drgn_error_create(DRGN_ERROR_OVERFLOW,
+						 "symbol offset out of range");
+		} else if (errno) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "invalid symbol offset");
+		} else if (end == p) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "expected symbol offset");
+		}
+		p = end;
+
+		while (isspace(*p))
+			p++;
+
+		if (*p) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "unexpected input after symbol offset");
+		}
+	} else if (*p) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "unexpected input after symbol name or address");
+	}
+
+	if (sym_name[0] == '0' && (sym_name[1] == 'x' || sym_name[1] == 'X')
+	    && isxdigit(sym_name[2])) {
+		errno = 0;
+		unsigned long long address = strtoull(sym_name + 2, &end, 16);
+		if (end == sym_name + sym_name_len) {
+			if (errno == ERANGE) {
+				return drgn_error_create(DRGN_ERROR_OVERFLOW,
+							 "address out of range");
+			} else if (!errno) {
+				sym_name = NULL;
+				sym_name_len = 0;
+				offset += address;
+			}
+		}
+	}
+
+	*sym_name_ret = sym_name;
+	*sym_name_len_ret = sym_name_len;
+	*offset_ret = offset;
+	return NULL;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_program_addr2line(struct drgn_program *prog,
+		       const char *address_str,
+		       struct drgn_source_location_list **ret)
+{
+	struct drgn_error *err;
+	const char *sym_name;
+	size_t sym_name_len;
+	unsigned long long offset;
+	err = drgn_parse_addr2line(address_str, &sym_name, &sym_name_len,
+				   &offset);
+	if (err)
+		return err;
+
+	uint64_t address = 0;
+	if (sym_name_len) {
+		_cleanup_free_ char *sym_name_copy = strndup(sym_name, sym_name_len);
+		if (!sym_name_copy)
+			return &drgn_enomem;
+
+		_cleanup_symbol_ struct drgn_symbol *sym = NULL;
+		err = drgn_program_find_symbol_by_name(prog, sym_name_copy, &sym);
+		if (err)
+			return err;
+		address = drgn_symbol_address(sym);
+	}
+
+	return drgn_program_source_location(prog, address + offset, ret);
 }

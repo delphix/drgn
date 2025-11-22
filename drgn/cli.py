@@ -39,6 +39,7 @@ _DRGN_GLOBALS = [
     "offsetof",
     "reinterpret",
     "sizeof",
+    "source_location",
     "stack_trace",
 ]
 
@@ -185,7 +186,16 @@ def _displayhook(value: Any) -> None:
         except drgn.FaultError as e:
             logger.warning("can't print value: %s", e)
             text = repr(value)
-    elif isinstance(value, (drgn.StackFrame, drgn.StackTrace, drgn.Type)):
+    elif isinstance(
+        value,
+        (
+            drgn.SourceLocation,
+            drgn.SourceLocationList,
+            drgn.StackFrame,
+            drgn.StackTrace,
+            drgn.Type,
+        ),
+    ):
         text = str(value)
     else:
         text = repr(value)

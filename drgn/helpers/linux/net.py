@@ -25,11 +25,13 @@ __all__ = (
     "SOCK_INODE",
     "SOCKET_I",
     "for_each_net",
+    "for_each_netdev",
     "get_net_ns_by_inode",
     "get_net_ns_by_fd",
     "netdev_for_each_tx_queue",
     "netdev_get_by_index",
     "netdev_get_by_name",
+    "netdev_name",
     "netdev_priv",
     "sk_fullsock",
     "sk_nulls_for_each",
@@ -132,6 +134,34 @@ def netdev_for_each_tx_queue(dev: Object) -> Iterator[Object]:
         yield dev._tx + i
 
 
+@takes_object_or_program_or_default
+def for_each_netdev(prog: Program, net: Optional[Object]) -> Iterator[Object]:
+    """
+    Iterate over all network devices in a namespace.
+
+    :param net: ``struct net *``. Defaults to the initial network namespace if
+        given a :class:`~drgn.Program` or :ref:`omitted <default-program>`.
+    :return: Iterator of ``struct net_device *`` objects.
+    """
+    if net is None:
+        net = prog["init_net"]
+    return list_for_each_entry(
+        "struct net_device", net.dev_base_head.address_of_(), "dev_list"
+    )
+
+
+def netdev_name(dev: Object) -> bytes:
+    """
+    Get the name of a network device.
+
+    >>> netdev_name(dev)
+    b'lo'
+
+    :param dev: ``struct net_device *``
+    """
+    return dev.name.string_()
+
+
 _NETDEV_HASHBITS = 8
 _NETDEV_HASHENTRIES = 1 << _NETDEV_HASHBITS
 
@@ -177,28 +207,9 @@ def netdev_get_by_name(
     if isinstance(name, str):
         name = name.encode()
 
-    # Since Linux kernel commit ff92741270bf ("net: introduce name_node struct
-    # to be used in hashlist") (in v5.5), the device name hash table contains
-    # struct netdev_name_node entries. Before that, it contained the struct
-    # net_device directly.
-    try:
-        entry_type = prog.type("struct netdev_name_node")
-        member = "hlist"
-        entry_is_name_node = True
-    except LookupError:
-        entry_type = prog.type("struct net_device")
-        member = "name_hlist"
-        entry_is_name_node = False
-
-    for i in range(_NETDEV_HASHENTRIES):
-        head = net.dev_name_head[i]
-        for entry in hlist_for_each_entry(entry_type, head, member):
-            if entry.name.string_() == name:
-                if entry_is_name_node:
-                    return entry.dev
-                else:
-                    return entry
-
+    for dev in for_each_netdev(net):
+        if netdev_name(dev) == name:
+            return dev
     return NULL(prog, "struct net_device *")
 
 

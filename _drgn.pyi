@@ -305,6 +305,41 @@ class Program:
         """
         ...
 
+    def source_location(
+        self, address: Union[IntegerLike, str], /
+    ) -> SourceLocationList:
+        """
+        Find the source code location containing a code address.
+
+        The address may be given as an integer or a string. A string argument
+        must be a symbol name or hexadecimal address, optionally followed by a
+        ``+`` character and a decimal or hexadecimal offset. Hexadecimal
+        numbers must be prefixed with "0x" or "0X". Whitespace between tokens
+        is ignored.
+
+        >>> prog.source_location("__schedule")
+        __schedule at kernel/sched/core.c:6646:1
+        >>> prog.source_location("__schedule+0x2b6")
+        #0  context_switch at kernel/sched/core.c:5381:9
+        #1  __schedule at kernel/sched/core.c:6765:8
+        >>> prog.source_location(0xffffffffb64d70a6)
+        #0  context_switch at kernel/sched/core.c:5381:9
+        #1  __schedule at kernel/sched/core.c:6765:8
+
+        Because of function inlining, a code address may actually correspond to
+        multiple source code locations. So, this returns a sequence of
+        locations, where the first item corresponds to the innermost inlined
+        function, the second item is its caller, etc.
+
+        .. note::
+
+            This is similar to :manpage:`addr2line(1)`.
+
+        :param address: Code address.
+        :raises LookupError: if the source code location is not found
+        """
+        ...
+
     @overload
     def type(self, name: str, filename: Optional[str] = None) -> Type:
         """
@@ -3189,11 +3224,10 @@ class StackFrame:
         """
         ...
 
-    def source(self) -> Tuple[str, int, int]:
+    def source(self) -> SourceLocation:
         """
         Get the source code location of this frame.
 
-        :return: Location as a ``(filename, line, column)`` triple.
         :raises LookupError: if the source code location is not available
         """
         ...
@@ -3227,6 +3261,79 @@ class StackFrame:
         """
         ...
 
+    def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
+
+# This isn't really a NamedTuple, but it's the best approximation since we
+# allow unpacking the attributes.
+class SourceLocation(NamedTuple):
+    """
+    File, line, and column location in source code.
+
+    The attributes can be accessed by name:
+
+    >>> filename = loc.filename
+    >>> line = loc.line
+    >>> column = loc.column
+
+    or unpacked:
+
+    >>> filename, line, column = loc
+
+    :class:`str() <str>` returns a pretty-printed location:
+
+    >>> loc
+    context_switch at kernel/sched/core.c:5381:9
+    """
+
+    filename: str
+    """Source file name, or empty string if unknown."""
+
+    line: int
+    """Source line number, or 0 if unknown."""
+
+    column: int
+    """Source column, or 0 if unknown."""
+
+    def name(self) -> Optional[str]:
+        """
+        Get the name of the function or symbol at this source location, or
+        ``None`` if it could not be determined.
+        """
+        ...
+
+    def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
+
+class SourceLocationList:
+    """
+    A :ref:`sequence <python:typesseq-common>` of :class:`SourceLocation`.
+
+    This is a read-only list of source code locations:
+
+    >>> locs = prog.source_location(0xffffffffb64d70a6)
+    >>> print(repr(locs))
+    <_drgn.SourceLocationList object at 0x7fb5d1f8e0e0>
+    >>> print(repr(locs[0]))
+    <_drgn.SourceLocation object at 0x7fb5d1feb8d0>
+    >>> print(repr(locs[1]))
+    <_drgn.SourceLocation object at 0x7fb5d1feb880>
+
+    For code address lookups where the address is in an inlined function, the
+    first item corresponds to the innermost inlined function, the second item
+    is its caller, etc.
+
+    :class:`str() <str>` returns a pretty-printed list of locations:
+
+    >>> locs
+    #0  context_switch at kernel/sched/core.c:5381:9
+    #1  __schedule at kernel/sched/core.c:6765:8
+    """
+
+    prog: Final[Program]
+    """Program that this source location list is from."""
+
+    def __getitem__(self, idx: IntegerLike) -> SourceLocation: ...
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[SourceLocation]: ...
     def _repr_pretty_(self, p: Any, cycle: bool) -> None: ...
 
 class Type:
@@ -3775,17 +3882,19 @@ class Qualifiers(enum.Flag):
     ATOMIC = ...
     """Atomic type."""
 
-def sizeof(__type_or_obj: Union[Type, Object]) -> int:
+def sizeof(type_or_obj: Union[Type, Object, str], /) -> int:
     """
     Get the size of a :class:`Type` or :class:`Object` in bytes.
 
-    :param type_or_obj: Entity to get the size of.
+    :param type_or_obj: Entity to get the size of. If given as a string, it is
+        looked up (first as a type, then as an object) in the
+        :ref:`default-program <default program>`.
     :raises TypeError: if the type does not have a size (e.g., because it is
         incomplete or void)
     """
     ...
 
-def alignof(__type: Type) -> int:
+def alignof(type: Union[Type, str], /) -> int:
     """
     Get the alignment requirement (in bytes) of a :class:`Type`.
 
@@ -3794,11 +3903,13 @@ def alignof(__type: Type) -> int:
     .. |alignof()| replace:: ``_Alignof()``
     .. _alignof(): https://en.cppreference.com/w/c/language/_Alignof
 
+    :param type: Type. If given as a string, it is looked up in the
+        :ref:`default-program <default program>`.
     :raises TypeError: if *type* is a function type or an incomplete type
     """
     ...
 
-def offsetof(type: Type, member: str) -> int:
+def offsetof(type: Union[Type, str], member: str) -> int:
     """
     Get the offset (in bytes) of a member in a :class:`Type`.
 
@@ -3807,7 +3918,8 @@ def offsetof(type: Type, member: str) -> int:
     .. |offsetof()| replace:: ``offsetof()``
     .. _offsetof(): https://en.cppreference.com/w/c/types/offsetof
 
-    :param type: Structure, union, or class type.
+    :param type: Structure, union, or class type. If given as a string, it is
+        looked up in the :ref:`default-program <default program>`.
     :param member: Name of member. May include one or more member references
         and zero or more array subscripts.
     :raises TypeError: if *type* is not a structure, union, or class type

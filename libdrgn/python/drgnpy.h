@@ -208,6 +208,21 @@ typedef struct {
 
 typedef struct {
 	PyObject_HEAD
+	PyObject *filename;
+	PyObject *line;
+	PyObject *column;
+	PyObject *obj;
+	size_t i;
+	bool is_stack_trace;
+} SourceLocation;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_source_location_list *locs;
+} SourceLocationList;
+
+typedef struct {
+	PyObject_HEAD
 	struct drgn_stack_trace *trace;
 } StackTrace;
 
@@ -301,6 +316,8 @@ extern PyTypeObject Program_type;
 extern PyTypeObject Register_type;
 extern PyTypeObject RelocatableModule_type;
 extern PyTypeObject SharedLibraryModule_type;
+extern PyTypeObject SourceLocationList_type;
+extern PyTypeObject SourceLocation_type;
 extern PyTypeObject StackFrame_type;
 extern PyTypeObject StackTrace_type;
 extern PyTypeObject SymbolIndex_type;
@@ -329,6 +346,17 @@ int init_logging(void);
 
 bool set_drgn_in_python(void);
 void clear_drgn_in_python(void);
+
+static inline void drgn_in_python_cleanup(bool *clearp)
+{
+	if (*clearp)
+		clear_drgn_in_python();
+}
+
+#define drgn_in_python_guard()							\
+	__attribute__((__cleanup__(drgn_in_python_cleanup), __unused__))	\
+	bool PP_UNIQUE(clear) = set_drgn_in_python()
+
 struct drgn_error *drgn_error_from_python(void);
 void *set_drgn_error(struct drgn_error *err);
 void *set_error_type_name(const char *format,
@@ -382,6 +410,10 @@ int Program_type_arg(Program *prog, PyObject *type_obj, bool can_be_none,
 Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds);
 Program *program_from_kernel(PyObject *self);
 Program *program_from_pid(PyObject *self, PyObject *args, PyObject *kwds);
+
+PyObject *SourceLocation_wrap(const char *filename, int line, int column,
+			      PyObject *obj, size_t i, bool is_stack_trace);
+PyObject *SourceLocationList_wrap(struct drgn_source_location_list *locs);
 
 PyObject *Symbol_wrap(struct drgn_symbol *sym, PyObject *name_obj);
 PyObject *Symbol_list_wrap(struct drgn_symbol **symbols, size_t count,

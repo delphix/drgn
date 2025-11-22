@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "bitmap.h"
 #include "cleanup.h"
 #include "debug_info.h"
 #include "elf_file.h"
@@ -348,8 +349,6 @@ find_module_elf_symtab(struct drgn_module *module)
 static size_t elf_symbol_shndx(struct drgn_elf_symbol_table *symtab,
 			       size_t sym_idx, const GElf_Sym *sym)
 {
-	if (sym->st_shndx < SHN_LORESERVE)
-		return sym->st_shndx;
 	if (sym->st_shndx == SHN_XINDEX
 	    && symtab->shndx
 	    && sym_idx < symtab->shndx->d_size / sizeof(uint32_t)) {
@@ -362,7 +361,7 @@ static size_t elf_symbol_shndx(struct drgn_elf_symbol_table *symtab,
 			tmp = bswap_32(tmp);
 		return tmp;
 	}
-	return SHN_UNDEF;
+	return sym->st_shndx;
 }
 
 static bool elf_symbol_address(struct drgn_elf_symbol_table *symtab,
@@ -391,15 +390,28 @@ static bool elf_symbol_address(struct drgn_elf_symbol_table *symtab,
 		addr += symtab->bias;
 	if (symtab->file->is_relocatable) {
 		size_t shndx = elf_symbol_shndx(symtab, sym_idx, sym);
-		if (shndx == SHN_UNDEF)
+		if (shndx != SHN_UNDEF
+		    && (shndx < SHN_LORESERVE || shndx > SHN_HIRESERVE)) {
+			Elf_Scn *scn = elf_getscn(symtab->file->elf, shndx);
+			if (!scn)
+				return false;
+			// If the section's address is not known, then the
+			// symbol is essentially undefined, so ignore it. This
+			// filters out things like symbols from the .init*
+			// sections in Linux kernel modules which are unloaded
+			// after initialization.
+			// NB: shndx is bounds-checked by elf_getscn().
+			if (!drgn_bitmap_test_bit(symtab->file->sections_with_address,
+						  shndx))
+				return false;
+			GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn,
+								 &shdr_mem);
+			if (!shdr)
+				return false;
+			addr += shdr->sh_addr;
+		} else if (shndx != SHN_ABS) {
 			return false;
-		Elf_Scn *scn = elf_getscn(symtab->file->elf, shndx);
-		if (!scn)
-			return false;
-		GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
-		if (!shdr)
-			return false;
-		addr += shdr->sh_addr;
+		}
 	}
 	*ret = addr;
 	return true;
@@ -482,7 +494,8 @@ static bool addr_in_sym_section(struct drgn_elf_symbol_table *symtab,
 				uint64_t unbiased_addr)
 {
 	size_t shndx = elf_symbol_shndx(symtab, sym_idx, sym);
-	if (shndx == SHN_UNDEF)
+	if (shndx == SHN_UNDEF
+	    || (SHN_LORESERVE <= shndx && shndx <= SHN_HIRESERVE))
 		return false;
 	Elf_Scn *scn = elf_getscn(symtab->file->elf, shndx);
 	if (!scn)

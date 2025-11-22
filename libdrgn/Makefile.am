@@ -50,6 +50,7 @@ libdrgn_common_la_SOURCES = $(ARCH_DEFS_PYS:_defs.py=.c) \
 			    binary_buffer.h \
 			    binary_search.h \
 			    binary_search_tree.h \
+			    bitmap.h \
 			    bitops.h \
 			    c_keywords.inc \
 			    c_lexer.h \
@@ -175,6 +176,7 @@ libdrgn_common_python_la_SOURCES = python/constants.c \
 				   python/platform.c \
 				   python/plugins.c \
 				   python/program.c \
+				   python/source_location.c \
 				   python/stack_trace.c \
 				   python/symbol.c \
 				   python/symbol_index.c \
@@ -269,11 +271,13 @@ examples_load_debug_info_LDADD = $(libdrgn_libs)
 TESTS = $(check_PROGRAMS)
 
 check_PROGRAMS = tests/binary_search \
+		 tests/bitmap \
 		 tests/cityhash \
 		 tests/crc32 \
 		 tests/hexlify \
 		 tests/language_c \
 		 tests/lexer \
+		 tests/parse_addr2line \
 		 tests/path \
 		 tests/recursion_guard \
 		 tests/serialize
@@ -295,6 +299,9 @@ test_ldadd = $(check_LIBS) $(libdrgn_libs)
 tests_binary_search_CFLAGS = $(test_cflags)
 tests_binary_search_CPPFLAGS = $(test_cppflags)
 tests_binary_search_LDADD = $(test_ldadd)
+tests_bitmap_CFLAGS = $(test_cflags)
+tests_bitmap_CPPFLAGS = $(test_cppflags)
+tests_bitmap_LDADD = $(test_ldadd)
 tests_cityhash_CFLAGS = $(test_cflags)
 tests_cityhash_CPPFLAGS = $(test_cppflags)
 tests_cityhash_LDADD = $(test_ldadd)
@@ -310,6 +317,9 @@ tests_language_c_LDADD = $(test_ldadd)
 tests_lexer_CFLAGS = $(test_cflags)
 tests_lexer_CPPFLAGS = $(test_cppflags)
 tests_lexer_LDADD = $(test_ldadd)
+tests_parse_addr2line_CFLAGS = $(test_cflags)
+tests_parse_addr2line_CPPFLAGS = $(test_cppflags)
+tests_parse_addr2line_LDADD = $(test_ldadd)
 tests_path_CFLAGS = $(test_cflags)
 tests_path_CPPFLAGS = $(test_cppflags)
 tests_path_LDADD = $(test_ldadd)
