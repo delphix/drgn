@@ -9,10 +9,20 @@ The ``drgn.helpers.linux.fs`` module provides helpers for working with the
 Linux virtual filesystem (VFS) layer, including mounts, dentries, and inodes.
 """
 
+import operator
 import os
 from typing import Iterator, Optional, Tuple, Union, overload
 
-from drgn import IntegerLike, Object, Path, Program, TypeKind, container_of, sizeof
+from drgn import (
+    IntegerLike,
+    Object,
+    Path,
+    Program,
+    TypeKind,
+    cast,
+    container_of,
+    sizeof,
+)
 from drgn.helpers.common.format import escape_ascii_string
 from drgn.helpers.common.prog import takes_object_or_program_or_default
 from drgn.helpers.linux.list import (
@@ -21,21 +31,25 @@ from drgn.helpers.linux.list import (
     list_for_each_entry,
 )
 from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
+from drgn.helpers.linux.xarray import xa_for_each, xa_is_value
 
 __all__ = (
-    "path_lookup",
+    "address_space_for_each_page",
     "d_path",
+    "decode_file_type",
     "dentry_path",
-    "inode_path",
-    "inode_paths",
-    "mount_src",
-    "mount_dst",
-    "mount_fstype",
-    "for_each_mount",
-    "print_mounts",
     "fget",
     "for_each_file",
+    "for_each_mount",
+    "inode_for_each_page",
+    "inode_path",
+    "inode_paths",
+    "mount_dst",
+    "mount_fstype",
+    "mount_src",
+    "path_lookup",
     "print_files",
+    "print_mounts",
     "super_block_for_each_mount",
 )
 
@@ -298,6 +312,42 @@ def inode_paths(inode: Object) -> Iterator[bytes]:
     )
 
 
+def inode_for_each_page(inode: Object) -> Iterator[Tuple[int, Object]]:
+    """
+    Iterate over all cached pages and their indices in an inode.
+
+    >>> for index, page in inode_for_each_page(inode):
+    ...     print(index, hex(page))
+    ...
+    0 0xffffcfde4d0b6b00
+    1 0xffffcfde4d0bda40
+    3 0xffffcfde4d0b8b80
+
+    :param inode: ``struct inode *``
+    :return: Iterator of (index, ``struct page *`` object) tuples.
+    """
+    return address_space_for_each_page(inode.i_mapping.read_())
+
+
+def address_space_for_each_page(mapping: Object) -> Iterator[Tuple[int, Object]]:
+    """
+    Iterate over all cached pages and their indices in an inode address space.
+
+    :param mapping: ``struct address_space *``
+    :return: Iterator of (index, ``struct page *`` object) tuples.
+    """
+    try:
+        i_pages = mapping.i_pages
+    except AttributeError:
+        # i_pages was renamed from page_tree in Linux kernel commit
+        # b93b016313b3 ("page cache: use xa_lock") (in v4.17).
+        i_pages = mapping.page_tree
+    page_type = mapping.prog_.type("struct page *")
+    for index, entry in xa_for_each(i_pages.address_of_()):
+        if not xa_is_value(entry):  # Skip shadow entries.
+            yield index, cast(page_type, entry)
+
+
 def mount_src(mnt: Object) -> bytes:
     """
     Get the source device name for a mount.
@@ -474,3 +524,32 @@ def print_files(task: Object) -> None:
         path = d_path(file.f_path)
         escaped_path = escape_ascii_string(path, escape_backslash=True)
         print(f"{fd} {escaped_path} ({file.type_.type_name()})0x{file.value_():x}")
+
+
+# From include/uapi/linux/stat.h in the Linux kernel source code.
+_S_IFMT = 0o170000
+_S_IFMT_TO_STR = {
+    0o140000: "SOCK",
+    0o120000: "LNK",
+    0o100000: "REG",
+    0o060000: "BLK",
+    0o040000: "DIR",
+    0o020000: "CHR",
+    0o010000: "FIFO",
+}
+
+
+def decode_file_type(mode: IntegerLike) -> str:
+    """
+    Convert a file mode to a human-readable file type string.
+
+    :param mode: File mode (e.g., ``struct inode::i_mode`` or
+        :attr:`os.stat_result.st_mode`).
+    :return: File type as a string (e.g., "REG", "DIR", "CHR", etc.), or a raw
+        octal value if unknown.
+    """
+    fmt = operator.index(mode) & _S_IFMT
+    try:
+        return _S_IFMT_TO_STR[fmt]
+    except KeyError:
+        return f"{fmt:06o}"
