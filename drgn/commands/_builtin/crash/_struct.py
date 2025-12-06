@@ -5,7 +5,6 @@
 
 import argparse
 import functools
-import shutil
 import sys
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -15,6 +14,8 @@ from drgn.commands.crash import (
     Cpuspec,
     CrashDrgnCodeBuilder,
     _guess_type,
+    _guess_type_name,
+    _object_format_options,
     _parse_members,
     _parse_type_name_and_members,
     _parse_type_offset_arg,
@@ -141,10 +142,7 @@ address = prog.symbol({_repr_black(address_or_symbol)}).address{subtract_offset}
             offset_type_name = type_name
         else:
             code.add_from_import("drgn", "reinterpret")
-            try:
-                offset_type_name = _guess_type(prog, offset_name).type_name()
-            except LookupError:
-                offset_type_name = "struct " + offset_name
+            offset_type_name = _guess_type_name(prog, offset_name)
             if object_or_pointer == "object":
                 after += f'\n{pcpu_prefix}object = reinterpret("{type_name}", {pcpu_prefix}object)'
             else:
@@ -346,11 +344,7 @@ def _crash_cmd_struct(
                 print(f"[{cpu}]: {pcpu_ptr.value_():x}")
                 yield pcpu_ptr[sl]
 
-    format_options = {
-        "columns": shutil.get_terminal_size().columns,
-        "dereference": False,
-        "integer_base": args.integer_base or prog.config.get("crash_radix", 10),
-    }
+    format_options = _object_format_options(prog, args.integer_base)
     for arr in arrays():
         for i, obj in enumerate(arr):
             if i != 0:
@@ -556,11 +550,7 @@ def _crash_cmd_task(
                 code.append("thread_info = task_thread_info(task)\n")
         return code.print()
 
-    format_options = {
-        "columns": shutil.get_terminal_size().columns,
-        "dereference": False,
-        "integer_base": args.integer_base or prog.config.get("crash_radix", 10),
-    }
+    format_options = _object_format_options(prog, args.integer_base)
 
     first = True
     for task_arg in task_args:
