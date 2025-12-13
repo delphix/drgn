@@ -21,6 +21,7 @@ from drgn.commands import (
     CommandNamespace,
     CommandNotFoundError,
     CustomCommandFuncDecorator,
+    DrgnCodeBlockContext,
     DrgnCodeBuilder,
     _unquote,
     command,
@@ -92,6 +93,16 @@ def _object_format_options(
         "dereference": False,
         "integer_base": integer_base or prog.config.get("crash_radix", 10),
     }
+
+
+def _format_seconds_duration(seconds: int) -> str:
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if days:
+        return f"{days} days, {hours:02}:{minutes:02}:{seconds:02}"
+    else:
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
 def _find_pager(which: Optional[str] = None) -> Optional[List[str]]:
@@ -259,10 +270,14 @@ def crash_get_context(
 
 def print_task_header(task: Object) -> None:
     """Print basic information about a task in the same format as crash."""
+    _print_task_header(task, cpu=task_cpu(task))
+
+
+def _print_task_header(task: Object, *, cpu: int) -> None:
     print(
         f"PID: {task.pid.value_():<7}  "
         f"TASK: {task.value_():x}  "
-        f"CPU: {task_cpu(task)}  "
+        f"CPU: {cpu}  "
         f"COMMAND: {double_quote_ascii_string(task.comm.string_())}"
     )
 
@@ -520,41 +535,41 @@ task = Object(prog, "struct task_struct *", address)
             assert arg[0] == "task"
             self._append_crash_task_context(arg[1])
 
-    def append_task_header(self, indent: str = "") -> None:
+    def append_task_header(self, indent: str = "", *, variable: str = "task") -> None:
         """Append code for getting basic information about a task."""
         self.add_from_import("drgn.helpers.linux.sched", "task_cpu")
         self.append(
             textwrap.indent(
-                """\
-pid = task.pid
-cpu = task_cpu(task)
-command = task.comm
+                f"""\
+pid = {variable}.pid
+cpu = task_cpu({variable})
+command = {variable}.comm
 """,
                 indent,
             )
         )
 
-    def append_cpuspec(self, cpuspec: Cpuspec, loop_body: str) -> None:
+    def begin_cpuspec_loop(self, cpuspec: Cpuspec) -> DrgnCodeBlockContext:
         """
-        Append code to be executed for each CPU in a CPU specifier.
+        Begin a loop over each CPU in a CPU specifier.
+
+        This must be paired with
+        :meth:`~drgn.commands.DrgnCodeBuilder.end_block()` or used as a context
+        manager.
 
         :param cpuspec: CPU specifier parsed by :func:`parse_cpuspec()`.
-        :param loop_body: Code to add for each CPU. Will be indented if
-            needed.
         """
         if cpuspec.current:
             self.add_from_import("drgn.helpers.linux.sched", "task_cpu")
             self.append_crash_context()
             self.append("cpu = task_cpu(task)\n")
-            self.append(loop_body)
-            return
+            return self.begin_block("")
 
         if cpuspec.all:
             self.add_from_import("drgn.helpers.linux.cpumask", "for_each_possible_cpu")
-            self.append("for cpu in for_each_possible_cpu():\n")
+            return self.begin_block("for cpu in for_each_possible_cpu():\n")
         else:
-            self.append(f"for cpu in {cpuspec.cpus(self._prog)!r}:\n")
-        self.append(textwrap.indent(loop_body, "    "))
+            return self.begin_block(f"for cpu in {cpuspec.cpus(self._prog)!r}:\n")
 
     def append_cpuspec_list(self, cpuspec: Cpuspec) -> bool:
         """

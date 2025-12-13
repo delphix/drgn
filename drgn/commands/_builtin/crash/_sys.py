@@ -22,11 +22,12 @@ from typing import (
 )
 
 from drgn import Architecture, Object, Program
-from drgn.commands import argument, drgn_argument, mutually_exclusive_group
+from drgn.commands import _repr_black, argument, drgn_argument, mutually_exclusive_group
 from drgn.commands.crash import (
     Cpuspec,
     CrashDrgnCodeBuilder,
     _crash_get_panic_context,
+    _format_seconds_duration,
     crash_command,
     crash_get_context,
     parse_cpuspec,
@@ -56,6 +57,7 @@ from drgn.helpers.linux.mm import totalram_pages
 from drgn.helpers.linux.panic import panic_message, panic_task
 from drgn.helpers.linux.percpu import per_cpu
 from drgn.helpers.linux.pid import for_each_task
+from drgn.helpers.linux.printk import print_dmesg
 from drgn.helpers.linux.sched import (
     get_task_state,
     loadavg,
@@ -199,22 +201,7 @@ offline_cpus = cpus - num_online_cpus()
         self.code.append("uptime_ = uptime()\n")
 
     def _get_uptime(self) -> str:
-        seconds = ktime_get_boottime_seconds(self.prog).value_()
-
-        if seconds >= 24 * 60 * 60:
-            days = seconds // (24 * 60 * 60)
-            seconds -= days * (24 * 60 * 60)
-            days_str = f"{days} days, "
-        else:
-            days_str = ""
-
-        hours = seconds // (60 * 60)
-        seconds -= hours * (60 * 60)
-
-        minutes = seconds // 60
-        seconds %= 60
-
-        return f"{days_str}{hours:02}:{minutes:02}:{seconds:02}"
+        return _format_seconds_duration(ktime_get_boottime_seconds(self.prog).value_())
 
     def _append_load_average(self) -> None:
         self.code.add_from_import("drgn.helpers.linux.sched", "loadavg")
@@ -744,3 +731,46 @@ def _crash_cmd_irq(
 
     if len(rows) > 1:
         print_table(rows)
+
+
+@crash_command(
+    description="Dump kernel dmesg",
+    arguments=(
+        mutually_exclusive_group(
+            argument(
+                "-T",
+                dest="timestamps",
+                action="store_const",
+                const="human",
+                default=True,
+                help="Dump kernel dmesg in human readable time",
+            ),
+            argument(
+                "-t",
+                dest="timestamps",
+                action="store_false",
+                default=argparse.SUPPRESS,
+                help="Dump kernel dmesg without timestamp",
+            ),
+        ),
+        drgn_argument,
+    ),
+)
+def _crash_cmd_log(
+    prog: Program, name: str, args: argparse.Namespace, **kwargs: Any
+) -> None:
+    if args.drgn:
+        code = CrashDrgnCodeBuilder(prog)
+        code.add_from_import("drgn.helpers.linux.printk", "get_dmesg")
+        code.append(
+            """\
+# Or print_dmesg() if you just want to print it.
+dmesg = get_dmesg("""
+        )
+        if isinstance(args.timestamps, str):
+            code.append(f"timestamps={_repr_black(args.timestamps)}")
+        elif not args.timestamps:
+            code.append("timestamps=False")
+        code.append(")\n")
+        return code.print()
+    print_dmesg(prog, timestamps=args.timestamps)

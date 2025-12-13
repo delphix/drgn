@@ -87,6 +87,8 @@ __all__ = (
     "for_each_vmap_area",
     "in_direct_map",
     "memory_block_size_bytes",
+    "mm_cmdline",
+    "mm_environ",
     "page_flags",
     "page_index",
     "page_size",
@@ -98,6 +100,7 @@ __all__ = (
     "phys_to_page",
     "phys_to_virt",
     "task_rss",
+    "task_vsize",
     "totalram_pages",
     "virt_to_page",
     "virt_to_pfn",
@@ -1529,8 +1532,17 @@ def cmdline(task: Object) -> Optional[List[bytes]]:
         supported <architecture support matrix>` for this architecture yet
     """
     mm = task.mm.read_()
-    if not mm:
-        return None
+    return mm_cmdline(mm) if mm else None
+
+
+def mm_cmdline(mm: Object) -> List[bytes]:
+    """
+    Like :func:`cmdline()`, but takes a (non-``NULL``) ``struct mm_struct *``
+    instead of a ``struct task_struct *``.
+
+    :param mm: ``struct mm_struct *``
+    """
+    mm = mm.read_()
     arg_start = mm.arg_start.value_()
     arg_end = mm.arg_end.value_()
     return access_remote_vm(mm, arg_start, arg_end - arg_start).split(b"\0")[:-1]
@@ -1557,8 +1569,17 @@ def environ(task: Object) -> Optional[List[bytes]]:
         supported <architecture support matrix>` for this architecture yet
     """
     mm = task.mm.read_()
-    if not mm:
-        return None
+    return mm_environ(mm) if mm else None
+
+
+def mm_environ(mm: Object) -> List[bytes]:
+    """
+    Like :func:`environ()`, but takes a (non-``NULL``) ``struct mm_struct *``
+    instead of a ``struct task_struct *``.
+
+    :param mm: ``struct mm_struct *``
+    """
+    mm = mm.read_()
     env_start = mm.env_start.value_()
     env_end = mm.env_end.value_()
     return access_remote_vm(mm, env_start, env_end - env_start).split(b"\0")[:-1]
@@ -1895,6 +1916,18 @@ def task_rss(prog: Program, task: Object) -> TaskRss:
                 shmemrss += rss_stat.count[MM_SHMEMPAGES].value_()
 
     return TaskRss(filerss, anonrss, shmemrss, swapents)
+
+
+def task_vsize(task: Object) -> int:
+    """
+    Return the virtual memory size of a task in bytes.
+
+    :param task: ``struct task_struct *``
+    """
+    mm = task.mm.read_()
+    if not mm:
+        return 0
+    return mm.total_vm.value_() * task.prog_["PAGE_SIZE"].value_()
 
 
 @takes_program_or_default

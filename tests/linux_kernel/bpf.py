@@ -3,6 +3,9 @@
 
 import array
 import ctypes
+import os
+import re
+import sys
 from typing import NamedTuple
 
 from _drgn_util.platform import SYS
@@ -164,6 +167,152 @@ BPF_F_ALLOW_MULTI = 1 << 1
 BPF_F_REPLACE = 1 << 2
 
 
+# Instruction classes.
+BPF_LD = 0x00
+BPF_LDX = 0x01
+BPF_ST = 0x02
+BPF_STX = 0x03
+BPF_ALU = 0x04
+BPF_JMP = 0x05
+BPF_RET = 0x06
+BPF_JMP32 = 0x06
+BPF_MISC = 0x07
+BPF_ALU64 = 0x07
+
+# ld/ldx fields.
+BPF_W = 0x00
+BPF_H = 0x08
+BPF_B = 0x10
+BPF_DW = 0x18
+BPF_IMM = 0x00
+BPF_ABS = 0x20
+BPF_IND = 0x40
+BPF_MEM = 0x60
+BPF_LEN = 0x80
+BPF_MSH = 0xA0
+BPF_MEMSX = 0x80
+BPF_ATOMIC = 0xC0
+BPF_XADD = 0xC0
+
+# alu/jmp fields.
+BPF_ADD = 0x00
+BPF_SUB = 0x10
+BPF_MUL = 0x20
+BPF_DIV = 0x30
+BPF_OR = 0x40
+BPF_AND = 0x50
+BPF_LSH = 0x60
+BPF_RSH = 0x70
+BPF_NEG = 0x80
+BPF_MOD = 0x90
+BPF_XOR = 0xA0
+
+BPF_JA = 0x00
+BPF_JEQ = 0x10
+BPF_JGT = 0x20
+BPF_JGE = 0x30
+BPF_JSET = 0x40
+BPF_K = 0x00
+BPF_X = 0x08
+
+BPF_MOV = 0xB0
+BPF_ARSH = 0xC0
+
+# Change endianness of a register.
+BPF_END = 0xD0
+BPF_TO_LE = 0x00
+BPF_TO_BE = 0x08
+BPF_FROM_LE = BPF_TO_LE
+BPF_FROM_BE = BPF_TO_BE
+
+# jmp encodings.
+BPF_JNE = 0x50
+BPF_JLT = 0xA0
+BPF_JLE = 0xB0
+BPF_JSGT = 0x60
+BPF_JSGE = 0x70
+BPF_JSLT = 0xC0
+BPF_JSLE = 0xD0
+BPF_JCOND = 0xE0
+BPF_CALL = 0x80
+BPF_EXIT = 0x90
+
+# atomic op type fields.
+BPF_FETCH = 0x01
+BPF_XCHG = 0xE0 | BPF_FETCH
+BPF_CMPXCHG = 0xF0 | BPF_FETCH
+
+BPF_LOAD_ACQ = 0x100
+BPF_STORE_REL = 0x110
+
+# Register numbers.
+BPF_REG_0 = 0
+BPF_REG_1 = 1
+BPF_REG_2 = 2
+BPF_REG_3 = 3
+BPF_REG_4 = 4
+BPF_REG_5 = 5
+BPF_REG_6 = 6
+BPF_REG_7 = 7
+BPF_REG_8 = 8
+BPF_REG_9 = 9
+BPF_REG_10 = 10
+
+MAX_BPF_REG = 11
+
+
+# Instruction encoding.
+def bpf_insn(*, code: int, dst_reg: int, src_reg: int, off: int, imm: int) -> int:
+    if code < 0 or code > 255:
+        raise ValueError(f"code {code} is out of range")
+    if dst_reg < 0 or dst_reg > 15:
+        raise ValueError(f"dst_reg {dst_reg} is out of range")
+    if src_reg < 0 or src_reg > 15:
+        raise ValueError(f"src_reg {src_reg} is out of range")
+    if off < -32768 or off > 32767:
+        raise ValueError(f"off {off} is out of range")
+    # Allow signed and unsigned 32-bit values.
+    if imm < -(2**31) or imm >= 2**32:
+        raise ValueError(f"imm {imm} is out of range")
+    if sys.byteorder == "little":
+        return (
+            code
+            | (dst_reg << 8)
+            | (src_reg << 12)
+            | ((off & 0xFFFF) << 16)
+            | ((imm & 0xFFFFFFFF) << 32)
+        )
+    else:
+        return (
+            (code << 56)
+            | (dst_reg << 52)
+            | (src_reg << 48)
+            | ((off & 0xFFFF) << 32)
+            | (imm & 0xFFFFFFFF)
+        )
+
+
+# Instructions.
+def BPF_MOV64_IMM(dst: int, imm: int) -> int:
+    return bpf_insn(
+        code=BPF_ALU64 | BPF_MOV | BPF_K,
+        dst_reg=dst,
+        src_reg=0,
+        off=0,
+        imm=imm,
+    )
+
+
+def BPF_EXIT_INSN() -> int:
+    return bpf_insn(
+        code=BPF_JMP | BPF_EXIT,
+        dst_reg=0,
+        src_reg=0,
+        off=0,
+        imm=0,
+    )
+
+
 class _bpf_attr_map_create(ctypes.Structure):
     _fields_ = (
         ("map_type", ctypes.c_uint32),
@@ -268,6 +417,18 @@ def bpf_map_create(map_type, key_size, value_size, max_entries):
     return _bpf(BPF_MAP_CREATE, attr)
 
 
+_LOG_BUF_SIZE = 65536
+
+
+class BpfVerifierError(OSError):
+    def __init__(self, *args, log) -> None:
+        super().__init__(*args)
+        self.log = log
+
+    def __str__(self) -> str:
+        return f"{super().__str__()}\n{self.log}"
+
+
 def bpf_prog_load(prog_type, insns, license, expected_attach_type=0):
     attr = _bpf_attr()
     attr.prog_type = prog_type
@@ -275,8 +436,37 @@ def bpf_prog_load(prog_type, insns, license, expected_attach_type=0):
     attr.insns, attr.insn_cnt = insns_array.buffer_info()
     ctypes_license = ctypes.c_char_p(license)
     attr.license = ctypes.cast(ctypes_license, ctypes.c_void_p).value
+
+    attr.log_level = 1
+    attr.log_size = _LOG_BUF_SIZE
+    log_buf = ctypes.create_string_buffer(_LOG_BUF_SIZE)
+    attr.log_buf = ctypes.addressof(log_buf)
+
+    if prog_type == BPF_PROG_TYPE_KPROBE:
+        # Before Linux kernel commit 6c4fc209fcf9 ("bpf: remove useless version
+        # check for prog load") (in v5.0), for BPF_PROG_TYPE_KPROBE,
+        # kern_version must match the kernel's LINUX_VERSION_CODE.
+        match = re.match(r"([0-9]+)\.([0-9]+)\.([0-9]+)", os.uname().release)
+        if match:
+            attr.kern_version = (
+                (int(match.group(1)) << 16)
+                | (int(match.group(2)) << 8)
+                | min(int(match.group(3)), 255)
+            )
+
     attr.expected_attach_type = expected_attach_type
-    return _bpf(BPF_PROG_LOAD, attr)
+
+    ret = _syscall(
+        _SYS_bpf, ctypes.c_int(BPF_PROG_LOAD), ctypes.byref(attr), _sizeof_bpf_attr
+    )
+    if ret == -1:
+        errno = ctypes.get_errno()
+        log = log_buf.value
+        if log:
+            raise BpfVerifierError(errno, os.strerror(errno), log=log.decode())
+        else:
+            raise OSError(errno, os.strerror(errno))
+    return ret
 
 
 def bpf_prog_attach(target_fd, attach_bpf_fd, attach_type, attach_flags=0):
@@ -345,6 +535,79 @@ def bpf_prog_get_info_by_fd(bpf_fd):
     attr.info = ctypes.addressof(info)
     _bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
     return BpfProgInfo(type=info.type, id=info.id, tag=bytes(info.tag))
+
+
+class _bpf_map_info(ctypes.Structure):
+    _fields_ = (
+        ("type", ctypes.c_uint32),
+        ("id", ctypes.c_uint32),
+        ("key_size", ctypes.c_uint32),
+        ("value_size", ctypes.c_uint32),
+        ("max_entries", ctypes.c_uint32),
+        ("map_flags", ctypes.c_uint32),
+        ("name", ctypes.c_char * _BPF_OBJ_NAME_LEN),
+        ("ifindex", ctypes.c_uint32),
+        ("btf_vmlinux_value_type_id", ctypes.c_uint32),
+        ("netns_dev", ctypes.c_uint64),
+        ("netns_ino", ctypes.c_uint64),
+        ("btf_id", ctypes.c_uint32),
+        ("btf_key_type_id", ctypes.c_uint32),
+        ("btf_value_type_id", ctypes.c_uint32),
+        ("btf_vmlinux_id", ctypes.c_uint32),
+        ("map_extra", ctypes.c_uint64),
+        ("hash", ctypes.c_uint64),
+        ("hash_size", ctypes.c_uint32),
+    )
+
+
+class BpfMapInfo(NamedTuple):
+    type: int
+    id: int
+    key_size: int
+    value_size: int
+    max_entries: int
+    map_flags: int
+    name: bytes
+    ifindex: int
+    btf_vmlinux_value_type_id: int
+    netns_dev: int
+    netns_ino: int
+    btf_id: int
+    btf_key_type_id: int
+    btf_value_type_id: int
+    btf_vmlinux_id: int
+    map_extra: int
+    hash: int
+    hash_size: int
+
+
+def bpf_map_get_info_by_fd(bpf_fd):
+    attr = _bpf_attr()
+    attr.bpf_fd = bpf_fd
+    info = _bpf_map_info()
+    attr.info_len = ctypes.sizeof(info)
+    attr.info = ctypes.addressof(info)
+    _bpf(BPF_OBJ_GET_INFO_BY_FD, attr)
+    return BpfMapInfo(
+        type=info.type,
+        id=info.id,
+        key_size=info.key_size,
+        value_size=info.value_size,
+        max_entries=info.max_entries,
+        map_flags=info.map_flags,
+        name=info.name,
+        ifindex=info.ifindex,
+        btf_vmlinux_value_type_id=info.btf_vmlinux_value_type_id,
+        netns_dev=info.netns_dev,
+        netns_ino=info.netns_ino,
+        btf_id=info.btf_id,
+        btf_key_type_id=info.btf_key_type_id,
+        btf_value_type_id=info.btf_value_type_id,
+        btf_vmlinux_id=info.btf_vmlinux_id,
+        map_extra=info.map_extra,
+        hash=info.hash,
+        hash_size=info.hash_size,
+    )
 
 
 def bpf_link_create(prog_fd, target_fd, attach_type, flags=0):
