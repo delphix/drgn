@@ -6,15 +6,17 @@
 
 import argparse
 import builtins
+import contextlib
 import importlib
 import logging
 import os
 import os.path
+from pathlib import Path
 import pkgutil
 import runpy
 import shutil
 import sys
-from typing import IO, Any, Callable, Dict, Optional, Tuple
+from typing import IO, Any, Callable, Dict, Iterator, Optional, Tuple
 
 import drgn
 from drgn.internal.repl import interact, readline
@@ -144,6 +146,18 @@ def default_globals(prog: drgn.Program) -> Dict[str, Any]:
         for name in module.__dict__["__all__"]:
             init_globals[name] = getattr(module, name)
     return init_globals
+
+
+def _set_kernel_with_sudo_fallback(prog: drgn.Program) -> None:
+    try:
+        prog.set_kernel()
+        return
+    except PermissionError as e:
+        if shutil.which("sudo") is None:
+            sys.exit(
+                f"{e}\ndrgn debugs the live kernel by default, which requires root"
+            )
+    prog.set_core_dump(open_via_sudo("/proc/kcore", os.O_RDONLY))
 
 
 def _identify_script(path: str) -> str:
@@ -606,15 +620,7 @@ def _main() -> None:
                     f"{e}\nerror: attaching to live process requires ptrace attach permissions"
                 )
         else:
-            try:
-                prog.set_kernel()
-            except PermissionError as e:
-                if shutil.which("sudo") is None:
-                    sys.exit(
-                        f"{e}\ndrgn debugs the live kernel by default, which requires root"
-                    )
-                else:
-                    prog.set_core_dump(open_via_sudo("/proc/kcore", os.O_RDONLY))
+            _set_kernel_with_sudo_fallback(prog)
     except OSError as e:
         sys.exit(str(e))
     except ValueError as e:
@@ -645,6 +651,97 @@ def _main() -> None:
             else:
                 sys.argv = ["-e"] + args.args
                 exec(args.exec, exec_globals)
+
+
+def _history_file() -> str:
+    # Historically, our history file was directly in ~. However, the May 2021
+    # XDG Base Directory Specification [1] added a dedicated directory for
+    # things like history files: $XDG_STATE_HOME, which defaults to
+    # ~/.local/state.
+    #
+    # We don't move existing history files, but we create new ones in the new
+    # location.
+    #
+    # Note that we use pathlib because it raises an error if a home directory
+    # can't be resolved instead of failing silently like os.path.expanduser().
+    #
+    # [1]: https://specifications.freedesktop.org/basedir/latest/
+    path = Path("~/.drgn_history").expanduser()
+    if path.exists():
+        return str(path)
+    return _state_file("history")
+
+
+def _state_file(name: str) -> str:
+    xdg_state_home = os.getenv("XDG_STATE_HOME")
+    if xdg_state_home is None:
+        path = Path("~/.local/state").expanduser()
+    else:
+        path = Path(xdg_state_home)
+    return str(path / "drgn" / name)
+
+
+def _read_history(history_file: str) -> None:
+    try:
+        readline.read_history_file(history_file)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning("could not read history: %s", e)
+
+
+def _write_history(history_file: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(history_file), exist_ok=True)
+        readline.write_history_file(history_file)
+    except OSError as e:
+        logger.warning("could not write history: %s", e)
+
+
+current_history_file = None
+
+
+@contextlib.contextmanager
+def _setup_readline(
+    history_file: str, completer: Optional[Callable[[str, int], Optional[str]]] = None
+) -> Iterator[None]:
+    global current_history_file
+    old_history_file = current_history_file
+    old_history_length = readline.get_history_length()
+    old_completer = readline.get_completer()
+
+    try:
+        if current_history_file is not None:
+            _write_history(current_history_file)
+        readline.clear_history()
+        _read_history(history_file)
+        current_history_file = history_file
+
+        readline.set_history_length(1000)
+
+        if completer is None:
+            readline.parse_and_bind("tab: self-insert")
+        else:
+            readline.parse_and_bind("tab: complete")
+        readline.set_completer(completer)
+
+        try:
+            yield
+        finally:
+            _write_history(history_file)
+    finally:
+        readline.set_completer(old_completer)
+        if old_completer is None:
+            readline.parse_and_bind("tab: self-insert")
+        else:
+            readline.parse_and_bind("tab: complete")
+
+        readline.set_history_length(old_history_length)
+
+        readline.clear_history()
+        if old_history_file is not None:
+            _read_history(old_history_file)
+        current_history_file = old_history_file
 
 
 def run_interactive(
@@ -697,42 +794,26 @@ For help, type help(drgn).
 
     old_path = list(sys.path)
     old_displayhook = sys.displayhook
-    old_history_length = readline.get_history_length()
-    old_completer = readline.get_completer()
     try:
         old_default_prog = drgn.get_default_prog()
     except drgn.NoDefaultProgramError:
         old_default_prog = None
-    histfile = os.path.expanduser("~/.drgn_history")
-    try:
-        readline.clear_history()
+    had_outer_repl = "outer_repl" in prog.config
+
+    with _setup_readline(_history_file(), Completer(init_globals).complete):
         try:
-            readline.read_history_file(histfile)
-        except OSError as e:
-            if not isinstance(e, FileNotFoundError):
-                logger.warning("could not read history: %s", e)
+            sys.path.insert(0, "")
+            sys.displayhook = _displayhook
 
-        readline.set_history_length(1000)
-        readline.parse_and_bind("tab: complete")
-        readline.set_completer(Completer(init_globals).complete)
+            drgn.set_default_prog(prog)
 
-        sys.path.insert(0, "")
-        sys.displayhook = _displayhook
+            if not had_outer_repl:
+                prog.config["outer_repl"] = "drgn"
 
-        drgn.set_default_prog(prog)
-
-        try:
             interact(init_globals, banner)
         finally:
-            try:
-                readline.write_history_file(histfile)
-            except OSError as e:
-                logger.warning("could not write history: %s", e)
-    finally:
-        drgn.set_default_prog(old_default_prog)
-        sys.displayhook = old_displayhook
-        sys.path[:] = old_path
-        readline.set_history_length(old_history_length)
-        readline.parse_and_bind("tab: self-insert")
-        readline.set_completer(old_completer)
-        readline.clear_history()
+            if not had_outer_repl:
+                prog.config.pop("outer_repl", None)
+            drgn.set_default_prog(old_default_prog)
+            sys.displayhook = old_displayhook
+            sys.path[:] = old_path

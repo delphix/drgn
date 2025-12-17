@@ -9,21 +9,27 @@ into drgn should be defined in this package.
 import argparse
 import importlib
 import pkgutil
-import re
 import subprocess
-import sys
-import traceback
-from typing import Any, Dict
+import types
+from typing import Any, Dict, Union
 
 from drgn import Program, execscript
-from drgn.commands import _shell_command, argument, command, custom_command
+from drgn.commands import (
+    CommandArgumentError,
+    _parse_py_command,
+    _print_py_command_exception,
+    argument,
+    command,
+    custom_command,
+    raw_command,
+)
 
 # Import all submodules, recursively.
 for _module_info in pkgutil.walk_packages(__path__, __name__ + "."):
     importlib.import_module(_module_info.name)
 
 
-@custom_command(
+@raw_command(
     description="execute a shell command",
     usage="**sh** [*command*]",
     long_description="""
@@ -42,7 +48,7 @@ def _cmd_sh(prog: Program, name: str, args: str, **kwargs: Any) -> int:
 
 @custom_command(
     description="execute a python statement and allow shell redirection",
-    usage="**py** [*command*]",
+    usage="**py** *code*",
     long_description="""
     Execute the given code, up to the first shell redirection or pipeline
     statement, as Python code.
@@ -66,54 +72,30 @@ def _cmd_sh(prog: Program, name: str, args: str, **kwargs: Any) -> int:
     MY_FLAG`` gets piped to ``grep foo``, because ``(field`` on its own is not
     valid Python syntax.
     """,
+    parse=_parse_py_command,
 )
 def _cmd_py(
     prog: Program,
     name: str,
-    args: str,
+    code: Union[types.CodeType, SyntaxError, None],
     *,
     globals: Dict[str, Any],
     **kwargs: Any,
 ) -> None:
+    if code is None:
+        raise CommandArgumentError("expected code")
 
-    def print_exc() -> None:
-        # When printing a traceback, we should not print our own stack frame, as
-        # that would confuse the user. Unfortunately the traceback objects are
-        # linked lists and there's no functionality to drop the last N frames of
-        # a traceback while printing.
-        _, _, tb = sys.exc_info()
-        count = 0
-        while tb:
-            count += 1
-            tb = tb.tb_next
-        traceback.print_exc(limit=1 - count)
+    if isinstance(code, SyntaxError):
+        _print_py_command_exception(code)
+        return
 
-    for match in re.finditer(r"[|<>]", args):
-        try:
-            pos = match.start()
-            code = compile(args[:pos], "<input>", "single")
-            break
-        except SyntaxError:
-            pass
-    else:
-        # Fallback for no match: compile all the code as a "single" statement so
-        # exec() still prints out the result. At this point, a syntax error
-        # should be formatted just like a standard Python exception.
-        try:
-            pos = len(args)
-            code = compile(args, "<input>", "single")
-        except SyntaxError:
-            print_exc()
-            return
-
-    with _shell_command(args[pos:]):
-        try:
-            exec(code, globals)
-        except (Exception, KeyboardInterrupt):
-            # Any exception should be formatted just as the interpreter would.
-            # This includes keyboard interrupts, but not things like
-            # SystemExit or GeneratorExit.
-            print_exc()
+    try:
+        exec(code, globals)
+    except (Exception, KeyboardInterrupt) as e:
+        # Any exception should be formatted just as the interpreter would. This
+        # includes keyboard interrupts, but not things like SystemExit or
+        # GeneratorExit.
+        _print_py_command_exception(e)
 
 
 @command(
