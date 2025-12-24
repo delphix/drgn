@@ -12,28 +12,12 @@ in the system.
 import argparse
 import collections
 import functools
-import re
 import sys
-from typing import (
-    AbstractSet,
-    Any,
-    Callable,
-    Iterable,
-    Iterator,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Tuple,
-    TypeVar,
-    Union,
-)
+from typing import AbstractSet, Any, List, Optional, Sequence, Tuple
 
 from drgn import FaultError, Object, Program
 from drgn.commands import (
-    DrgnCodeBlockContext,
-    DrgnCodeBuilder,
-    _repr_black,
+    CommandArgumentError,
     argument,
     drgn_argument,
     mutually_exclusive_group,
@@ -41,10 +25,14 @@ from drgn.commands import (
     unquote_shell_word,
 )
 from drgn.commands.crash import (
+    _CRASH_FOREACH_SUBCOMMANDS,
     Cpuspec,
     CrashDrgnCodeBuilder,
+    _crash_foreach_subcommand,
     _format_seconds_duration,
+    _pid_or_task_or_command,
     _print_task_header,
+    _TaskSelector,
     crash_custom_command,
     parse_cpuspec,
     print_task_header,
@@ -60,329 +48,16 @@ from drgn.helpers.linux.mm import (
     task_vsize,
     totalram_pages,
 )
-from drgn.helpers.linux.pid import find_task, for_each_task, for_each_task_in_group
+from drgn.helpers.linux.pid import for_each_task_in_group
 from drgn.helpers.linux.resource import task_rlimits
 from drgn.helpers.linux.sched import (
+    _TASK_STATE_CHAR_TO_STATE,
     cpu_rq,
-    idle_task,
     task_cpu,
     task_on_cpu,
     task_state_to_char,
-    thread_group_leader,
 )
 from drgn.helpers.linux.timekeeping import ktime_get_coarse_ns
-
-_PID_OR_TASK_OR_COMMAND = Union[
-    Tuple[Literal["pid"], int],
-    Tuple[Literal["task"], int],
-    Tuple[Literal["command"], str],
-    Tuple[Literal["command_pattern"], "re.Pattern[str]"],
-]
-
-
-def _pid_or_task_or_command(arg: str) -> _PID_OR_TASK_OR_COMMAND:
-    try:
-        return "pid", int(arg, 10)
-    except ValueError:
-        pass
-
-    try:
-        return "task", int(arg, 16)
-    except ValueError:
-        pass
-
-    if arg:
-        if arg[0] == "'" and arg[-1] == "'":
-            return "command_pattern", re.compile(arg[1:-1])
-        if arg[0] == "\\":
-            return "command", arg[1:]
-    return "command", arg
-
-
-_T = TypeVar("_T")
-
-
-def _in_set_condition(
-    name: str, items: Iterable[_T], convert: Callable[[_T], str] = str
-) -> str:
-    converted = [convert(item) for item in items]
-    if len(converted) == 1:
-        return f"{name} == {converted[0]}"
-    else:
-        return f"{name} in {{{', '.join(converted)}}}"
-
-
-def _not_in_set_condition(
-    name: str, items: Iterable[_T], convert: Callable[[_T], str] = str
-) -> str:
-    converted = [convert(item) for item in items]
-    if len(converted) == 1:
-        return f"{name} != {converted[0]}"
-    else:
-        return f"{name} not in {{{', '.join(converted)}}}"
-
-
-def _join_if_statement(conditions: Sequence[str], logical_op: str) -> str:
-    if len(conditions) == 1:
-        return f"if {conditions[0]}:\n"
-
-    logical_op += " "
-    parts = ["if (\n"]
-    prefix = ""
-    for condition in conditions:
-        parts.append(f"    {prefix}{condition}\n")
-        prefix = logical_op
-    parts.append("):\n")
-    return "".join(parts)
-
-
-class _TaskSelector:
-    def __init__(
-        self,
-        prog: Program,
-        task_args: Sequence[_PID_OR_TASK_OR_COMMAND] = (),
-        *,
-        kernel: bool = False,
-        user: bool = False,
-        group_leader: bool = False,
-        policies: Optional[AbstractSet[int]] = None,
-        on_cpu: bool = False,
-    ) -> None:
-        self.prog = prog
-
-        self._pids = set()
-        self._task_structs = set()
-        self._commands = set()
-        self._command_patterns = []
-        for task_arg in task_args:
-            if task_arg[0] == "pid":
-                self._pids.add(task_arg[1])
-            elif task_arg[0] == "task":
-                self._task_structs.add(task_arg[1])
-            elif task_arg[0] == "command_pattern":
-                self._command_patterns.append(task_arg[1])
-            else:
-                self._commands.add(task_arg[1])
-
-        self._kernel = kernel
-        self._user = user
-        self._group_leader = group_leader
-        self._on_cpu = on_cpu
-        self._policies = policies
-
-    def _find_by_pid(self) -> bool:
-        return bool(
-            self._pids
-            and not self._task_structs
-            and not self._commands
-            and not self._command_patterns
-        )
-
-    def _filter(self, task: Object) -> Optional[Object]:
-        if self._kernel and not task_is_kthread(task):
-            return None
-        if self._user and task_is_kthread(task):
-            return None
-        if self._policies is not None and task.policy.value_() not in self._policies:
-            return None
-        if self._on_cpu and not task_on_cpu(task):
-            return None
-
-        if not self._pids and not self._task_structs:
-            if self._group_leader and not thread_group_leader(task):
-                return None
-            if not self._commands and not self._command_patterns:
-                return task
-
-        if (
-            # If we found the task by PID, then we don't need to check the PID
-            # again.
-            self._find_by_pid()
-            # Otherwise, only read task.pid if we're filtering by PID.
-            or (self._pids and task.pid.value_() in self._pids)
-            or task.value_() in self._task_structs
-        ):
-            # If we only want group leaders and match a non-group leader by PID
-            # or task_struct, then it should be replaced by its group leader.
-            if self._group_leader and not thread_group_leader(task):
-                return task.group_leader.read_()
-            return task
-
-        # Only read task.comm if we're filtering by comm.
-        if self._commands or self._command_patterns:
-            comm = task.comm.string_().decode(errors="surrogateescape")
-            if comm in self._commands or any(
-                pattern.search(comm) for pattern in self._command_patterns
-            ):
-                return task
-
-        return None
-
-    def tasks(self) -> Iterator[Object]:
-        # If we're filtering by PID but not by task_struct or comm, then we can
-        # avoid iterating over every task.
-        if self._find_by_pid():
-            for pid in sorted(self._pids):
-                if pid == 0:
-                    for cpu in for_each_online_cpu(self.prog):
-                        filtered_task = self._filter(idle_task(self.prog, cpu))
-                        if filtered_task is not None:
-                            yield filtered_task
-                    continue
-
-                task = find_task(self.prog, pid)
-                if not task:
-                    print(f"ps: no such process with PID {pid}")
-                    continue
-
-                filtered_task = self._filter(task)
-                if filtered_task is not None:
-                    yield filtered_task
-            return
-
-        unmatched_task_structs = self._task_structs.copy()
-        for task in for_each_task(
-            self.prog,
-            # If we only want user tasks, then we don't need the idle tasks.
-            # That is, unless we are filtering by task_struct, in case we need
-            # them to check the validity of the given task_structs.
-            idle=not self._user or bool(self._task_structs),
-        ):
-            unmatched_task_structs.discard(task.value_())
-
-            filtered_task = self._filter(task)
-            if filtered_task is not None:
-                yield filtered_task
-
-        for task_value in unmatched_task_structs:
-            print(f"ps: invalid task_struct: {task_value:#x}")
-
-    def begin_task_loop(self, code: DrgnCodeBuilder) -> DrgnCodeBlockContext:
-        if self._find_by_pid():
-            code.append("tasks = []\n")
-            if 0 in self._pids:
-                code.add_from_import(
-                    "drgn.helpers.linux.cpumask", "for_each_online_cpu"
-                )
-                code.add_from_import("drgn.helpers.linux.sched", "idle_task")
-                code.append(
-                    """\
-for cpu in for_each_online_cpu():
-    tasks.append(idle_task(cpu))
-"""
-                )
-            non_zero_pids = [pid for pid in self._pids if pid != 0]
-            non_zero_pids.sort()
-            if non_zero_pids:
-                code.add_from_import("drgn.helpers.linux.pid", "find_task")
-                if len(non_zero_pids) == 1:
-                    code.append(f"pid = {non_zero_pids[0]}\n")
-                    pid_block = code.begin_block("")
-                else:
-                    pids_str = ", ".join([str(pid) for pid in non_zero_pids])
-                    pid_block = code.begin_block(f"for pid in ({pids_str}):\n")
-                code.append(
-                    """\
-task = find_task(pid)
-if task:
-    tasks.append(task)
-"""
-                )
-                pid_block.end()
-            block = code.begin_block("for task in tasks:\n")
-        else:
-            code.add_from_import("drgn.helpers.linux.pid", "for_each_task")
-            idle = "idle=True" if not self._user or self._task_structs else ""
-            block = code.begin_block(f"for task in for_each_task({idle}):\n")
-
-        if self._kernel:
-            code.add_from_import("drgn.helpers.linux.kthread", "task_is_kthread")
-            code.append("if not task_is_kthread(task):\n    continue\n")
-        if self._user:
-            code.add_from_import("drgn.helpers.linux.kthread", "task_is_kthread")
-            code.append("if task_is_kthread(task):\n    continue\n")
-        if self._policies is not None:
-            condition = _not_in_set_condition(
-                "task.policy.value_()", sorted(self._policies)
-            )
-            code.append(f"if {condition}:\n    continue\n")
-        if self._on_cpu:
-            code.add_from_import("drgn.helpers.linux.sched", "task_on_cpu")
-            code.append("if not task_on_cpu(task):\n    continue\n")
-
-        block2 = None
-        if self._find_by_pid():
-            if self._group_leader:
-                code.add_from_import("drgn.helpers.linux.sched", "thread_group_leader")
-                code.append(
-                    """\
-if not thread_group_leader(task):
-    task = task.group_leader.read_()
-"""
-                )
-        elif self._pids or self._task_structs:
-            if self._group_leader or self._commands or self._command_patterns:
-                condition_func = _in_set_condition
-                logical_op = "or"
-            else:
-                condition_func = _not_in_set_condition
-                logical_op = "and"
-
-            conditions = []
-            if self._pids:
-                conditions.append(
-                    condition_func("task.pid.value_()", sorted(self._pids))
-                )
-            if self._task_structs:
-                conditions.append(
-                    condition_func("task.value_()", sorted(self._task_structs), hex)
-                )
-            code.append(_join_if_statement(conditions, logical_op))
-
-            if self._group_leader:
-                code.add_from_import("drgn.helpers.linux.sched", "thread_group_leader")
-                code.append(
-                    """\
-    if not thread_group_leader(task):
-        task = task.group_leader.read_()
-"""
-                )
-            elif self._commands or self._command_patterns:
-                code.append("    pass\n")
-
-            if self._commands or self._command_patterns:
-                block2 = code.begin_block("else:\n")
-            else:
-                if self._group_leader:
-                    code.append("else:\n")
-                code.append("    continue\n")
-        elif self._group_leader:
-            code.add_from_import("drgn.helpers.linux.sched", "thread_group_leader")
-            code.append("if not thread_group_leader(task):\n    continue\n")
-
-        if self._commands or self._command_patterns:
-            code.append("comm_string = task.comm.string_().decode()\n")
-            conditions = []
-            if self._commands:
-                conditions.append(
-                    _not_in_set_condition(
-                        "comm_string", sorted(self._commands), _repr_black
-                    )
-                )
-            if self._command_patterns:
-                code.add_import("re")
-                for pattern in self._command_patterns:
-                    conditions.append(
-                        f"not re.search({_repr_black(pattern.pattern)}, comm_string)"
-                    )
-            code.append(_join_if_statement(conditions, "and"))
-            code.append("    continue\n")
-
-        if block2:
-            block2.end()
-
-        return block
-
 
 _SCHED_POLICIES = {
     "NORMAL": 0,
@@ -762,6 +437,186 @@ for state, num in counter.items():
         print(f"  {state}: {num}")
 
 
+@_crash_foreach_subcommand(
+    arguments=(
+        argument(
+            "-G",
+            dest="group_leader",
+            action="store_true",
+        ),
+        argument(
+            "-y",
+            dest="policy",
+        ),
+        mutually_exclusive_group(
+            argument(
+                "-s",
+                dest="stack_pointer",
+                action="store_true",
+            ),
+            argument(
+                "-p",
+                dest="func",
+                action="store_const",
+                const=_ps_parents,
+            ),
+            argument(
+                "-c",
+                dest="func",
+                action="store_const",
+                const=_ps_children,
+            ),
+            argument(
+                "-t",
+                dest="func",
+                action="store_const",
+                const=_ps_times,
+            ),
+            argument(
+                "-l",
+                dest="last_arrival_timestamp",
+                action="store_true",
+            ),
+            argument(
+                "-m",
+                dest="last_arrival_elapsed",
+                action="store_true",
+            ),
+            argument(
+                "-a",
+                dest="func",
+                action="store_const",
+                const=_ps_arguments,
+            ),
+            argument(
+                "-g",
+                dest="func",
+                action="store_const",
+                const=_ps_thread_groups,
+            ),
+            argument(
+                "-r",
+                dest="func",
+                action="store_const",
+                const=_ps_rlimit,
+            ),
+            argument(
+                "-S",
+                dest="func",
+                action="store_const",
+                const=_ps_summary,
+            ),
+        ),
+        argument(
+            "-C",
+            dest="cpu",
+        ),
+        argument(
+            "-H",
+            dest="header",
+            action="store_false",
+        ),
+        # Note: crash doesn't support foreach ps -S, -H, or -C, but supporting
+        # them actually makes things easier for us, so we do.
+        drgn_argument,
+    ),
+)
+def _crash_foreach_ps(task_selector: _TaskSelector, args: argparse.Namespace) -> None:
+    if args.last_arrival_timestamp or args.last_arrival_elapsed:
+        cpuspec = None if args.cpu is None else parse_cpuspec(args.cpu)
+    elif args.cpu is not None:
+        raise CommandArgumentError("-C can only be used with -l or -m")
+
+    if args.group_leader or args.func == _ps_thread_groups:
+        task_selector._group_leader = True
+    if args.policy is not None:
+        task_selector._policies = _parse_sched_policies(args.policy)
+
+    if args.func is not None:
+        return args.func(task_selector, args.drgn)
+
+    if args.last_arrival_timestamp or args.last_arrival_elapsed:
+        return _ps_last_arrival(
+            task_selector, args.drgn, args.last_arrival_elapsed, cpuspec
+        )
+
+    prog = task_selector.prog
+
+    if args.drgn:
+        code = CrashDrgnCodeBuilder(prog)
+        code.add_from_import(
+            "drgn.helpers.linux.mm", "task_rss", "task_vsize", "totalram_pages"
+        )
+        code.append("total_mem = totalram_pages()\n\n")
+        with task_selector.begin_task_loop(code):
+            code.add_from_import(
+                "drgn.helpers.linux.sched", "task_cpu", "task_state_to_char"
+            )
+            code.append(
+                """\
+pid = task.pid
+ppid = task.parent.pid
+cpu = task_cpu(task)
+state = task_state_to_char(task)
+rss = task_rss(task)
+mem_usage = rss.total / total_mem
+vsize = task_vsize(task)
+comm = task.comm
+"""
+            )
+        return code.print()
+
+    rows: List[Sequence[Any]] = []
+    if args.header:
+        rows.append(
+            (
+                "",
+                CellFormat("PID", ">"),
+                CellFormat("PPID", ">"),
+                CellFormat("CPU", ">"),
+                CellFormat("KSTACKP" if args.stack_pointer else "TASK", "^"),
+                "ST",
+                CellFormat("%MEM", ">"),
+                CellFormat("VSZ", ">"),
+                CellFormat("RSS", ">"),
+                "COMM",
+            )
+        )
+
+    page_size = prog["PAGE_SIZE"].value_()
+    total_mem = totalram_pages(prog)
+    for task in task_selector.tasks():
+        if args.stack_pointer:
+            try:
+                pointer_cell = CellFormat(prog.stack_trace(task)[0].sp, "^x")
+            except ValueError:
+                pointer_cell = CellFormat("--", "^")
+        else:
+            pointer_cell = CellFormat(task.value_(), "^x")
+
+        rss = task_rss(prog, task)
+
+        comm_column = escape_ascii_string(task.comm.string_(), escape_backslash=True)
+        if task_is_kthread(task):
+            comm_column = f"[{comm_column}]"
+
+        rows.append(
+            (
+                ">" if task_selector._on_cpu or task_on_cpu(task) else "",
+                task.pid.value_(),
+                task.parent.pid.value_(),
+                task_cpu(task),
+                pointer_cell,
+                task_state_to_char(task),
+                CellFormat(rss.total / total_mem * 100, ".1f"),
+                task_vsize(task) // 1024,
+                rss.total * page_size // 1024,
+                comm_column,
+            )
+        )
+    print_table(rows)
+
+
 @crash_custom_command(
     description="process information",
     long_description="display process status information",
@@ -921,9 +776,9 @@ for state, num in counter.items():
             nargs="*",
             help=r"""
             display only this task, given as a decimal process ID, hexadecimal
-            ``task_struct``, single quoted ("'") regular expression matching
+            ``task_struct``, single-quoted (``'``) regular expression matching
             command names, or a literal command name (optionally prefixed with
-            "\" to disambiguate it). May be given multiple times
+            ``\`` to disambiguate it). May be given multiple times
             """,
         ),
         drgn_argument,
@@ -950,100 +805,149 @@ def _crash_cmd_ps(
             for arg in quoted_args
         ]
     )
-
-    if args.last_arrival_timestamp or args.last_arrival_elapsed:
-        cpuspec = None if args.cpu is None else parse_cpuspec(args.cpu)
-    elif args.cpu is not None:
-        parser.error("-C can only be used with -l or -m")
-
     task_selector = _TaskSelector(
         prog,
         args.tasks,
         kernel=args.kernel,
         user=args.user,
-        group_leader=args.group_leader or args.func == _ps_thread_groups,
-        policies=None if args.policy is None else _parse_sched_policies(args.policy),
+        # Note: group_leader and policies are overridden in
+        # _crash_foreach_ps().
         on_cpu=args.active,
+        sort=True,
     )
+    _crash_foreach_ps(task_selector, args)
 
-    if args.func is not None:
-        return args.func(task_selector, args.drgn)
 
-    if args.last_arrival_timestamp or args.last_arrival_elapsed:
-        return _ps_last_arrival(
-            task_selector, args.drgn, args.last_arrival_elapsed, cpuspec
+@crash_custom_command(
+    description="run command on multiple tasks",
+    long_description="""
+    Run the given command on all tasks matching the given constraints (or all
+    tasks in the system if no constraints are given).
+    """,
+    usage=r"**foreach** [**\-\-drgn**] [*pid* | *task* | *name* ...] "
+    "[**kernel** | **user** | **gleader**] [**active**] [*state*] "
+    "*command* [*-option* ...]",
+    arguments=(
+        argument(
+            "pid",
+            help="run the command on the task with this decimal process ID",
+        ),
+        argument(
+            "task",
+            help="""
+            run the command on the task with this hexadecimal task_struct
+            address
+            """,
+        ),
+        argument(
+            "name",
+            help=r"""
+            run the command on tasks with the given name. May be prefixed with
+            ``\`` to disambiguate it as a literal command name. If
+            single-quoted (``'``), then it is treated as a regular expression
+            """,
+        ),
+        argument(
+            "kernel",
+            help="run the command on kernel threads",
+        ),
+        argument(
+            "user",
+            help="run the command on user tasks",
+        ),
+        argument(
+            "gleader",
+            help="run the command on thread group leaders",
+        ),
+        argument(
+            "active",
+            help="run the command on the active task on each CPU",
+        ),
+        argument(
+            "state",
+            help='run the command on tasks in this state ("R", "D", etc.)',
+        ),
+        argument(
+            "command",
+            help="""
+            run this command on the selected tasks. Currently, **files**,
+            **ps**, **set**, **sig**, **task**, and **vm** are supported
+            """,
+        ),
+        argument(
+            "-option",
+            action="store_true",
+            help="additional option to pass to the command",
+        ),
+        drgn_argument,
+    ),
+    parse=functools.partial(parse_shell_command, unquote=False),
+)
+def _crash_cmd_foreach(
+    prog: Program,
+    name: str,
+    quoted_args: Sequence[str],
+    *,
+    parser: argparse.ArgumentParser,
+    **kwargs: Any,
+) -> Any:
+    args = [
+        (
+            arg
+            if arg.startswith("'") or arg.startswith("\\")
+            else unquote_shell_word(arg)
         )
+        for arg in quoted_args
+    ]
 
-    if args.drgn:
-        code = CrashDrgnCodeBuilder(prog)
-        code.add_from_import(
-            "drgn.helpers.linux.mm", "task_rss", "task_vsize", "totalram_pages"
-        )
-        code.append("total_mem = totalram_pages()\n\n")
-        with task_selector.begin_task_loop(code):
-            code.add_from_import(
-                "drgn.helpers.linux.sched", "task_cpu", "task_state_to_char"
-            )
-            code.append(
-                """\
-pid = task.pid
-ppid = task.parent.pid
-cpu = task_cpu(task)
-state = task_state_to_char(task)
-rss = task_rss(task)
-mem_usage = rss.total / total_mem
-vsize = task_vsize(task)
-comm = task.comm
-"""
-            )
-        return code.print()
-
-    rows: List[Sequence[Any]] = []
-    if args.header:
-        rows.append(
-            (
-                "",
-                CellFormat("PID", ">"),
-                CellFormat("PPID", ">"),
-                CellFormat("CPU", ">"),
-                CellFormat("KSTACKP" if args.stack_pointer else "TASK", "^"),
-                "ST",
-                CellFormat("%MEM", ">"),
-                CellFormat("VSZ", ">"),
-                CellFormat("RSS", ">"),
-                "COMM",
-            )
-        )
-
-    page_size = prog["PAGE_SIZE"].value_()
-    total_mem = totalram_pages(prog)
-    for task in task_selector.tasks():
-        if args.stack_pointer:
-            try:
-                pointer_cell = CellFormat(prog.stack_trace(task)[0].sp, "^x")
-            except ValueError:
-                pointer_cell = CellFormat("--", "^")
+    tasks = []
+    kernel = False
+    user = False
+    group_leader = False
+    on_cpu = False
+    state = None
+    command_args = []
+    for i, arg in enumerate(args):
+        if arg in _CRASH_FOREACH_SUBCOMMANDS:
+            subcommand = _CRASH_FOREACH_SUBCOMMANDS[arg]
+            command_args.extend(args[i + 1 :])
+            break
+        elif arg.startswith("-"):
+            command_args.append(arg)
+        elif arg == "kernel":
+            if group_leader:
+                parser.error("gleader and kernel are mutually exclusive")
+            if user:
+                parser.error("user and kernel are mutually exclusive")
+            kernel = True
+        elif arg == "user":
+            if kernel:
+                parser.error("kernel and user are mutually exclusive")
+            user = True
+        elif arg == "gleader":
+            if kernel:
+                parser.error("kernel and gleader are mutually exclusive")
+            user = group_leader = True
+        elif arg == "active":
+            on_cpu = True
+        elif arg in _TASK_STATE_CHAR_TO_STATE:
+            if state is not None:
+                parser.error("only one task state allowed")
+            state = arg
         else:
-            pointer_cell = CellFormat(task.value_(), "^x")
+            tasks.append(_pid_or_task_or_command(arg))
+    else:
+        parser.error("no command given")
 
-        rss = task_rss(prog, task)
-
-        comm_column = escape_ascii_string(task.comm.string_(), escape_backslash=True)
-        if task_is_kthread(task):
-            comm_column = f"[{comm_column}]"
-
-        rows.append(
-            (
-                ">" if args.active or task_on_cpu(task) else "",
-                task.pid.value_(),
-                task.parent.pid.value_(),
-                task_cpu(task),
-                pointer_cell,
-                task_state_to_char(task),
-                CellFormat(rss.total / total_mem * 100, ".1f"),
-                task_vsize(task) // 1024,
-                rss.total * page_size // 1024,
-                comm_column,
-            )
-        )
-    print_table(rows)
+    return subcommand.func(
+        _TaskSelector(
+            prog,
+            tasks,
+            kernel=kernel,
+            user=user,
+            group_leader=group_leader,
+            on_cpu=on_cpu,
+            state=state,
+        ),
+        subcommand.parser.parse_args(command_args),
+    )

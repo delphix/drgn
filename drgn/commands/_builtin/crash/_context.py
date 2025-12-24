@@ -14,15 +14,18 @@ from drgn.commands import (
     drgn_argument,
     mutually_exclusive_group,
 )
-from drgn.commands._builtin.crash._sys import _SysPrinter
+from drgn.commands._builtin.crash._sys import _append_sys_drgn_task, _print_sys
 from drgn.commands.crash import (
     CrashDrgnCodeBuilder,
+    _crash_foreach_subcommand,
     _crash_get_panic_context,
     _find_pager,
     _get_pager,
     _pid_or_task,
+    _TaskSelector,
     crash_command,
     crash_get_context,
+    print_task_header,
 )
 from drgn.helpers.linux.sched import cpu_curr
 
@@ -204,34 +207,48 @@ def _crash_cmd_set(
             )
 
     if args.drgn:
+        code = CrashDrgnCodeBuilder(prog)
         if args.panic:
-            code = CrashDrgnCodeBuilder(prog)
             code._append_crash_panic_context()
-            code.print()
         elif args.cpu is not None:
-            code = CrashDrgnCodeBuilder(prog)
             code._append_crash_cpu_context(args.cpu)
-            code.print()
         elif args.task is not None:
-            code = CrashDrgnCodeBuilder(prog)
             code.append_crash_context(args.task)
-            code.print()
         else:
-            _SysPrinter(prog, True, system_fields=False, context="current").print()
+            code.append_crash_context()
+        _append_sys_drgn_task(code)
+        code.print()
         return None
 
     if args.panic:
-        task = _crash_get_panic_context(prog)
+        prog.config["crash_context"] = _crash_get_panic_context(prog)
         prog.config.pop("crash_context_origin", None)
     elif args.cpu is not None:
-        task = cpu_curr(prog, args.cpu)
+        prog.config["crash_context"] = cpu_curr(prog, args.cpu)
         prog.config["crash_context_origin"] = ("cpu", args.cpu)
     elif args.task is not None:
-        task = crash_get_context(prog, args.task)
+        prog.config["crash_context"] = crash_get_context(prog, args.task)
         prog.config["crash_context_origin"] = args.task
-    else:
-        printer = _SysPrinter(prog, False, system_fields=False, context="current")
-        printer.print()
-        return printer.task
-    prog.config["crash_context"] = task
-    return task
+    return _print_sys(prog, system_fields=False, context="current")
+
+
+@_crash_foreach_subcommand(arguments=(drgn_argument,))
+def _crash_foreach_set(task_selector: _TaskSelector, args: argparse.Namespace) -> None:
+    prog = task_selector.prog
+
+    if args.drgn:
+        code = CrashDrgnCodeBuilder(prog)
+        with task_selector.begin_task_loop(code):
+            # No append_task_header() because it is a subset of
+            # _append_sys_drgn_task() anyways.
+            _append_sys_drgn_task(code)
+        return code.print()
+
+    first = True
+    for task in task_selector.tasks():
+        if first:
+            first = False
+        else:
+            print()
+        print_task_header(task)
+        _print_sys(prog, system_fields=False, context=task)
