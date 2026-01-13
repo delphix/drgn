@@ -31,12 +31,14 @@
 #include <linux/mm.h>
 #include <linux/mmzone.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/nodemask.h>
 #include <linux/plist.h>
 #include <linux/radix-tree.h>
 #include <linux/rbtree.h>
 #include <linux/rbtree_augmented.h>
+#include <linux/rwsem.h>
 #include <linux/sbitmap.h>
 #include <linux/skbuff.h>
 #include <linux/slab.h>
@@ -776,6 +778,99 @@ static void drgn_test_plist_init(void)
 	drgn_plist_add(&drgn_test_plist_entries[1].node, &drgn_test_full_plist);
 	drgn_plist_add(&drgn_test_plist_entries[0].node, &drgn_test_full_plist);
 	drgn_plist_add(&drgn_test_plist_entries[2].node, &drgn_test_full_plist);
+}
+
+// locking
+
+static DECLARE_COMPLETION(drgn_test_locking_kthread_ready);
+struct task_struct *drgn_test_locking_kthread;
+struct task_struct *drgn_test_locking_kthread2;
+DEFINE_MUTEX(drgn_test_mutex_locked);
+DEFINE_MUTEX(drgn_test_mutex_unlocked);
+DECLARE_RWSEM(drgn_test_rwsem_read_locked);
+DECLARE_RWSEM(drgn_test_rwsem_write_locked);
+DECLARE_RWSEM(drgn_test_rwsem_previously_read_locked);
+DECLARE_RWSEM(drgn_test_rwsem_previously_write_locked);
+DECLARE_RWSEM(drgn_test_rwsem_never_locked);
+DECLARE_RWSEM(drgn_test_rwsem_writer_waiting);
+
+static int drgn_test_locking_kthread_fn(void *arg)
+{
+	mutex_lock(&drgn_test_mutex_locked);
+
+	down_read(&drgn_test_rwsem_read_locked);
+	down_write(&drgn_test_rwsem_write_locked);
+
+	down_read(&drgn_test_rwsem_previously_read_locked);
+	up_read(&drgn_test_rwsem_previously_read_locked);
+
+	down_write(&drgn_test_rwsem_previously_write_locked);
+	up_write(&drgn_test_rwsem_previously_write_locked);
+
+	down_read(&drgn_test_rwsem_writer_waiting);
+
+	complete(&drgn_test_locking_kthread_ready);
+	for (;;) {
+		set_current_state(TASK_INTERRUPTIBLE);
+		if (kthread_should_stop()) {
+			__set_current_state(TASK_RUNNING);
+			break;
+		}
+		if (kthread_should_park()) {
+			__set_current_state(TASK_RUNNING);
+			kthread_parkme();
+			continue;
+		}
+		schedule();
+		__set_current_state(TASK_RUNNING);
+	}
+
+	up_read(&drgn_test_rwsem_writer_waiting);
+	up_write(&drgn_test_rwsem_write_locked);
+	up_read(&drgn_test_rwsem_read_locked);
+
+	mutex_unlock(&drgn_test_mutex_locked);
+	return 0;
+}
+
+static int drgn_test_locking_kthread_fn2(void *arg)
+{
+	down_write(&drgn_test_rwsem_writer_waiting);
+	up_write(&drgn_test_rwsem_writer_waiting);
+	return 0;
+}
+
+static int drgn_test_locking_init(void)
+{
+	drgn_test_locking_kthread = kthread_create(drgn_test_locking_kthread_fn,
+						   NULL,
+						   "drgn_test_locking_kthread");
+	if (!drgn_test_locking_kthread)
+		return -1;
+	wake_up_process(drgn_test_locking_kthread);
+	wait_for_completion(&drgn_test_locking_kthread_ready);
+
+	drgn_test_locking_kthread2 =
+		kthread_create(drgn_test_locking_kthread_fn2, NULL,
+			       "drgn_test_locking_kthread2");
+	if (!drgn_test_locking_kthread2)
+		return -1;
+	wake_up_process(drgn_test_locking_kthread2);
+
+	return kthread_park(drgn_test_locking_kthread);
+}
+
+static void drgn_test_locking_exit(void)
+{
+	// This one needs to exit first to unblock the second one.
+	if (drgn_test_locking_kthread) {
+		kthread_stop(drgn_test_locking_kthread);
+		drgn_test_locking_kthread = NULL;
+	}
+	if (drgn_test_locking_kthread2) {
+		kthread_stop(drgn_test_locking_kthread2);
+		drgn_test_locking_kthread2 = NULL;
+	}
 }
 
 // mapletree
@@ -2619,6 +2714,7 @@ static void drgn_test_exit(void)
 	drgn_test_radix_tree_exit();
 	drgn_test_xarray_exit();
 	drgn_test_waitq_exit();
+	drgn_test_locking_exit();
 	drgn_test_idr_exit();
 	drgn_test_block_exit();
 	drgn_test_swaitq_exit();
@@ -2636,6 +2732,9 @@ static int __init drgn_test_init(void)
 	drgn_test_list_init();
 	drgn_test_llist_init();
 	drgn_test_plist_init();
+	ret = drgn_test_locking_init();
+	if (ret)
+		goto out;
 	ret = drgn_test_maple_tree_init();
 	if (ret)
 		goto out;
