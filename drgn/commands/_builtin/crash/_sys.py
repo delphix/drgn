@@ -190,11 +190,11 @@ def _get_load_average(prog: Program) -> str:
 
 def _append_tasks(code: CrashDrgnCodeBuilder) -> None:
     code.add_from_import("drgn.helpers.linux.pid", "for_each_task")
-    code.append("num_tasks = sum(1 for _ in for_each_task())\n")
+    code.append("num_tasks = sum(1 for _ in for_each_task(idle=True))\n")
 
 
 def _get_tasks(prog: Program) -> str:
-    return str(sum(1 for _ in for_each_task(prog)))
+    return str(sum(1 for _ in for_each_task(prog, idle=True)))
 
 
 def _append_utsname_field(code: CrashDrgnCodeBuilder, field: str) -> None:
@@ -351,7 +351,11 @@ def _print_sys(
     if isinstance(context, Object) or context is None:
         task = context
     elif context == "panic":
-        task = _crash_get_panic_context(prog)
+        try:
+            task = _crash_get_panic_context(prog)
+        except LookupError:
+            logger.warning("panic task not found")
+            task = None
     elif context == "current":
         task = crash_get_context(prog)
     else:
