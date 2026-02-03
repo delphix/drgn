@@ -28,6 +28,7 @@ from typing import (
 )
 
 from util import KernelVersion, nproc
+from vmtest.chroot import chroot_sh_cmd
 from vmtest.config import (
     ARCHITECTURES,
     HOST_ARCHITECTURE,
@@ -38,7 +39,7 @@ from vmtest.config import (
     Kernel,
 )
 from vmtest.download import Downloader
-from vmtest.rootfsbuild import build_drgn_in_rootfs
+from vmtest.rootfsbuild import build_drgn_for_arch
 from vmtest.vm import LostVMError, TestKmodMode, run_in_vm
 
 logger = logging.getLogger(__name__)
@@ -317,15 +318,14 @@ class _TestRunner:
                 outfile = exit_stack.enter_context(
                     (self._directory / "log" / f"{arch.name}-build.log").open("w")
                 )
-            rootfs = self._rootfs(arch)
-            if rootfs == Path("/"):
+            if self._use_host_rootfs and arch is HOST_ARCHITECTURE:
                 subprocess.check_call(
                     [sys.executable, "setup.py", "build_ext", "-i"],
                     stdout=outfile,
                     stderr=outfile,
                 )
             else:
-                build_drgn_in_rootfs(rootfs, outfile=outfile)
+                build_drgn_for_arch(arch, self._directory, outfile=outfile)
         return functools.partial(self._drgn_build_done, arch)
 
     def _drgn_build_done(self, arch: Architecture) -> bool:
@@ -441,18 +441,17 @@ class _TestRunner:
             args = [
                 "unshare",
                 "--map-root-user",
-                "--map-users=auto",
-                "--map-groups=auto",
+                "--map-auto",
                 "--fork",
                 "--pid",
                 "--mount-proc=" + str(rootfs / "proc"),
                 "sh",
                 "-c",
-                """\
+                f"""\
 set -e
 
 mount --bind . "$1/mnt"
-chroot "$1" sh -c 'cd /mnt && pytest -v --ignore=tests/linux_kernel'
+{chroot_sh_cmd('"$1"')} 'cd /mnt && pytest -v --ignore=tests/linux_kernel'
 """,
                 "sh",
                 str(rootfs),

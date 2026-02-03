@@ -62,32 +62,38 @@ static inline int PyModule_Add(PyObject *mod, const char *name, PyObject *value)
 
 #define DRGNPY_PUBLIC __attribute__((__visibility__("default")))
 
-// PyLong_From* and PyLong_As* for stdint.h types. These use _Generic for
-// slightly more type safety (e.g., so you can't pass an int64_t to
-// PyLong_FromUint64()).
-#if ULONG_MAX == UINT64_MAX
-#define PyLong_FromUint64(v) _Generic((v), uint64_t: PyLong_FromUnsignedLong)(v)
-#define PyLong_AsUint64(obj) ((uint64_t)PyLong_AsUnsignedLong(obj))
-#define PyLong_AsUint64Mask(obj) ((uint64_t)PyLong_AsUnsignedLongMask(obj))
-#elif ULLONG_MAX == UINT64_MAX
-#define PyLong_FromUint64(v) _Generic((v), uint64_t: PyLong_FromUnsignedLongLong)(v)
-#define PyLong_AsUint64(obj) ((uint64_t)PyLong_AsUnsignedLongLong(obj))
-#define PyLong_AsUint64Mask(obj) ((uint64_t)PyLong_AsUnsignedLongLongMask(obj))
+// Added in Python 3.14. We provide a fallback for older versions.
+int PyLong_IsNegative(PyObject *obj);
+
+#if PY_VERSION_HEX < 0x030e00a1
+static inline PyObject *PyLong_FromInt64(int64_t value)
+{
+	return PyLong_FromLongLong(value);
+}
+static inline PyObject *PyLong_FromUInt32(uint32_t value)
+{
+	return PyLong_FromUnsignedLong(value);
+}
+static inline PyObject *PyLong_FromUInt64(uint64_t value)
+{
+	return PyLong_FromUnsignedLongLong(value);
+}
+
+int PyLong_AsInt64(PyObject *obj, int64_t *value);
+int PyLong_AsUInt32(PyObject *obj, uint32_t *value);
+int PyLong_AsUInt64(PyObject *obj, uint64_t *value);
 #endif
 
-#if LONG_MIN == INT64_MIN && LONG_MAX == INT64_MAX
-#define PyLong_FromInt64(v) _Generic((v), int64_t: PyLong_FromLong)(v)
-#define PyLong_AsInt64(obj) ((int64_t)PyLong_AsLong(obj))
-#elif LLONG_MIN == INT64_MIN && LLONG_MAX == INT64_MAX
-#define PyLong_FromInt64(v) _Generic((v), int64_t: PyLong_FromLongLong)(v)
-#define PyLong_AsInt64(obj) ((int64_t)PyLong_AsLongLong(obj))
-#endif
-
-#if ULONG_MAX >= UINT32_MAX
-#define PyLong_FromUint32(v) _Generic((v), uint32_t: PyLong_FromUnsignedLong)(v)
-#define PyLong_FromUint16(v) _Generic((v), uint16_t: PyLong_FromUnsignedLong)(v)
-#define PyLong_FromUint8(v) _Generic((v), uint8_t: PyLong_FromUnsignedLong)(v)
-#endif
+// These variants don't exist as of Python 3.14.
+static inline PyObject *PyLong_FromUInt8(uint8_t value)
+{
+	return PyLong_FromUnsignedLong(value);
+}
+static inline PyObject *PyLong_FromUInt16(uint16_t value)
+{
+	return PyLong_FromUnsignedLong(value);
+}
+int PyLong_AsUInt16(PyObject *obj, uint16_t *value);
 
 #define Py_RETURN_BOOL(cond) do {	\
 	if (cond)			\
@@ -156,6 +162,11 @@ typedef struct {
 	const char *attr_name;
 	const struct drgn_language *language;
 } Language;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_memory_search_iterator *it;
+} MemorySearchIterator;
 
 typedef struct {
 	PyObject_HEAD
@@ -316,6 +327,10 @@ extern PyTypeObject ExtraModule_type;
 extern PyTypeObject FaultError_type;
 extern PyTypeObject Language_type;
 extern PyTypeObject MainModule_type;
+extern PyTypeObject MemorySearchIteratorWithBytes_type;
+extern PyTypeObject MemorySearchIteratorWithInt_type;
+extern PyTypeObject MemorySearchIteratorWithStr_type;
+extern PyTypeObject MemorySearchIterator_type;
 extern PyTypeObject ModuleIteratorWithNew_type;
 extern PyTypeObject ModuleIterator_type;
 extern PyTypeObject ModuleSectionAddressesIterator_type;
@@ -374,6 +389,9 @@ void *set_error_type_name(const char *format,
 			  struct drgn_qualified_type qualified_type);
 
 #define call_tp_alloc(type) ((type *)type##_type.tp_alloc(&type##_type, 0))
+
+PyObject *MemorySearchIterator_wrap(PyTypeObject *type,
+				    struct drgn_memory_search_iterator *it);
 
 PyObject *Module_wrap(struct drgn_module *module);
 static inline Program *Module_prog(Module *module)

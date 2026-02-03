@@ -131,7 +131,7 @@ static PyObject *sizeof_(PyObject *self, PyObject *arg)
 	}
 	if (err)
 		return set_drgn_error(err);
-	return PyLong_FromUint64(size);
+	return PyLong_FromUInt64(size);
 }
 
 static bool
@@ -178,7 +178,7 @@ static PyObject *alignof_(PyObject *self, PyObject *arg)
 	err = drgn_type_alignof(qualified_type, &size);
 	if (err)
 		return set_drgn_error(err);
-	return PyLong_FromUint64(size);
+	return PyLong_FromUInt64(size);
 }
 
 static PyObject *offsetof_(PyObject *self, PyObject *args, PyObject *kwds)
@@ -210,7 +210,7 @@ static PyObject *offsetof_(PyObject *self, PyObject *args, PyObject *kwds)
 	err = drgn_type_offsetof(type, member, &offset);
 	if (err)
 		return set_drgn_error(err);
-	return PyLong_FromUint64(offset);
+	return PyLong_FromUInt64(offset);
 }
 
 static PyMethodDef drgn_methods[] = {
@@ -325,7 +325,11 @@ static int add_type_aliases(PyObject *m)
 			      os_PathLike);
 	if (!item)
 		return -1;
-	return PyModule_Add(m, "Path", PyObject_GetItem(typing_Union, item));
+	if (PyModule_Add(m, "Path", PyObject_GetItem(typing_Union, item)))
+		return -1;
+
+	return PyModule_Add(m, "MemorySearchIterator",
+			    PyObject_GetAttrString(typing_module, "Iterator"));
 }
 
 PyMODINIT_FUNC PyInit__drgn(void); // Silence -Wmissing-prototypes.
@@ -346,6 +350,10 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 	    add_type(m, &DebugInfoOptions_type) ||
 	    add_type(m, &Language_type) || add_languages() ||
 	    add_type(m, &DrgnObject_type) ||
+	    PyType_Ready(&MemorySearchIteratorWithBytes_type) ||
+	    PyType_Ready(&MemorySearchIteratorWithInt_type) ||
+	    PyType_Ready(&MemorySearchIteratorWithStr_type) ||
+	    PyType_Ready(&MemorySearchIterator_type) ||
 	    add_type(m, &Module_type) ||
 	    add_type(m, &MainModule_type) ||
 	    add_type(m, &SharedLibraryModule_type) ||
@@ -428,6 +436,15 @@ DRGNPY_PUBLIC PyMODINIT_FUNC PyInit__drgn(void)
 
 	if (add_bool(m, "_with_lzma",
 #ifdef WITH_LZMA
+		     true
+#else
+		     false
+#endif
+		    ))
+		goto err;
+
+	if (add_bool(m, "_with_pcre2",
+#ifdef WITH_PCRE2
 		     true
 #else
 		     false
