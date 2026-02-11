@@ -1065,6 +1065,7 @@ unsigned long drgn_test_pfn;
 struct page *drgn_test_page;
 struct page *drgn_test_compound_page;
 void *drgn_test_vmalloc_va;
+phys_addr_t drgn_test_vmalloc_pa;
 unsigned long drgn_test_vmalloc_pfn;
 struct page *drgn_test_vmalloc_page;
 
@@ -1110,11 +1111,46 @@ struct {
 size_t drgn_test_num_present_sections;
 #endif
 
+#ifdef CONFIG_SPARSEMEM
+// __highest_present_section_nr is not exported, so we can't use
+// for_each_present_section_nr(). We can derive __highest_present_section_nr
+// from max_pfn, but that's also not exported. So, we derive max_pfn from the
+// maximum zone end PFN.
+static unsigned long drgn_test_highest_present_section_nr(void)
+{
+	unsigned long max_pfn = 0;
+	unsigned long nr;
+	int nid;
+
+	for_each_online_node(nid) {
+		pg_data_t *pgdat = NODE_DATA(nid);
+		int i;
+
+		for (i = 0; i < MAX_NR_ZONES; i++) {
+			unsigned long end_pfn = zone_end_pfn(&pgdat->node_zones[i]);
+			if (end_pfn > max_pfn)
+				max_pfn = end_pfn;
+		}
+	}
+
+	nr = pfn_to_section_nr(max_pfn - 1);
+	for (;;) {
+		if (present_section_nr(nr))
+			return nr;
+		if (nr == 0)
+			break;
+		nr--;
+	}
+	return 0;
+}
+#endif
+
 static int drgn_test_mm_init(void)
 {
 	u32 fill;
 	size_t i;
 #ifdef CONFIG_SPARSEMEM
+	unsigned long highest_present_section_nr;
 	size_t n;
 #endif
 
@@ -1138,6 +1174,8 @@ static int drgn_test_mm_init(void)
 		return -ENOMEM;
 	drgn_test_vmalloc_pfn = vmalloc_to_pfn(drgn_test_vmalloc_va);
 	drgn_test_vmalloc_page = vmalloc_to_page(drgn_test_vmalloc_va);
+	drgn_test_vmalloc_pa = page_to_phys(drgn_test_vmalloc_page)
+			       + offset_in_page(drgn_test_vmalloc_va);
 
 #ifdef CONFIG_SPARSEMEM
 	drgn_test_section_nr = pfn_to_section_nr(drgn_test_pfn);
@@ -1149,9 +1187,9 @@ static int drgn_test_mm_init(void)
 	drgn_test_section_decoded_mem_map =
 		drgn_test_section_mem_map + drgn_test_section_pfn;
 
-	// __highest_present_section_nr is not exported, so we can't use
-	// for_each_present_section_nr().
-	for (i = 0, n = 0; i < NR_MEM_SECTIONS; i++) {
+	highest_present_section_nr = drgn_test_highest_present_section_nr();
+
+	for (i = 0, n = 0; i <= highest_present_section_nr; i++) {
 		if (present_section_nr(i))
 			n++;
 	}
@@ -1162,7 +1200,7 @@ static int drgn_test_mm_init(void)
 	if (!drgn_test_present_sections)
 		return -ENOMEM;
 
-	for (i = 0; i < NR_MEM_SECTIONS; i++) {
+	for (i = 0; i <= highest_present_section_nr; i++) {
 		if (present_section_nr(i)) {
 			drgn_test_present_sections[drgn_test_num_present_sections].nr = i;
 			drgn_test_present_sections[drgn_test_num_present_sections].section =

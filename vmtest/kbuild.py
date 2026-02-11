@@ -235,6 +235,28 @@ _PATCHES = (
             (KernelVersion("5.5"), KernelVersion("5.10")),
         ),
     ),
+    _Patch(
+        name="riscv-fix-vmemmap-and-vmalloc-offsets-in-proc-kcore.patch",
+        versions=((KernelVersion("6.11"), None),),
+    ),
+    _Patch(
+        name="6.10-riscv-fix-vmemmap-and-vmalloc-offsets-in-proc-kcore.patch",
+        versions=(
+            (KernelVersion("6.8"), KernelVersion("6.11")),
+            (KernelVersion("6.6.51"), KernelVersion("6.7")),
+        ),
+    ),
+    _Patch(
+        name="6.7-riscv-fix-vmemmap-and-vmalloc-offsets-in-proc-kcore.patch",
+        versions=(
+            (KernelVersion("6.7"), KernelVersion("6.8")),
+            (KernelVersion("5.17"), KernelVersion("6.6.51")),
+        ),
+    ),
+    _Patch(
+        name="5.16-riscv-fix-vmemmap-and-vmalloc-offsets-in-proc-kcore.patch",
+        versions=((KernelVersion("4.15"), KernelVersion("5.17")),),
+    ),
 )
 
 
@@ -635,11 +657,23 @@ MODULE_DESCRIPTION("Module for testing build");
             package,
         )
 
-        image_name = (
-            (await check_output("make", *make_args, "-s", "image_name", env=self._env))
-            .decode()
-            .strip()
-        )
+        if self._arch.kernel_srcarch == "riscv":
+            # `qemu-system-riscv64 -kernel` apparently can't boot a compressed
+            # kernel. Since Linux kernel commit e79dfcbfb902 ("riscv: make
+            # image compression configurable") (in v6.10),
+            # CONFIG_KERNEL_UNCOMPRESSED=y makes `make image_name` output the
+            # uncompressed image. Before that, we need a special case.
+            image_name = "Image"
+        else:
+            image_name = (
+                (
+                    await check_output(
+                        "make", *make_args, "-s", "image_name", env=self._env
+                    )
+                )
+                .decode()
+                .strip()
+            )
 
         with tempfile.TemporaryDirectory(
             prefix=package.name + ".tmp.", dir=package.parent
