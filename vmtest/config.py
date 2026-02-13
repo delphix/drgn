@@ -281,9 +281,12 @@ class Architecture:
     kernel_config: str
     # Flavor-specific Linux kernel configuration options.
     kernel_flavor_configs: Mapping[str, str]
+    # Name of compiler host on
+    # https://mirrors.kernel.org/pub/tools/crosstool/.
+    kernel_org_compiler_host_name: Optional[str]
     # Name of compiler target on
     # https://mirrors.kernel.org/pub/tools/crosstool/.
-    kernel_org_compiler_name: str
+    kernel_org_compiler_target_name: str
     # Options to pass to QEMU.
     qemu_options: Sequence[str]
     # Console device when using QEMU.
@@ -326,7 +329,8 @@ ARCHITECTURES = {
                     CONFIG_ARM64_16K_PAGES=y
                 """,
             },
-            kernel_org_compiler_name="aarch64-linux",
+            kernel_org_compiler_host_name="arm64",
+            kernel_org_compiler_target_name="aarch64-linux",
             qemu_options=("-M", "virt", "-cpu", "cortex-a76"),
             qemu_console="ttyAMA0",
             # /proc/kcore is broken on older versions.
@@ -373,7 +377,8 @@ ARCHITECTURES = {
                     CONFIG_ARM_LPAE=n
                 """,
             },
-            kernel_org_compiler_name="arm-linux-gnueabi",
+            kernel_org_compiler_host_name=None,
+            kernel_org_compiler_target_name="arm-linux-gnueabi",
             qemu_options=("-M", "virt,highmem=off"),
             qemu_console="ttyAMA0",
             # /proc/kcore is broken on older versions.
@@ -399,7 +404,8 @@ ARCHITECTURES = {
                 CONFIG_CRYPTO_AES_GCM_P10=n
             """,
             kernel_flavor_configs={},
-            kernel_org_compiler_name="powerpc64-linux",
+            kernel_org_compiler_host_name="ppc64le",
+            kernel_org_compiler_target_name="powerpc64-linux",
             qemu_options=(),
             qemu_console="hvc0",
             # Need an implementation of
@@ -427,7 +433,8 @@ ARCHITECTURES = {
                 CONFIG_RANDOMIZE_BASE=n
             """,
             kernel_flavor_configs={},
-            kernel_org_compiler_name="riscv64-linux",
+            kernel_org_compiler_host_name=None,
+            kernel_org_compiler_target_name="riscv64-linux",
             qemu_options=("-M", "virt"),
             qemu_console="ttyS0",
             # RISC-V support was added in Linux 4.15. Linux 6.11 and older need
@@ -450,7 +457,8 @@ ARCHITECTURES = {
                 CONFIG_CRYPTO_SHA256_S390=y
             """,
             kernel_flavor_configs={},
-            kernel_org_compiler_name="s390-linux",
+            kernel_org_compiler_host_name=None,
+            kernel_org_compiler_target_name="s390-linux",
             qemu_options=(),
             qemu_console="ttysclp0",
             # Need an implementation of
@@ -478,7 +486,8 @@ ARCHITECTURES = {
                     CONFIG_FRAME_POINTER_UNWINDER=y
                 """,
             },
-            kernel_org_compiler_name="x86_64-linux",
+            kernel_org_compiler_host_name="x86_64",
+            kernel_org_compiler_target_name="x86_64-linux",
             qemu_options=("-nodefaults",),
             qemu_console="ttyS0",
         ),
@@ -518,6 +527,14 @@ class Compiler(NamedTuple):
             "PATH": path,
             "CROSS_COMPILE": self.prefix,
         }
+
+
+def compiler_name(host_name: str, target_name: str) -> str:
+    return f"{host_name}-gcc-{KERNEL_ORG_COMPILER_VERSION}-nolibc-{target_name}"
+
+
+def compiler_url(host_name: str, target_name: str) -> str:
+    return f"https://github.com/osandov/drgn/releases/download/vmtest-compilers/{compiler_name(host_name, target_name)}.tar.xz"
 
 
 def kconfig_localversion(arch: Architecture, flavor: KernelFlavor, version: str) -> str:
