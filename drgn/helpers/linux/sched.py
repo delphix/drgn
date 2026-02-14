@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2026, Oracle and/or its affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
@@ -9,7 +10,7 @@ The ``drgn.helpers.linux.sched`` module provides helpers for working with the
 Linux CPU scheduler.
 """
 
-from typing import Tuple
+from typing import Iterator, Tuple
 
 from _drgn import (
     _linux_helper_cpu_curr,
@@ -18,17 +19,26 @@ from _drgn import (
     _linux_helper_task_on_cpu as task_on_cpu,
     _linux_helper_task_thread_info as task_thread_info,
 )
-from drgn import IntegerLike, Object, Program
+from drgn import IntegerLike, Object, Program, container_of
 from drgn.helpers.common.prog import takes_program_or_default
+from drgn.helpers.linux.cgroup import cgroup_name
+from drgn.helpers.linux.list import list_for_each_entry
 from drgn.helpers.linux.percpu import per_cpu
+from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
 
 __all__ = (
+    "cfs_rq_for_each_entity",
     "cpu_curr",
     "cpu_rq",
     "get_task_state",
     "idle_task",
     "loadavg",
+    "rq_for_each_fair_task",
+    "rq_for_each_rt_task",
+    "sched_entity_is_task",
+    "sched_entity_to_task",
     "task_cpu",
+    "task_group_name",
     "task_on_cpu",
     "task_rq",
     "task_since_last_arrival_ns",
@@ -176,9 +186,9 @@ def cpu_rq(prog: Program, cpu: IntegerLike) -> Object:
     Get the runqueue for a given cpu.
 
     :param cpu: CPU number.
-    :returns: ``struct rq``
+    :returns: ``struct rq *``
     """
-    return per_cpu(prog["runqueues"], cpu)
+    return per_cpu(prog["runqueues"], cpu).address_of_()
 
 
 def task_rq(task: Object) -> Object:
@@ -186,9 +196,145 @@ def task_rq(task: Object) -> Object:
     Get the runqueue for a given task.
 
     :param task: ``struct task_struct *``
-    :returns: ``struct rq``
+    :returns: ``struct rq *``
     """
     return cpu_rq(task.prog_, task_cpu(task))
+
+
+def rq_for_each_fair_task(rq: Object) -> Iterator[Object]:
+    """
+    Iterate over tasks on a runqueue in the fair scheduling class (EEVDF or
+    CFS).
+
+    :param rq: ``struct rq *``
+    :return: Iterator of ``struct task_struct *`` objects
+    """
+    try:
+        cfs_tasks = rq.cfs_tasks
+    except AttributeError:
+        # Before Linux kernel commit cac5cefbade9 ("sched/smp: Make SMP
+        # unconditional") (in v6.17), cfs_tasks does not exist on !SMP. Fall
+        # back to walking the tasks_timeline hierarchy.
+        return (
+            sched_entity_to_task(se)
+            for se, _, _, is_task in cfs_rq_for_each_entity(rq.cfs.address_of_())
+            if is_task
+        )
+    return list_for_each_entry(
+        "struct task_struct", cfs_tasks.address_of_(), "se.group_node"
+    )
+
+
+def rq_for_each_rt_task(rq: Object) -> Iterator[Object]:
+    """
+    Iterate over tasks on a runqueue in the realtime scheduling class.
+
+    :param rq: ``struct rq *``
+    :return: Iterator of ``struct task_struct *`` objects
+    """
+    for queue in rq.rt.active.queue:
+        yield from list_for_each_entry(
+            "struct task_struct", queue.address_of_(), "rt.run_list"
+        )
+
+
+def sched_entity_is_task(se: Object) -> bool:
+    """
+    Return whether a scheduler entity is a task.
+
+    :param se: ``struct sched_entity *``
+    """
+    try:
+        return not se.my_q
+    except AttributeError:
+        return True
+
+
+def sched_entity_to_task(se: Object) -> Object:
+    """
+    Get the task represented by a scheduler entity.
+
+    Note that this does not check whether the entity is actually a task; see
+    :func:`sched_entity_is_task()`.
+
+    :param se: ``struct sched_entity *``
+    :return: ``struct task_struct *``
+    """
+    return container_of(se, "struct task_struct", "se")
+
+
+def task_group_name(tg: Object) -> bytes:
+    """
+    Get the name of a task group.
+
+    :param tg: ``struct task_group *``
+    :return: Cgroup name, or empty byte string if not a cgroup.
+    """
+    cgrp = tg.css.cgroup.read_()
+    if not cgrp:
+        return b""
+    return cgroup_name(cgrp)
+
+
+def cfs_rq_for_each_entity(cfs_rq: Object) -> Iterator[Tuple[Object, int, bool, bool]]:
+    """
+    Iterate over all entities on a fair scheduler runqueue (recursively).
+
+    Task groups are visited before their children (i.e., this does a pre-order
+    traversal).
+
+    :param cfs_rq: ``struct cfs_rq *``
+    :return: Iterator of (``struct sched_entity *``, ``depth``, ``is_curr``,
+        ``is_task``) tuples.
+
+        ``depth`` is the depth of the entity relative to the runqueue (e.g.,
+        direct children have depth 0, entities in descendant task groups have
+        depth > 0).
+
+        ``is_curr`` is whether the entity is the current entity on its
+        runqueue.
+
+        If ``is_task`` is ``True``, then the entity is a task, which can be
+        obtained with :func:`sched_entity_to_task()`. Otherwise, it is a task
+        group.
+    """
+
+    def entities(cfs_rq: Object) -> Iterator[Tuple[Object, bool]]:
+        curr = cfs_rq.curr.read_()
+        if curr:
+            yield curr, True
+
+        # Since Linux kernel commit bfb068892d30 ("sched/fair: replace
+        # cfs_rq->rb_leftmost") (in v4.14), tasks_timeline is a struct
+        # rb_root_cached. Before that, it was a struct rb_root.
+        rb_root = cfs_rq.tasks_timeline
+        try:
+            rb_root = rb_root.rb_root
+        except AttributeError:
+            pass
+
+        for se in rbtree_inorder_for_each_entry(
+            "struct sched_entity", rb_root.address_of_(), "run_node"
+        ):
+            yield se, False
+
+    stack = [(entities(cfs_rq), 0)]
+    while stack:
+        it, depth = stack[-1]
+        try:
+            se, is_curr = next(it)
+        except StopIteration:
+            stack.pop()
+        else:
+            try:
+                my_q = se.my_q.read_()
+            except AttributeError:
+                my_q = None
+
+            yield se, depth, is_curr, not my_q
+
+            if my_q:
+                stack.append((entities(my_q), depth + 1))
 
 
 def task_since_last_arrival_ns(task: Object) -> int:

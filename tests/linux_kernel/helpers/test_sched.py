@@ -1,19 +1,32 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import contextlib
 import os
+from pathlib import Path
+import resource
 import signal
 from threading import Condition, Thread
 import time
+import unittest
 
+from drgn import container_of
+from drgn.helpers.linux.cgroup import cgroup_get_from_path
 from drgn.helpers.linux.cpumask import for_each_possible_cpu
 from drgn.helpers.linux.pid import find_task
 from drgn.helpers.linux.sched import (
+    cfs_rq_for_each_entity,
     cpu_curr,
+    cpu_rq,
     get_task_state,
     idle_task,
     loadavg,
+    rq_for_each_fair_task,
+    rq_for_each_rt_task,
+    sched_entity_is_task,
+    sched_entity_to_task,
     task_cpu,
+    task_group_name,
     task_on_cpu,
     task_since_last_arrival_ns,
     task_state_to_char,
@@ -27,6 +40,15 @@ from tests.linux_kernel import (
     skip_unless_have_test_kmod,
     wait_until,
 )
+from tests.linux_kernel.helpers.test_cgroup import tmp_cgroup
+
+
+@contextlib.contextmanager
+def tmp_cgroup_with_cpu_controller():
+    with tmp_cgroup() as cgroup_dir:
+        if "cpu" not in (cgroup_dir / "cgroup.controllers").read_text().split():
+            raise unittest.SkipTest("cgroup CPU controller not enabled")
+        yield cgroup_dir
 
 
 class TestSched(LinuxKernelTestCase):
@@ -116,6 +138,92 @@ class TestSched(LinuxKernelTestCase):
                 os.sched_setaffinity(pid, other_affinity)
             task = find_task(self.prog, pid)
             self.assertGreaterEqual(task_since_last_arrival_ns(task), 10000000)
+
+    def test_rq_for_each_fair_task(self):
+        old_affinity = os.sched_getaffinity(0)
+        cpu = max(old_affinity)
+        os.sched_setaffinity(0, (cpu,))
+        self.addCleanup(os.sched_setaffinity, 0, old_affinity)
+
+        rq = cpu_rq(self.prog, cpu)
+        pids = [task.pid.value_() for task in rq_for_each_fair_task(rq)]
+        self.assertIn(os.getpid(), pids)
+
+    def test_rq_for_each_rt_task(self):
+        old_affinity = os.sched_getaffinity(0)
+        cpu = max(old_affinity)
+        os.sched_setaffinity(0, (cpu,))
+        self.addCleanup(os.sched_setaffinity, 0, old_affinity)
+
+        old_rlimit = resource.getrlimit(resource.RLIMIT_RTTIME)
+        resource.setrlimit(
+            resource.RLIMIT_RTTIME, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+        )
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_RTTIME, old_rlimit)
+
+        old_scheduler = os.sched_getscheduler(0)
+        old_param = os.sched_getparam(0)
+        os.sched_setscheduler(0, os.SCHED_RR, os.sched_param(1))
+        self.addCleanup(os.sched_setscheduler, 0, old_scheduler, old_param)
+
+        rq = cpu_rq(self.prog, cpu)
+        pids = [task.pid.value_() for task in rq_for_each_rt_task(rq)]
+        self.assertIn(os.getpid(), pids)
+
+    def test_sched_entity_is_task(self):
+        task = find_task(self.prog, os.getpid())
+        self.assertTrue(sched_entity_is_task(task.se.address_of_()))
+
+    def test_sched_entity_is_task_false(self):
+        with tmp_cgroup_with_cpu_controller() as cgroup_dir:
+            cgrp = cgroup_get_from_path(self.prog, cgroup_dir.name)
+            css = cgrp.subsys[self.prog["cpu_cgrp_id"]]
+            task_group = container_of(css, "struct task_group", "css")
+            cpu = min(os.sched_getaffinity(0))
+            se = task_group.se[cpu].read_()
+            self.assertFalse(sched_entity_is_task(se))
+
+    def test_sched_entity_to_task(self):
+        task = find_task(self.prog, os.getpid())
+        self.assertEqual(sched_entity_to_task(task.se.address_of_()), task)
+
+    def test_task_group_name(self):
+        with tmp_cgroup_with_cpu_controller() as cgroup_dir:
+            cgrp = cgroup_get_from_path(self.prog, cgroup_dir.name)
+            css = cgrp.subsys[self.prog["cpu_cgrp_id"]]
+            task_group = container_of(css, "struct task_group", "css")
+            self.assertEqual(task_group_name(task_group), cgroup_dir.name.encode())
+
+    def test_cfs_rq_for_each_entity(self):
+        old_affinity = os.sched_getaffinity(0)
+        cpu = max(old_affinity)
+        self.addCleanup(os.sched_setaffinity, 0, old_affinity)
+        os.sched_setaffinity(0, (cpu,))
+
+        with tmp_cgroup_with_cpu_controller() as cgroup_dir:
+            old_cgroup = (
+                Path("/proc/self/cgroup").read_text().strip().partition("::")[2]
+            )
+            old_cgroup_procs = (
+                cgroup_dir.parent / old_cgroup.lstrip("/") / "cgroup.procs"
+            )
+            (cgroup_dir / "cgroup.procs").write_text(str(os.getpid()))
+            try:
+                cgrp = cgroup_get_from_path(self.prog, cgroup_dir.name)
+                css = cgrp.subsys[self.prog["cpu_cgrp_id"]]
+                task_group = container_of(css, "struct task_group", "css")
+                task_group_se = task_group.se[cpu].read_()
+
+                task = find_task(self.prog, os.getpid())
+                task_se = task.se.address_of_()
+
+                entities = list(
+                    cfs_rq_for_each_entity(cpu_rq(self.prog, cpu).cfs.address_of_())
+                )
+                self.assertIn((task_group_se, 0, True, False), entities)
+                self.assertIn((task_se, 1, True, True), entities)
+            finally:
+                old_cgroup_procs.write_text(str(os.getpid()))
 
     def test_thread_group_leader(self):
         condition = Condition()
