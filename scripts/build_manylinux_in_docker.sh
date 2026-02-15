@@ -7,9 +7,15 @@ set -eux
 # Drop into a shell if something fails.
 trap 'if [ $? -ne 0 ]; then exec bash -i; fi' EXIT
 
-sed -i -e 's/mirrorlist/#mirrorlist/g' \
-	-e 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \
-	/etc/yum.repos.d/CentOS-*
+BUILD_ONLY_PYTHON="${1:-}"
+
+case "$PLAT" in
+manylinux2014_*)
+	sed -i -e 's/mirrorlist/#mirrorlist/g' \
+		-e 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \
+		/etc/yum.repos.d/CentOS-*
+	;;
+esac
 
 yum install -y \
 	bzip2-devel \
@@ -17,35 +23,37 @@ yum install -y \
 	libcurl-devel \
 	libzstd-devel \
 	lzo-devel \
-	pcre2-devel \
 	snappy-devel \
 	xz-devel \
 	zlib-devel \
 	zstd
 
-BUILD_ONLY_PYTHON=""
-if [ -n "${1:-}" ]; then
-	# Translate, e.g. 3.10 -> (3, 10)
-	BUILD_ONLY_PYTHON="$(echo "$1" | perl -pe 's/(\d+)\.(\d+)/(\1, \2)/')"
-fi
-
 # Install a recent version of elfutils instead of whatever is in the manylinux
 # image.
-elfutils_version=0.193
+elfutils_version=0.194
 elfutils_url=https://sourceware.org/elfutils/ftp/$elfutils_version/elfutils-$elfutils_version.tar.bz2
 mkdir /tmp/elfutils
 cd /tmp/elfutils
 curl -L "$elfutils_url" | tar -xj --strip-components=1
-./configure --enable-libdebuginfod --disable-debuginfod --with-zlib --with-bzlib --with-lzma --with-zstd
+CFLAGS="-g -O2 -Wno-error" ./configure --disable-werror --enable-libdebuginfod --disable-debuginfod --with-zlib --with-bzlib --with-lzma --with-zstd
 make -j$(($(nproc) + 1))
 make install
 
-libkdumpfile_version=0.5.5
-libkdumpfile_url=https://github.com/ptesarik/libkdumpfile/releases/download/v$libkdumpfile_version/libkdumpfile-$libkdumpfile_version.tar.gz
+libkdumpfile_version=0.5.6
+libkdumpfile_url=https://codeberg.org/ptesarik/libkdumpfile/releases/download/v$libkdumpfile_version/libkdumpfile-$libkdumpfile_version.tar.gz
 mkdir /tmp/libkdumpfile
 cd /tmp/libkdumpfile
 curl -L "$libkdumpfile_url" | tar -xz --strip-components=1
-./configure --with-libzstd --with-lzo2 --with-snappy --with-zlib --without-python --disable-kdumpid
+./configure --with-libzstd --with-lzo2 --with-snappy --with-zlib --disable-kdumpid
+make -j$(($(nproc) + 1))
+make install
+
+pcre2_version=10.47
+pcre2_url=https://github.com/PCRE2Project/pcre2/releases/download/pcre2-$pcre2_version/pcre2-$pcre2_version.tar.gz
+mkdir /tmp/pcre2
+cd /tmp/pcre2
+curl -L "$pcre2_url" | tar -xz --strip-components=1
+./configure --enable-pcre2-8 --disable-pcre2-16 --disable-pcre2-32 --enable-unicode --enable-jit
 make -j$(($(nproc) + 1))
 make install
 
@@ -68,7 +76,7 @@ tar -xf "/io/$SDIST" --strip-components=1
 build_for_python() {
 	if [ -n "$BUILD_ONLY_PYTHON" ]; then
 		# Build for selected Python release only
-		"$1" -c "import sys; sys.exit(sys.version_info[:2] != $BUILD_ONLY_PYTHON)"
+		"$1" -c 'import sys; sys.exit(f"{sys.version_info.major}.{sys.version_info.minor}{sys.abiflags}" != sys.argv[1])' "$BUILD_ONLY_PYTHON"
 	else
 		# Build for all supported Pythons
 		"$1" -c 'import sys; sys.exit(sys.version_info < (3, 8))'
