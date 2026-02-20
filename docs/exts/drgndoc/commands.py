@@ -46,6 +46,7 @@ def _log_unrecognized_input(e: Union[str, UnrecognizedInputError]) -> None:
 
 class Command(NamedTuple):
     func: ResolvedNode[Function]
+    namespace: str
     name: str
     decorator: ast.Call
     enabled: str
@@ -189,9 +190,9 @@ class CommandFormatter:
                     namespace = ""
                     enabled = "linux"
                 elif (
-                    name == "drgn.commands.crash.crash_command"
-                    or name == "drgn.commands.crash.crash_custom_command"
-                    or name == "drgn.commands.crash.crash_raw_command"
+                    name == "drgn.commands._crash.common.crash_command"
+                    or name == "drgn.commands._crash.common.crash_custom_command"
+                    or name == "drgn.commands._crash.common.crash_raw_command"
                 ):
                     namespace = "crash"
                 else:
@@ -206,6 +207,7 @@ class CommandFormatter:
 
                 command = Command(
                     func=func,
+                    namespace=namespace,
                     name=self._command_name(func.name, decorator, namespace),
                     decorator=decorator,
                     enabled=enabled,
@@ -548,8 +550,16 @@ class CommandFormatter:
                 _format_text(lines, help, indent="    ")
 
     def format(self, command: Command) -> List[str]:
+        label = "drgncommand-"
+        if command.namespace:
+            label = f"{label}{command.namespace}-"
+        label += command.name.replace("*", "asterisk")
+
         command_name = command.name.replace("*", r"\*")
+
         lines = [
+            f".. _{label}:",
+            "",
             command_name,
             "=" * len(command_name),
         ]
