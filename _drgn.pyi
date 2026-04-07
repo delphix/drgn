@@ -849,6 +849,42 @@ class Program:
         """
         ...
 
+    def set_qemu_qmp(self, address: Union[str, int]) -> None:
+        """
+        Set the program to a QEMU guest over the QEMU Machine Protocol (QMP).
+
+        This does not load any debugging symbols; see
+        :meth:`load_default_debug_info()`.
+
+        .. note::
+
+            This can identify Linux kernel guests automatically. To do so, you
+            must:
+
+            1. Use a Unix domain socket for the QMP connection (e.g., run QEMU
+               with ``-qmp unix:/path/to/sock,server=on,wait=off``).
+            2. Use a Linux kernel version >= 4.17 in the guest.
+            3. Run QEMU with ``-device vmcoreinfo``.
+            4. Set ``CONFIG_KEXEC=y`` and ``CONFIG_FW_CFG_SYSFS=y`` in the
+               guest kernel's configuration. (Alternatively, you can use
+               ``CONFIG_FW_CFG_SYSFS=m`` and ensure that the ``qemu_fw_cfg``
+               kernel module is loaded.)
+
+            Otherwise, you may need to pass *vmcoreinfo* explicitly to
+            :class:`Program()`.
+
+        :param address: QMP socket address or file descriptor. If the address
+            is in the format ``host:port``, where ``host`` is a hostname, IP
+            address, or empty (for localhost) and ``port`` is a valid port
+            number (decimal integer 1-65535), then it is interpreted as a TCP
+            address. Otherwise, it is interpreted as a Unix domain socket path.
+
+            Note that hostnames may not begin with ``/`` or ``.``, so a Unix
+            domain socket path containing ``:`` may be prefixed with one of
+            those to disambiguate it.
+        """
+        ...
+
     def modules(self) -> Iterator[Module]:
         """Get an iterator over all of the created modules in the program."""
 
@@ -4101,6 +4137,7 @@ class OutOfBoundsError(Exception):
 _elfutils_version: str
 _have_debuginfod: bool
 _enable_dlopen_debuginfod: bool
+_with_json_c: bool
 _with_libkdumpfile: bool
 _with_lzma: bool
 _with_pcre2: bool

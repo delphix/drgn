@@ -128,10 +128,11 @@ def version_header() -> str:
     debuginfod = f'with{"" if drgn._have_debuginfod else "out"} debuginfod'
     if drgn._enable_dlopen_debuginfod:
         debuginfod += " (dlopen)"
+    json_c = f'with{"" if drgn._with_json_c else "out"} json-c'
     libkdumpfile = f'with{"" if drgn._with_libkdumpfile else "out"} libkdumpfile'
     lzma = f'with{"" if drgn._with_lzma else "out"} lzma'
     pcre2 = f'with{"" if drgn._with_pcre2 else "out"} pcre2'
-    return f"drgn {drgn.__version__} (using Python {python_version}, elfutils {drgn._elfutils_version}, {debuginfod}, {libkdumpfile}, {lzma}, {pcre2})"
+    return f"drgn {drgn.__version__} (using Python {python_version}, elfutils {drgn._elfutils_version}, {debuginfod}, {json_c}, {libkdumpfile}, {lzma}, {pcre2})"
 
 
 def default_globals(prog: drgn.Program) -> Dict[str, Any]:
@@ -474,6 +475,14 @@ def _main() -> None:
         type=int,
         help="debug the running process with the given PID",
     )
+    program_group.add_argument(
+        "--qemu",
+        metavar="ADDRESS",
+        type=str,
+        help="debug a QEMU guest over the QEMU Machine Protocol (QMP) "
+        "at the given address, which may be a Unix domain socket path "
+        "or a TCP address as host:port",
+    )
 
     symbol_group = parser.add_argument_group("debugging symbols")
     symbol_group.add_argument(
@@ -677,6 +686,8 @@ def _main() -> None:
                 sys.exit(
                     f"{e}\nerror: attaching to live process requires ptrace attach permissions"
                 )
+        elif args.qemu is not None:
+            prog.set_qemu_qmp(args.qemu)
         else:
             _set_kernel_with_sudo_fallback(prog)
     except OSError as e:
