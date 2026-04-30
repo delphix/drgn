@@ -5,6 +5,7 @@ import os
 
 from drgn import NULL
 from drgn.helpers.linux.sysfs import (
+    kobject_path,
     sysfs_listdir,
     sysfs_lookup,
     sysfs_lookup_kobject,
@@ -236,3 +237,6 @@ class TestSysfs(LinuxKernelTestCase):
         self.assertRaisesRegex(
             ValueError, "not a directory", sysfs_listdir, self.prog, "kernel/vmcoreinfo"
         )
+
+    def test_kobject_path(self):
+        self.assertEqual(kobject_path(self.prog["kernel_kobj"]), b"/sys/kernel")
