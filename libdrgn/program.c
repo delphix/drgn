@@ -5,7 +5,6 @@
 #include <byteswap.h>
 #include <dirent.h>
 #include <elf.h>
-#include <elfutils/libdw.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <gelf.h>
@@ -25,7 +24,6 @@
 #include "helpers.h"
 #include "io.h"
 #include "language.h"
-#include "log.h"
 #include "linux_kernel.h"
 #include "log.h"
 #include "memory_reader.h"
@@ -276,7 +274,7 @@ drgn_program_set_enabled_##which##_finders(struct drgn_program *prog,		\
 					   size_t count)			\
 {										\
 	return drgn_handler_list_set_enabled(&prog->which##_finders, names,	\
-					     count, #which "finder");		\
+					     count, #which " finder");		\
 }										\
 										\
 LIBDRGN_PUBLIC struct drgn_error *						\
