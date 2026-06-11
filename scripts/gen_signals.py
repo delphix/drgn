@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Mapping, Sequence, Set, Tuple
+from typing import Dict, Iterator, List, Mapping, Sequence, Set, Tuple
 
 _SRCARCH_TO_MACHINE_NAMES = {
     "arm64": ["aarch64"],
@@ -19,6 +19,18 @@ _SRCARCH_TO_MACHINE_NAMES = {
     "s390": ["s390", "s390x"],
     "sparc": ["sparc", "sparc64"],
     "x86": ["i386", "x86_64"],
+}
+
+
+PREFERRED_SIGNAL_NAMES = {
+    "SIGCHLD",
+    "SIGABRT",
+    "SIGIO",
+    "SIGSYS",
+    # Preferred over SIGINFO on alpha.
+    "SIGPWR",
+    # Preferred over SIGSWI on arm.
+    "SIGRTMIN",
 }
 
 
@@ -39,118 +51,12 @@ def create_mandatory(
             shutil.copyfile(generic_dir / file, dest_dir / file)
 
 
-def parse_constants(contents: str, prefix: str) -> Dict[str, int]:
-    result = {}
-    for name, definition in re.findall(
-        rf"^gen_signals_py_({re.escape(prefix)}\S+) (.*)", contents, flags=re.M
-    ):
-        if match := re.fullmatch(r"\(\s*([0-9]+)\s*-\s*([0-9]+)\s*\)", definition):
-            # Hack for xtensa, which defines SIGRTMAX as (_NSIG-1)
-            result[name] = int(match.group(1)) - int(match.group(2))
-        else:
-            result[name] = int(
-                # Remove U and L suffixes.
-                re.sub(
-                    r"^([0-9]+|0x[0-9a-f]+)[ul]+$",
-                    r"\1",
-                    definition,
-                    flags=re.IGNORECASE,
-                ),
-                0,
-            )
-    return result
-
-
-def add_synonym(constants: Dict[str, int], name1: str, name2: str) -> None:
-    try:
-        if constants[name1] != constants[name2]:
-            raise ValueError(f"{name1} and {name2} are not synonyms")
-        return
-    except KeyError:
-        pass
-    try:
-        constants[name1] = constants[name2]
-        return
-    except KeyError:
-        pass
-    try:
-        constants[name2] = constants[name1]
-    except KeyError:
-        pass
-
-
-def sort_constants(
-    constants: Dict[str, int], preferred_synonyms: Set[str]
-) -> Tuple[Tuple[str, int], ...]:
-    def key_func(item: Tuple[str, int]):
-        name, value = item
-        return value, name not in preferred_synonyms
-
-    sorted_constants = tuple(sorted(constants.items(), key=key_func))
-    for i in range(1, len(sorted_constants)):
-        if key_func(sorted_constants[i - 1]) == key_func(sorted_constants[i]):
-            raise ValueError(
-                f"duplicate constants {sorted_constants[i - 1][0]} and {sorted_constants[i][0]}"
-            )
-    return sorted_constants
-
-
-def print_deduplicated(
-    deduplicated: Mapping[Tuple[Tuple[str, int], ...], Sequence[str]],
-    dict_name: str,
-    value_format: str,
-) -> None:
-    sys.stdout.write(f"_{dict_name}_TMP = {{}}\n")
-    for items, machine_names in sorted(
-        deduplicated.items(), key=lambda item: min(item[1])
-    ):
-        if len(machine_names) == 1:
-            sys.stdout.write(f'_{dict_name}_TMP["{machine_names[0]}"] = ')
-            indent = ""
-        else:
-            quoted_machine_names = [
-                f'"{machine_name}"' for machine_name in machine_names
-            ]
-            quoted_machine_names.sort()
-            sys.stdout.write(
-                f"""\
-for _name in ({", ".join(quoted_machine_names)}):
-    _{dict_name}_TMP[_name] = """
-            )
-            indent = "    "
-        sys.stdout.write(
-            f"""types.MappingProxyType(
-{indent}    {{
-"""
-        )
-        for name, value in items:
-            sys.stdout.write(f'{indent}        "{name}": {value:{value_format}},\n')
-        sys.stdout.write(
-            f"""\
-{indent}    }}
-{indent})
-"""
-        )
-    sys.stdout.write(
-        f"""\
-{dict_name} = types.MappingProxyType(_{dict_name}_TMP)
-del _{dict_name}_TMP
-"""
-    )
-
-
-def main() -> None:
-    argparse.ArgumentParser(
-        description="Generate Python dictionaries containing signal numbers and sigaction flags from the kernel source code"
-    ).parse_args()
-
+def arch_signal_defines() -> Iterator[Tuple[str, str]]:
     asm_generic_mandatory_y = parse_mandatory_y(Path("include/asm-generic/Kbuild"))
     uapi_asm_generic_mandatory_y = parse_mandatory_y(
         Path("include/uapi/asm-generic/Kbuild")
     )
 
-    deduplicated_signals: Dict[Tuple[Tuple[str, int], ...], List[str]] = {}
-    deduplicated_flags: Dict[Tuple[Tuple[str, int], ...], List[str]] = {}
     for arch_dir in Path("arch").iterdir():
         if not arch_dir.is_dir() or arch_dir.name == "um":
             continue
@@ -243,40 +149,160 @@ def main() -> None:
                 text=True,
             ).stdout
 
-            machine_names = srcarch_to_machine_names(arch_dir.name)
+            yield arch_dir.name, expanded
 
-            signals = parse_constants(expanded, "SIG")
-            add_synonym(signals, "SIGCHLD", "SIGCLD")
-            add_synonym(signals, "SIGABRT", "SIGIOT")
-            add_synonym(signals, "SIGIO", "SIGPOLL")
-            add_synonym(signals, "SIGSYS", "SIGUNUSED")
-            sorted_signals = sort_constants(
-                signals,
-                {
-                    "SIGCHLD",
-                    "SIGABRT",
-                    "SIGIO",
-                    "SIGSYS",
-                    # Preferred over SIGINFO on alpha.
-                    "SIGPWR",
-                    # Preferred over SIGSWI on arm.
-                    "SIGRTMIN",
-                },
+
+def parse_constants(contents: str, prefix: str) -> Dict[str, int]:
+    result = {}
+    for name, definition in re.findall(
+        rf"^gen_signals_py_({re.escape(prefix)}\S+) (.*)", contents, flags=re.M
+    ):
+        if match := re.fullmatch(r"\(\s*([0-9]+)\s*-\s*([0-9]+)\s*\)", definition):
+            # Hack for xtensa, which defines SIGRTMAX as (_NSIG-1)
+            result[name] = int(match.group(1)) - int(match.group(2))
+        else:
+            result[name] = int(
+                # Remove U and L suffixes.
+                re.sub(
+                    r"^([0-9]+|0x[0-9a-f]+)[ul]+$",
+                    r"\1",
+                    definition,
+                    flags=re.IGNORECASE,
+                ),
+                0,
             )
-            deduplicated_signals.setdefault(sorted_signals, []).extend(machine_names)
+    return result
 
-            flags = parse_constants(expanded, "SA_")
-            add_synonym(flags, "SA_NODEFER", "SA_NOMASK")
-            add_synonym(flags, "SA_RESETHAND", "SA_ONESHOT")
-            add_synonym(flags, "SA_ONSTACK", "SA_STACK")
-            sorted_flags = sort_constants(
-                flags, {"SA_NODEFER", "SA_RESETHAND", "SA_ONSTACK"}
+
+def add_synonym(constants: Dict[str, int], name1: str, name2: str) -> None:
+    try:
+        if constants[name1] != constants[name2]:
+            raise ValueError(f"{name1} and {name2} are not synonyms")
+        return
+    except KeyError:
+        pass
+    try:
+        constants[name1] = constants[name2]
+        return
+    except KeyError:
+        pass
+    try:
+        constants[name2] = constants[name1]
+    except KeyError:
+        pass
+
+
+def sort_constants(
+    constants: Dict[str, int], preferred_synonyms: Set[str]
+) -> Tuple[Tuple[str, int], ...]:
+    def key_func(item: Tuple[str, int]):
+        name, value = item
+        return value, name not in preferred_synonyms
+
+    sorted_constants = tuple(sorted(constants.items(), key=key_func))
+    for i in range(1, len(sorted_constants)):
+        if key_func(sorted_constants[i - 1]) == key_func(sorted_constants[i]):
+            raise ValueError(
+                f"duplicate constants {sorted_constants[i - 1][0]} and {sorted_constants[i][0]}"
             )
-            deduplicated_flags.setdefault(sorted_flags, []).extend(machine_names)
+    return sorted_constants
 
+
+def print_deduplicated(
+    deduplicated: Mapping[Tuple[Tuple[str, int], ...], Sequence[str]],
+    dict_name: str,
+    value_format: str,
+) -> None:
+    sys.stdout.write(f"{dict_name} = types.MappingProxyType({{\n")
+    for items, machine_names in sorted(
+        deduplicated.items(), key=lambda item: min(item[1])
+    ):
+        if len(machine_names) == 1:
+            indent = "    "
+            sys.stdout.write(f'    "{machine_names[0]}": ')
+        else:
+            indent = "        "
+            quoted_machine_names = [
+                f'"{machine_name}"' for machine_name in machine_names
+            ]
+            quoted_machine_names.sort()
+            sys.stdout.write(
+                f"    **dict.fromkeys(\n"
+                f"        ({', '.join(quoted_machine_names)}),\n"
+                f"        "
+            )
+        sys.stdout.write(f"types.MappingProxyType(\n{indent}    {{\n")
+        for name, value in items:
+            sys.stdout.write(f'{indent}        "{name}": {value:{value_format}},\n')
+        sys.stdout.write(f"{indent}    }}\n{indent})")
+        if len(machine_names) == 1:
+            sys.stdout.write(",\n")
+        else:
+            sys.stdout.write(",\n    ),\n")
+    sys.stdout.write("})\n")
+
+
+def python_dicts() -> None:
+    deduplicated_signals: Dict[Tuple[Tuple[str, int], ...], List[str]] = {}
+    deduplicated_flags: Dict[Tuple[Tuple[str, int], ...], List[str]] = {}
+    for srcarch, defines in arch_signal_defines():
+        machine_names = srcarch_to_machine_names(srcarch)
+
+        signals = parse_constants(defines, "SIG")
+        add_synonym(signals, "SIGCHLD", "SIGCLD")
+        add_synonym(signals, "SIGABRT", "SIGIOT")
+        add_synonym(signals, "SIGIO", "SIGPOLL")
+        add_synonym(signals, "SIGSYS", "SIGUNUSED")
+        sorted_signals = sort_constants(signals, PREFERRED_SIGNAL_NAMES)
+        deduplicated_signals.setdefault(sorted_signals, []).extend(machine_names)
+
+        flags = parse_constants(defines, "SA_")
+        add_synonym(flags, "SA_NODEFER", "SA_NOMASK")
+        add_synonym(flags, "SA_RESETHAND", "SA_ONESHOT")
+        add_synonym(flags, "SA_ONSTACK", "SA_STACK")
+        sorted_flags = sort_constants(
+            flags, {"SA_NODEFER", "SA_RESETHAND", "SA_ONSTACK"}
+        )
+        deduplicated_flags.setdefault(sorted_flags, []).extend(machine_names)
+
+    print("# Generated by scripts/gen_signals.py python_dicts.")
     print_deduplicated(deduplicated_signals, "SIGNALS_BY_MACHINE_NAME", "")
     print()
     print_deduplicated(deduplicated_flags, "SIGACTION_FLAGS_BY_MACHINE_NAME", "#x")
+
+
+def signal_str() -> None:
+    all_signals = set()
+    for srcarch, defines in arch_signal_defines():
+        signals = parse_constants(defines, "SIG")
+        all_signals.update(signals.keys())
+
+    print("// Generated by scripts/gen_signals.py signal_str.")
+    for name in sorted(
+        all_signals, key=lambda name: (name not in PREFERRED_SIGNAL_NAMES, name)
+    ):
+        sys.stdout.write(
+            f"""\
+#ifdef {name}
+\tif (sig == {name}) return "{name}";
+#endif
+"""
+        )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate code from signal numbers and sigaction flags from the kernel source code"
+    )
+    parser.add_argument(
+        "mode", choices=("python_dicts", "signal_str"), help="what to generate"
+    )
+    args = parser.parse_args()
+
+    if args.mode == "python_dicts":
+        python_dicts()
+    else:
+        signal_str()
 
 
 if __name__ == "__main__":
