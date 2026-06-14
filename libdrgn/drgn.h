@@ -91,6 +91,18 @@ enum drgn_error_code {
 	DRGN_ERROR_OBJECT_ABSENT,
 	/** Functionality is not implemented. */
 	DRGN_ERROR_NOT_IMPLEMENTED,
+	/** Operation is not supported. */
+	DRGN_ERROR_UNSUPPORTED_OPERATION,
+	/**
+	 * Invalid operation detected at runtime (structure was modified while
+	 * iterating, invalid reentrant call, etc.).
+	 */
+	DRGN_ERROR_RUNTIME,
+	/**
+	 * External data is corrupted, unrecognized, inconsistent, or otherwise
+	 * invalid.
+	 */
+	DRGN_ERROR_BAD_DATA,
 	/** Number of defined error codes. */
 	DRGN_NUM_ERROR_CODES,
 } __attribute__((__packed__));

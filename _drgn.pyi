@@ -4101,15 +4101,10 @@ def offsetof(type: Union[Type, str], member: str) -> int:
     ...
 
 class FaultError(Exception):
-    """
-    This error is raised when a bad memory access is attempted (i.e., when
-    accessing a memory address which is not valid in a program).
-    """
-
     def __init__(self, message: str, address: int) -> None:
         """
-        :param message: :attr:`FaultError.message`
-        :param address: :attr:`FaultError.address`
+        Error raised when a bad memory access is attempted (i.e., when
+        accessing a memory address which is not valid in a program).
         """
         ...
     message: str
@@ -4117,23 +4112,38 @@ class FaultError(Exception):
     address: int
     """Address that couldn't be accessed."""
 
+class BadDataError(Exception):
+    """
+    Error raised when external data is corrupted, unrecognized, inconsistent,
+    or otherwise invalid.
+    """
+
+    ...
+
 class MissingDebugInfoError(Exception):
     """
-    This error is raised when one or more files in a program do not have debug
+    Error raised when one or more files in a program do not have debug
     information.
     """
 
     ...
 
 class ObjectAbsentError(Exception):
-    """This error is raised when attempting to use an absent object."""
+    """Error raised when attempting to use an absent object."""
 
     ...
 
 class OutOfBoundsError(Exception):
     """
-    This error is raised when attempting to access beyond the bounds of a value
-    object.
+    Error raised when attempting to access beyond the bounds of a value object.
+    """
+
+    ...
+
+class UnsupportedOperation(ValueError):
+    """
+    Error raised when an operation is called on a program or object that
+    can't support it.
     """
 
     ...

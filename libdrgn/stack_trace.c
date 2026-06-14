@@ -603,7 +603,7 @@ not_found:;
 		drgn_module_find_dwarf_file(regs->module,
 					    dwarf_cu_getdwarf(die.cu));
 	if (!file) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
+		return drgn_error_create(DRGN_ERROR_BAD_DATA,
 					 "couldn't find file containing DIE");
 	}
 	// It doesn't make sense to use the registers if the file has a
@@ -877,7 +877,7 @@ drgn_get_initial_registers(struct drgn_program *prog, uint32_t tid,
 			return err;
 		if (on_cpu) {
 			if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
-				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+				return drgn_error_create(DRGN_ERROR_UNSUPPORTED_OPERATION,
 							 "cannot unwind stack of running task");
 			}
 			uint64_t cpu;

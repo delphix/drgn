@@ -899,7 +899,7 @@ drgn_module_section_address_iterator_next(struct drgn_module_section_address_ite
 {
 	if (it->map_it.entry) {
 		if (it->generation != it->module->section_addresses_generation) {
-			return drgn_error_create(DRGN_ERROR_OTHER,
+			return drgn_error_create(DRGN_ERROR_RUNTIME,
 						 "section addresses changed during iteration");
 		}
 		*name_ret = it->map_it.entry->key;
@@ -3299,7 +3299,7 @@ drgn_created_module_iterator_next(struct drgn_module_iterator *_it,
 	}
 
 	if (it->generation != dbinfo->modules_generation) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
+		return drgn_error_create(DRGN_ERROR_RUNTIME,
 					 "modules changed during iteration");
 	}
 
@@ -4487,7 +4487,7 @@ process_add_mapping(struct process_loaded_module_iterator *it,
 		   &segment.start, &segment.end, &map_name_len,
 		   &segment_file_offset, &dev_major, &dev_minor, &ino,
 		   &path_index) != 6) {
-		return drgn_error_format(DRGN_ERROR_OTHER, "couldn't parse %s",
+		return drgn_error_format(DRGN_ERROR_BAD_DATA, "couldn't parse %s",
 					 maps_path);
 	}
 	// Skip anonymous mappings.
@@ -4774,7 +4774,7 @@ static struct drgn_error *parse_nt_file_error(struct binary_buffer *bb,
 					      const char *pos,
 					      const char *message)
 {
-	return drgn_error_create(DRGN_ERROR_OTHER, "couldn't parse NT_FILE");
+	return drgn_error_create(DRGN_ERROR_BAD_DATA, "couldn't parse NT_FILE");
 }
 
 static struct drgn_error *

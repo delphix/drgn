@@ -357,9 +357,11 @@ extern PyTypeObject TypeMember_type;
 extern PyTypeObject TypeParameter_type;
 extern PyTypeObject TypeTemplateParameter_type;
 extern PyTypeObject VdsoModule_type;
+extern PyObject *BadDataError;
 extern PyObject *MissingDebugInfoError;
 extern PyObject *ObjectAbsentError;
 extern PyObject *OutOfBoundsError;
+extern PyObject *UnsupportedOperation;
 
 PyGILState_STATE drgn_initialize_python(bool *success_ret);
 
