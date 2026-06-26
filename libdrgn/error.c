@@ -15,25 +15,49 @@
 #include "string_builder.h"
 #include "util.h"
 
-LIBDRGN_PUBLIC struct drgn_error drgn_enomem = {
-	.code = DRGN_ERROR_NO_MEMORY,
-	.message = "cannot allocate memory",
-};
+_Static_assert(DRGN_NUM_ERROR_CODES - 1 <= INT8_MAX, "too many error codes");
 
-LIBDRGN_PUBLIC struct drgn_error drgn_not_found = {
-	.code = DRGN_ERROR_LOOKUP,
-	.message = "not found",
-};
+LIBDRGN_PUBLIC struct drgn_error drgn_enomem =
+	DRGN_ERROR_INIT(DRGN_ERROR_NO_MEMORY, "cannot allocate memory");
 
-struct drgn_error drgn_stop = {
-	.code = DRGN_ERROR_STOP,
-	.message = "stop iteration",
-};
+LIBDRGN_PUBLIC struct drgn_error drgn_not_found =
+	DRGN_ERROR_INIT(DRGN_ERROR_LOOKUP, "not found");
 
-struct drgn_error drgn_error_object_absent = {
-	.code = DRGN_ERROR_OBJECT_ABSENT,
-	.message = "object absent",
-};
+struct drgn_error drgn_stop =
+	DRGN_ERROR_INIT(DRGN_ERROR_STOP, "stop iteration");
+
+struct drgn_error drgn_error_object_absent =
+	DRGN_ERROR_INIT(DRGN_ERROR_OBJECT_ABSENT, "object absent");
+
+LIBDRGN_PUBLIC enum drgn_error_code drgn_error_code(struct drgn_error *err)
+{
+	drgn_error_resolve(err);
+	return err->_code;
+}
+
+LIBDRGN_PUBLIC const char *drgn_error_message(struct drgn_error *err)
+{
+	drgn_error_resolve(err);
+	return err->_message;
+}
+
+LIBDRGN_PUBLIC int drgn_error_os_errno(struct drgn_error *err)
+{
+	drgn_error_resolve(err);
+	return err->_code == DRGN_ERROR_OS ? err->_errno : 0;
+}
+
+LIBDRGN_PUBLIC const char *drgn_error_os_path(struct drgn_error *err)
+{
+	drgn_error_resolve(err);
+	return err->_code == DRGN_ERROR_OS ? err->_path : NULL;
+}
+
+LIBDRGN_PUBLIC uint64_t drgn_error_fault_address(struct drgn_error *err)
+{
+	drgn_error_resolve(err);
+	return err->_code == DRGN_ERROR_FAULT ? err->_address : 0;
+}
 
 static struct drgn_error *drgn_error_create_nodup(enum drgn_error_code code,
 						  char *message)
@@ -45,13 +69,16 @@ static struct drgn_error *drgn_error_create_nodup(enum drgn_error_code code,
 		free(message);
 		return &drgn_enomem;
 	}
-
-	err->code = code;
-	err->needs_destroy = true;
-	err->errnum = 0;
-	err->path = NULL;
-	err->address = 0;
-	err->message = message;
+	err->_code = code;
+	err->_needs_destroy = true;
+	err->_python_exc = NULL;
+	if (code == DRGN_ERROR_OS) {
+		err->_errno = 0;
+		err->_path = NULL;
+	} else if (code == DRGN_ERROR_FAULT) {
+		err->_address = 0;
+	}
+	err->_message = message;
 	return err;
 }
 
@@ -78,24 +105,24 @@ drgn_error_format_os(const char *message, int errnum, const char *path_format,
 	if (!err)
 		return &drgn_enomem;
 
-	err->code = DRGN_ERROR_OS;
-	err->needs_destroy = true;
-	err->errnum = errnum;
+	err->_code = DRGN_ERROR_OS;
+	err->_needs_destroy = true;
+	err->_python_exc = NULL;
+	err->_errno = errnum;
 	if (path_format) {
 		va_start(ap, path_format);
-		ret = vasprintf(&err->path, path_format, ap);
+		ret = vasprintf(&err->_path, path_format, ap);
 		va_end(ap);
 		if (ret == -1) {
 			free(err);
 			return &drgn_enomem;
 		}
 	} else {
-		err->path = NULL;
+		err->_path = NULL;
 	}
-	err->address = 0;
-	err->message = strdup(message);
-	if (!err->message) {
-		free(err->path);
+	err->_message = strdup(message);
+	if (!err->_message) {
+		free(err->_path);
 		free(err);
 		return &drgn_enomem;
 	}
@@ -134,7 +161,7 @@ LIBDRGN_PUBLIC struct drgn_error *drgn_error_create_fault(const char *message,
 
 	err = drgn_error_create(DRGN_ERROR_FAULT, message);
 	if (err != &drgn_enomem)
-		err->address = address;
+		err->_address = address;
 	return err;
 }
 
@@ -153,57 +180,47 @@ drgn_error_format_fault(uint64_t address, const char *format, ...)
                 return &drgn_enomem;
 	err = drgn_error_create_nodup(DRGN_ERROR_FAULT, message);
 	if (err != &drgn_enomem)
-		err->address = address;
+		err->_address = address;
 	return err;
 }
 
 LIBDRGN_PUBLIC struct drgn_error *drgn_error_copy(struct drgn_error *src)
 {
-	if (!src->needs_destroy)
+	if (!src->_needs_destroy)
 		return src;
-	struct drgn_error *dst = malloc(sizeof(*dst));
-	if (!dst)
-		return &drgn_enomem;
-	dst->code = src->code;
-	dst->needs_destroy = true;
-	dst->errnum = src->errnum;
-	if (src->path) {
-		dst->path = strdup(src->path);
-		if (!dst->path) {
-			free(dst);
-			return &drgn_enomem;
-		}
-	} else {
-		dst->path = NULL;
+
+	enum drgn_error_code code = drgn_error_code(src);
+	switch (code) {
+	case DRGN_ERROR_OS:
+		return drgn_error_create_os(src->_message, src->_errno,
+					    src->_path);
+	case DRGN_ERROR_FAULT:
+		return drgn_error_create_fault(src->_message, src->_address);
+	default:
+		return drgn_error_create(code, src->_message);
 	}
-	dst->address = src->address;
-	if (src->message) {
-		dst->message = strdup(src->message);
-		if (!dst->message) {
-			free(dst->path);
-			free(dst);
-			return &drgn_enomem;
-		}
-	} else {
-		dst->message = NULL;
-	}
-	return dst;
 }
 
 #define emit_error(err) (							\
-	err->code == DRGN_ERROR_OS ?						\
+	/*									\
+	 * The call to drgn_error_code() resolves the error for the subsequent	\
+	 * direct accesses.							\
+	 */									\
+	drgn_error_code(err) == DRGN_ERROR_OS ?					\
 		/* This is easier than dealing with strerror_r(). */		\
-		(errno = err->errnum,						\
-		 err->message[0] && err->path ?					\
-		 emit_error_format("%s: %s: %m", err->message, err->path) :	\
-		 err->message[0] || err->path ?					\
+		(errno = err->_errno,						\
+		 err->_message[0] && err->_path ?				\
+		 emit_error_format("%s: %s: %m", err->_message, err->_path) :	\
+		 err->_message[0] || err->_path ?				\
 		 emit_error_format("%s: %m",					\
-				   err->message[0] ? err->message : err->path) :\
+				   err->_message[0]				\
+				   ? err->_message : err->_path) :		\
 		 emit_error_format("%m"))					\
-	: err->code == DRGN_ERROR_FAULT ?					\
-		emit_error_format("%s: 0x%" PRIx64, err->message, err->address)	\
+	: err->_code == DRGN_ERROR_FAULT ?					\
+		emit_error_format("%s: 0x%" PRIx64, err->_message,		\
+				  err->_address)				\
 	:									\
-		emit_error_string(err->message)					\
+		emit_error_string(err->_message)				\
 )
 
 bool string_builder_append_error(struct string_builder *sb,
@@ -248,9 +265,12 @@ LIBDRGN_PUBLIC int drgn_error_dwrite(int fd, struct drgn_error *err)
 
 LIBDRGN_PUBLIC void drgn_error_destroy(struct drgn_error *err)
 {
-	if (err && err->needs_destroy) {
-		free(err->path);
-		free(err->message);
+	if (err && err->_needs_destroy) {
+		drgn_error_python_exc_decref(err->_python_exc);
+		if (err->_code == DRGN_ERROR_OS)
+			free(err->_path);
+		if (err->_message != drgn_enomem._message)
+			free(err->_message);
 		free(err);
 	}
 }
