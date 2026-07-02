@@ -163,7 +163,7 @@ typedef struct drgn_error *
  * - Add a `DRGN_ARCH_FOO` enumerator to @ref drgn_architecture.
  * - Add the constant to `class Architecture` in `_drgn.pyi`.
  * - Create a new `libdrgn/arch_foo.c` file and add it to
- *   `libdrgnimpl_la_SOURCES` in `libdrgn/Makefile.am`.
+ *   `libdrgn_common_la_SOURCES` in `libdrgn/Makefile.am`.
  * - Define `struct drgn_architecture_info arch_info_foo` in
  *   `libdrgn/arch_foo.c` with the following members:
  *     - @ref name
@@ -173,8 +173,9 @@ typedef struct drgn_error *
  *     - @ref register_by_name = @ref drgn_register_by_name_unknown
  * - Add an `extern` declaration of `arch_info_foo` to `libdrgn/platform.h`.
  * - Handle the architecture in @ref drgn_platform_from_kdump(), @ref
- *   drgn_host_platform, @ref drgn_platform_create(), @ref
- *   drgn_platform_from_elf(), and @ref qmp_detect_platform().
+ *   drgn_platform_to_kdump(), @ref drgn_host_platform, @ref
+ *   drgn_platform_create(), @ref drgn_platform_from_elf(), and @ref
+ *   qmp_detect_platform().
  * - Update `docs/support_matrix.rst`.
  *
  * To support Linux kernel loadable modules:
@@ -187,7 +188,7 @@ typedef struct drgn_error *
  * - Create a new `libdrgn/arch_foo_defs.py` file. See
  *   `libdrgn/build-aux/gen_arch_inc_strswitch.py`.
  * - Add `arch_foo_defs.py` to `ARCH_DEFS_PYS` and remove `libdrgn/arch_foo.c`
- *   from `libdrgnimpl_la_SOURCES` in `libdrgn/Makefile.am`.
+ *   from `libdrgn_common_la_SOURCES` in `libdrgn/Makefile.am`.
  * - Add `#include "arch_foo_defs.inc"` to `libdrgn/arch_foo.c`.
  * - Add `DRGN_ARCHITECTURE_REGISTERS` to `arch_info_foo` and remove @ref
  *   register_by_name.
