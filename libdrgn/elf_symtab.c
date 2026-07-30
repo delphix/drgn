@@ -96,6 +96,13 @@ load_gnu_debugdata_file(struct drgn_module *module, Elf_Scn *gnu_debugdata_scn,
 	if (err)
 		return err;
 
+	if (gnu_debugdata_data->d_size == 0) {
+		drgn_log_debug(module->prog,
+			       "%s: .gnu_debugdata is empty; ignoring",
+			       module->loaded_file->path);
+		return NULL;
+	}
+
 	_cleanup_(lzma_end) lzma_stream stream = LZMA_STREAM_INIT;
 	lzma_ret ret = lzma_stream_decoder(&stream, UINT64_MAX, 0);
 	if (ret != LZMA_OK)
@@ -122,6 +129,12 @@ load_gnu_debugdata_file(struct drgn_module *module, Elf_Scn *gnu_debugdata_scn,
 
 		bytes_decoded = (char *)stream.next_out - (char *)data;
 		if (ret == LZMA_STREAM_END) {
+			if (bytes_decoded == 0) {
+				drgn_log_debug(module->prog,
+					       "%s: .gnu_debugdata decompressed to empty; ignoring",
+					       module->loaded_file->path);
+				return NULL;
+			}
 			void *tmp = realloc(data, bytes_decoded);
 			if (tmp)
 				data = tmp;
@@ -143,16 +156,30 @@ load_gnu_debugdata_file(struct drgn_module *module, Elf_Scn *gnu_debugdata_scn,
 	    || !string_builder_null_terminate(&path))
 		return &drgn_enomem;
 
-	Elf *elf = elf_memory(data, bytes_decoded);
+	_cleanup_elf_end_ Elf *elf = elf_memory(data, bytes_decoded);
 	if (!elf)
 		return drgn_error_libelf();
 
+	// Relocatable files must have their section addresses set. We could do
+	// that here, but it doesn't really make sense for a .gnu_debugdata file
+	// to be relocatable. Reject it early instead.
+	GElf_Ehdr ehdr_mem, *ehdr = gelf_getehdr(elf, &ehdr_mem);
+	if (!ehdr)
+		return drgn_error_libelf();
+	if (ehdr->e_type == ET_REL) {
+		drgn_log_debug(module->prog,
+			       "%s: .gnu_debugdata is relocatable; ignoring",
+			       module->loaded_file->path);
+		return NULL;
+	}
+
 	err = drgn_elf_file_create(module, path.str, -1, data, elf, file_ret);
 	if (err)
-		elf_end(elf);
-	else
-		data = NULL;
-	return err;
+		return err;
+	// Owned by *file_ret now.
+	data = NULL;
+	elf = NULL;
+	return NULL;
 }
 #else
 static struct drgn_error *
