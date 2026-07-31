@@ -552,7 +552,8 @@ linux_kernel_get_sections_per_root_impl(struct drgn_program *prog, uint64_t *ret
 			       &sizeof_mem_section);
 	if (err)
 		return err;
-	if (!is_power_of_two(sizeof_mem_section)) {
+	if (!is_power_of_two(sizeof_mem_section)
+	    || sizeof_mem_section > prog->vmcoreinfo.page_size) {
 		return drgn_error_create(DRGN_ERROR_BAD_DATA,
 					 "struct mem_section has invalid size");
 	}
@@ -708,10 +709,10 @@ static bool is_fedora_kernel(const char *osrelease)
 	const char *p = osrelease;
 	while ((p = strstr(p, ".fc"))) {
 		p += sizeof(".fc") - 1;
-		if (isdigit(*p)) {
+		if (isdigit((unsigned char)*p)) {
 			do {
 				p++;
-			} while (isdigit(*p));
+			} while (isdigit((unsigned char)*p));
 			if (*p == '.' || *p == '\0')
 				return true;
 		}
@@ -2631,8 +2632,8 @@ linux_cpu_present_mask(struct drgn_program *prog, uint64_t **bitmap_ret,
 		if (err)
 			return err;
 	}
-	// A bogus value could overflow a 32-bit size_t, validate it here
-	if (nr_cpu_ids > SIZE_MAX)
+	// A bogus value could overflow a size_t in our size calculations.
+	if (nr_cpu_ids > SIZE_MAX - 63)
 		return &drgn_enomem;
 
 	bool is_64_bit;
@@ -2645,7 +2646,7 @@ linux_cpu_present_mask(struct drgn_program *prog, uint64_t **bitmap_ret,
 	if (err)
 		return err;
 
-	size_t size = nr_cpu_ids / 64 + ((nr_cpu_ids % 64) ? 1 : 0);
+	size_t size = (nr_cpu_ids + 63) / 64;
 	_cleanup_free_ uint64_t *bitmap = calloc(size, sizeof(*bitmap));
 	if (!bitmap)
 		return &drgn_enomem;
@@ -2659,7 +2660,7 @@ linux_cpu_present_mask(struct drgn_program *prog, uint64_t **bitmap_ret,
 			for (size_t i = 0; i < size; i++)
 				bitmap[i] = bswap_64(bitmap[i]);
 	} else {
-		size_t nr_words = nr_cpu_ids / 32 + ((nr_cpu_ids % 32) ? 1 : 0);
+		size_t nr_words = (nr_cpu_ids + 31) / 32;
 		_cleanup_free_ uint32_t *orig = malloc_array(nr_words, sizeof(*orig));
 		if (!orig)
 			return &drgn_enomem;
@@ -2716,7 +2717,8 @@ drgn_program_is_irq_regs(struct drgn_program *prog, uint64_t addr,
 		DRGN_OBJECT(percpu_regs, prog);
 		VECTOR(uint64_vector, addresses);
 		uint64_t regs_ptr;
-		for (size_t word_index = 0; word_index * 64 < nr_cpus; word_index++) {
+		for (size_t word_index = 0, num_words = (nr_cpus + 63) / 64;
+		     word_index < num_words; word_index++) {
 			uint64_t word = cpumask[word_index];
 			unsigned int i;
 			for_each_bit(i, word) {

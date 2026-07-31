@@ -33,6 +33,12 @@
 #include "type.h"
 #include "util.h"
 
+#define _cleanup_stack_trace_ _cleanup_(drgn_stack_trace_destroyp)
+static inline void drgn_stack_trace_destroyp(struct drgn_stack_trace **tracep)
+{
+	drgn_stack_trace_destroy(*tracep);
+}
+
 static struct drgn_error *
 drgn_stack_trace_append_frame(struct drgn_stack_trace **trace, size_t *capacity,
 			      struct drgn_register_state *regs,
@@ -1293,7 +1299,7 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 	}
 
 	size_t trace_capacity = 1;
-	struct drgn_stack_trace *trace =
+	_cleanup_stack_trace_ struct drgn_stack_trace *trace =
 		malloc(offsetof(struct drgn_stack_trace,
 				frames[trace_capacity]));
 	if (!trace)
@@ -1301,7 +1307,7 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 	trace->prog = prog;
 	trace->num_frames = 0;
 
-	struct drgn_cfi_row *row = drgn_empty_cfi_row;
+	_cleanup_cfi_row_ struct drgn_cfi_row *row = drgn_empty_cfi_row;
 
 	struct drgn_register_state *regs;
 	if (prstatus) {
@@ -1311,14 +1317,14 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 		err = drgn_get_initial_registers(prog, tid, obj, &regs);
 	}
 	if (err)
-		goto out;
+		return err;
 
 	/* Limit iterations so we don't get caught in a loop. */
 	for (int i = 0; i < 1024; i++) {
 		err = drgn_stack_trace_add_frames(&trace, &trace_capacity,
 						  regs);
 		if (err)
-			goto out;
+			return err;
 
 		err = drgn_unwind_with_cfi(prog, &row, regs, &regs);
 		if (err == &drgn_not_found) {
@@ -1336,19 +1342,12 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 		if (err == &drgn_stop)
 			break;
 		else if (err)
-			goto out;
+			return err;
 	}
 
-	err = NULL;
-out:
-	drgn_cfi_row_destroy(row);
-	if (err) {
-		drgn_stack_trace_destroy(trace);
-	} else {
-		drgn_stack_trace_shrink_to_fit(&trace, trace_capacity);
-		*ret = trace;
-	}
-	return err;
+	drgn_stack_trace_shrink_to_fit(&trace, trace_capacity);
+	*ret = no_cleanup_ptr(trace);
+	return NULL;
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1362,8 +1361,9 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_stack_trace_from_pcs(struct drgn_program *prog, const uint64_t *pcs,
 				  size_t pcs_size, struct drgn_stack_trace **ret)
 {
-	struct drgn_stack_trace *trace = malloc_flexible_array(
-		struct drgn_stack_trace, frames, pcs_size);
+	_cleanup_stack_trace_ struct drgn_stack_trace *trace =
+		malloc_flexible_array(struct drgn_stack_trace, frames,
+				      pcs_size);
 	struct drgn_error *err;
 	size_t trace_capacity = pcs_size;
 
@@ -1375,17 +1375,17 @@ drgn_program_stack_trace_from_pcs(struct drgn_program *prog, const uint64_t *pcs
 	for (size_t i = 0; i != pcs_size; ++i) {
 		struct drgn_register_state *regs =
 			drgn_register_state_create_impl(0, 0, false);
+		if (!regs)
+			return &drgn_enomem;
 		drgn_register_state_set_pc(prog, regs, pcs[i]);
 
 		err = drgn_stack_trace_add_frames(&trace, &trace_capacity, regs);
-		if (err) {
-			drgn_stack_trace_destroy(trace);
+		if (err)
 			return err;
-		}
 	}
 
 	drgn_stack_trace_shrink_to_fit(&trace, trace_capacity);
-	*ret = trace;
+	*ret = no_cleanup_ptr(trace);
 	return NULL;
 }
 
@@ -1510,7 +1510,7 @@ drgn_program_source_location(struct drgn_program *prog, uint64_t address,
 {
 	struct drgn_error *err;
 	size_t trace_capacity = 1;
-	struct drgn_stack_trace *trace =
+	_cleanup_stack_trace_ struct drgn_stack_trace *trace =
 		malloc_flexible_array(struct drgn_stack_trace, frames,
 				      trace_capacity);
 	if (!trace)
@@ -1521,21 +1521,20 @@ drgn_program_source_location(struct drgn_program *prog, uint64_t address,
 
 	struct drgn_register_state *regs =
 		drgn_register_state_create_impl(0, 0, true);
+	if (!regs)
+		return &drgn_enomem;
 	drgn_register_state_set_pc(prog, regs, address);
 	err = drgn_stack_trace_add_frames(&trace, &trace_capacity, regs);
-	if (err) {
-		drgn_stack_trace_destroy(trace);
+	if (err)
 		return err;
-	}
 
 	if (!trace->frames[0].num_scopes) {
-		drgn_stack_trace_destroy(trace);
 		return drgn_error_create(DRGN_ERROR_LOOKUP,
 					 "source code location not found");
 	}
 
 	drgn_stack_trace_shrink_to_fit(&trace, trace_capacity);
-	*ret = (struct drgn_source_location_list *)trace;
+	*ret = (struct drgn_source_location_list *)no_cleanup_ptr(trace);
 	return NULL;
 }
 
@@ -1545,7 +1544,7 @@ struct drgn_error *drgn_parse_addr2line(const char *address_str,
 					unsigned long long *offset_ret)
 {
 	const char *p = address_str;
-	while (isspace(*p))
+	while (isspace((unsigned char)*p))
 		p++;
 
 	if (!*p) {
@@ -1554,7 +1553,7 @@ struct drgn_error *drgn_parse_addr2line(const char *address_str,
 	}
 
 	const char *sym_name = p;
-	while (*p && !isspace(*p) && *p != '+')
+	while (*p && !isspace((unsigned char)*p) && *p != '+')
 		p++;
 	size_t sym_name_len = p - sym_name;
 	if (sym_name_len == 0) {
@@ -1562,26 +1561,26 @@ struct drgn_error *drgn_parse_addr2line(const char *address_str,
 					 "expected symbol name");
 	}
 
-	while (isspace(*p))
+	while (isspace((unsigned char)*p))
 		p++;
 
 	unsigned long long offset = 0;
 	char *end;
 	if (*p == '+') {
 		p++;
-		while (isspace(*p))
+		while (isspace((unsigned char)*p))
 			p++;
 
 		if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
 			p += 2;
-			if (!isxdigit(*p)) {
+			if (!isxdigit((unsigned char)*p)) {
 				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 							 "expected symbol offset");
 			}
 			errno = 0;
 			offset = strtoull(p, &end, 16);
 		} else {
-			if (!isdigit(*p)) {
+			if (!isdigit((unsigned char)*p)) {
 				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 							 "expected symbol offset");
 			}
@@ -1600,7 +1599,7 @@ struct drgn_error *drgn_parse_addr2line(const char *address_str,
 		}
 		p = end;
 
-		while (isspace(*p))
+		while (isspace((unsigned char)*p))
 			p++;
 
 		if (*p) {
@@ -1613,7 +1612,7 @@ struct drgn_error *drgn_parse_addr2line(const char *address_str,
 	}
 
 	if (sym_name[0] == '0' && (sym_name[1] == 'x' || sym_name[1] == 'X')
-	    && isxdigit(sym_name[2])) {
+	    && isxdigit((unsigned char)sym_name[2])) {
 		errno = 0;
 		unsigned long long address = strtoull(sym_name + 2, &end, 16);
 		if (end == sym_name + sym_name_len) {

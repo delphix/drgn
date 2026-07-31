@@ -79,6 +79,12 @@ drgn_object_type_impl(struct drgn_type *type, struct drgn_type *underlying_type,
 		      enum drgn_qualifiers qualifiers, uint64_t bit_field_size,
 		      struct drgn_object_type *ret)
 {
+	// The maximum bit size we can represent is UINT64_MAX. However, pick an
+	// arbitrary smaller limit for integers to keep things from getting out
+	// of hand: 2^24 is the maximum bit width that Clang 13 allows for
+	// _ExtInt() (limited by the LLVM IR representation; technically it's
+	// 2^24-1, but it gets rounded up to a DW_AT_byte_size of 2^24/8).
+	static const uint64_t max_int_bit_size = 16777216;
 	struct drgn_error *err;
 
 	ret->type = type;
@@ -112,13 +118,7 @@ drgn_object_type_impl(struct drgn_type *type, struct drgn_type *underlying_type,
 			}
 			ret->bit_size = bit_field_size;
 		}
-		// The maximum bit size we can represent is UINT64_MAX. However,
-		// pick an arbitrary smaller limit to keep things from getting
-		// out of hand: 2^24 is the maximum bit width that Clang 13
-		// allows for _ExtInt() (limited by the LLVM IR representation;
-		// technically it's 2^24-1, but it gets rounded up to a
-		// DW_AT_byte_size of 2^24/8).
-		if (ret->bit_size < 1 || ret->bit_size > 16777216) {
+		if (ret->bit_size < 1 || ret->bit_size > max_int_bit_size) {
 			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
 						 "unsupported integer bit size (%" PRIu64 ")",
 						 ret->bit_size);
@@ -137,7 +137,15 @@ drgn_object_type_impl(struct drgn_type *type, struct drgn_type *underlying_type,
 		break;
 	}
 	case DRGN_TYPE_POINTER:
-		ret->encoding = DRGN_OBJECT_ENCODING_UNSIGNED;
+		if (ret->bit_size < 1 || ret->bit_size > max_int_bit_size) {
+			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
+						 "unsupported pointer bit size (%" PRIu64 ")",
+						 ret->bit_size);
+		}
+		if (ret->bit_size <= 64)
+			ret->encoding = DRGN_OBJECT_ENCODING_UNSIGNED;
+		else
+			ret->encoding = DRGN_OBJECT_ENCODING_UNSIGNED_BIG;
 		break;
 	case DRGN_TYPE_FLOAT:
 		if (ret->bit_size < 1 || ret->bit_size > 256) {
@@ -1595,26 +1603,27 @@ drgn_object_subscript(struct drgn_object *res, const struct drgn_object *obj,
 		      int64_t index)
 {
 	struct drgn_error *err;
-	struct drgn_element_info element;
 
 	if (drgn_object_program(res) != drgn_object_program(obj)) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "objects are from different programs");
 	}
 
-	err = drgn_program_element_info(drgn_object_program(obj), obj->type,
-					&element);
+	bool is_pointer;
+	struct drgn_qualified_type element_type;
+	uint64_t element_bit_size;
+	err = drgn_type_element_info(obj->type, &is_pointer, &element_type,
+				     &element_bit_size);
 	if (err)
 		return err;
 
-	if (obj->encoding == DRGN_OBJECT_ENCODING_UNSIGNED) {
-		return drgn_object_dereference_offset(res, obj,
-						      element.qualified_type,
-						      index * element.bit_size,
+	if (is_pointer) {
+		return drgn_object_dereference_offset(res, obj, element_type,
+						      index * element_bit_size,
 						      0);
 	} else {
-		return drgn_object_fragment(res, obj, element.qualified_type,
-					    index * element.bit_size, 0);
+		return drgn_object_fragment(res, obj, element_type, index *
+					    element_bit_size, 0);
 	}
 }
 
@@ -1631,28 +1640,31 @@ struct drgn_error *drgn_object_slice(struct drgn_object *res,
 					 "objects are from different programs");
 	}
 
-	struct drgn_element_info element;
-	err = drgn_program_element_info(drgn_object_program(obj), obj->type,
-					&element);
+	bool is_pointer;
+	struct drgn_qualified_type element_type;
+	uint64_t element_bit_size;
+	err = drgn_type_element_info(obj->type, &is_pointer, &element_type,
+				     &element_bit_size);
 	if (err)
 		return err;
 
 	struct drgn_qualified_type array_type;
-	err = drgn_array_type_create(prog, element.qualified_type,
-				     end > start ? end - start : 0,
-				     drgn_type_language(element.qualified_type.type),
+	err = drgn_array_type_create(prog, element_type,
+				     end > start
+				     ? (uint64_t)end - (uint64_t)start : 0,
+				     drgn_type_language(element_type.type),
 				     &array_type.type);
 	if (err)
 		return err;
 	array_type.qualifiers = 0;
 
-	if (obj->encoding == DRGN_OBJECT_ENCODING_UNSIGNED) {
+	if (is_pointer) {
 		return drgn_object_dereference_offset(res, obj, array_type,
-						      start * element.bit_size,
+						      start * element_bit_size,
 						      0);
 	} else {
 		return drgn_object_fragment(res, obj, array_type,
-					    start * element.bit_size, 0);
+					    start * element_bit_size, 0);
 	}
 }
 
@@ -2103,10 +2115,9 @@ drgn_op_add_to_pointer(struct drgn_object *res,
 		err = drgn_object_value_signed(index, &svalue);
 		if (err)
 			return err;
-		if (svalue >= 0) {
-			index_value = svalue;
-		} else {
-			index_value = -svalue;
+		index_value = svalue;
+		if (svalue < 0) {
+			index_value = -index_value;
 			negate = !negate;
 		}
 		break;
@@ -2189,20 +2200,19 @@ struct drgn_error *drgn_op_mul_impl(struct drgn_object *res,
 		if (err)
 			return err;
 
-		/*
-		 * Convert to sign and magnitude to avoid signed integer
-		 * overflow.
-		 */
-		bool lhs_negative = lhs_svalue < 0;
-		uint64_t lhs_uvalue = lhs_negative ? -lhs_svalue : lhs_svalue;
-		bool rhs_negative = rhs_svalue < 0;
-		uint64_t rhs_uvalue = rhs_negative ? -rhs_svalue : rhs_svalue;
+		// Calculate in sign and magnitude to avoid signed integer
+		// overflow.
+		uint64_t lhs_uvalue = lhs_svalue, rhs_uvalue = rhs_svalue;
+		if (lhs_svalue < 0)
+			lhs_uvalue = -lhs_uvalue;
+		if (rhs_svalue < 0)
+			rhs_uvalue = -rhs_uvalue;
 		union {
 			int64_t svalue;
 			uint64_t uvalue;
 		} tmp;
 		tmp.uvalue = lhs_uvalue * rhs_uvalue;
-		if (lhs_negative != rhs_negative)
+		if ((lhs_svalue < 0) != (rhs_svalue < 0))
 			tmp.uvalue = -tmp.uvalue;
 		return drgn_object_set_signed_internal(res, &type, tmp.svalue);
 	}
@@ -2240,6 +2250,10 @@ struct drgn_error *drgn_op_div_impl(struct drgn_object *res,
 			return err;
 		if (!rhs_svalue)
 			return &drgn_zero_division;
+		if (lhs_svalue == INT64_MIN && rhs_svalue == -1) {
+			return drgn_object_set_signed_internal(res, &type,
+							       INT64_MIN);
+		}
 		return drgn_object_set_signed_internal(res, &type,
 						       lhs_svalue / rhs_svalue);
 	}
@@ -2291,6 +2305,8 @@ struct drgn_error *drgn_op_mod_impl(struct drgn_object *res,
 			return err;
 		if (!rhs_svalue)
 			return &drgn_zero_division;
+		if (lhs_svalue == INT64_MIN && rhs_svalue == -1)
+			return drgn_object_set_signed_internal(res, &type, 0);
 		return drgn_object_set_signed_internal(res, &type,
 						       lhs_svalue % rhs_svalue);
 	}

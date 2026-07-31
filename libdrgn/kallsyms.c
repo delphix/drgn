@@ -48,7 +48,6 @@ struct kallsyms_reader {
 	uint8_t *names;
 	size_t names_len;
 	char *token_table;
-	size_t token_table_len;
 	uint16_t *token_index;
 	bool long_names;
 };
@@ -118,7 +117,6 @@ kallsyms_copy_tables(struct drgn_program *prog, struct kallsyms_reader *kr,
 {
 	struct drgn_error *err;
 	const size_t token_index_size = (UINT8_MAX + 1) * sizeof(uint16_t);
-	uint64_t last_token;
 	size_t names_idx;
 	char data;
 	uint8_t len_u8;
@@ -146,37 +144,37 @@ kallsyms_copy_tables(struct drgn_program *prog, struct kallsyms_reader *kr,
 	if (err)
 		return err;
 	if (bswap)
-		for (size_t i = 0; i < kr->num_syms; i++)
+		for (size_t i = 0; i <= UINT8_MAX; i++)
 			kr->token_index[i] = bswap_16(kr->token_index[i]);
 
-	// Find the end of the last token, so we get the overall length of
-	// token_table. Then copy the token_table into host memory.
-	last_token = loc->kallsyms_token_table + kr->token_index[UINT8_MAX];
+	// Find the length of the token table. First, find the maximum token
+	// index. As of Linux 7.2, that's always the last one, but let's not
+	// assume that.
+	size_t token_table_len = kr->token_index[UINT8_MAX];
+	for (size_t i = 0; i < UINT8_MAX; i++) {
+		if (kr->token_index[i] > token_table_len)
+			token_table_len = kr->token_index[i];
+	}
+
+	// Then, find the first null terminator after that index.
 	do {
 		err = drgn_program_read_memory(prog, &data,
-					       last_token, 1, false);
+					       loc->kallsyms_token_table + token_table_len,
+					       1, false);
 		if (err)
 			return err;
 
-		last_token++;
+		token_table_len++;
 	} while (data);
-	kr->token_table_len = last_token - loc->kallsyms_token_table + 1;
-	kr->token_table = malloc(kr->token_table_len);
+
+	kr->token_table = malloc(token_table_len);
 	if (!kr->token_table)
 		return &drgn_enomem;
 	err = drgn_program_read_memory(prog, kr->token_table,
 				       loc->kallsyms_token_table,
-				       kr->token_table_len, false);
+				       token_table_len, false);
 	if (err)
 		return err;
-
-	// Ensure that all members of token_index are in-bounds for indexing
-	// into token_table.
-	for (size_t i = 0; i <= UINT8_MAX; i++)
-		if (kr->token_index[i] >= kr->token_table_len)
-			return drgn_error_format(DRGN_ERROR_BAD_DATA,
-						 "kallsyms: token_index out of bounds (token_index[%zu] = %u >= %zu)",
-						 i, kr->token_index[i], kr->token_table_len);
 
 	// Now find the end of the names array by skipping through it, then copy
 	// that into host memory.
@@ -253,7 +251,12 @@ kallsyms_expand_symbol(struct kallsyms_reader *kr,
 		       struct string_builder *sb, char *kind_ret)
 {
 	uint64_t len;
-	struct drgn_error *err = binary_buffer_next_uleb128(names_bb, &len);
+	struct drgn_error *err;
+
+	if (kr->long_names)
+		err = binary_buffer_next_uleb128(names_bb, &len);
+	else
+		err = binary_buffer_next_u8_into_u64(names_bb, &len);
 	if (err)
 		return err;
 
@@ -288,17 +291,17 @@ kallsyms_expand_symbol(struct kallsyms_reader *kr,
 
 /**
  * Used to find _stext in the kallsyms before we've moved everything into
- * the drgn_symbol_index. Finds the index matching the given name, or -1.
+ * the drgn_symbol_index. Finds the index matching the given name.
  */
 static struct drgn_error *
-search_for_string(struct kallsyms_reader *kr, const char *name, ssize_t *ret)
+search_for_string(struct kallsyms_reader *kr, const char *name, size_t *ret)
 {
 	STRING_BUILDER(sb);
 	size_t len = strlen(name);
 	struct binary_buffer names_bb;
 	binary_buffer_init(&names_bb, kr->names, kr->names_len, false,
 			   kallsyms_binary_buffer_error);
-	for (ssize_t i = 0; i < kr->num_syms; i++) {
+	for (size_t i = 0; i < kr->num_syms; i++) {
 		char kind;
 		sb.len = 0;
 		struct drgn_error *err =
@@ -317,7 +320,7 @@ search_for_string(struct kallsyms_reader *kr, const char *name, ssize_t *ret)
 static void symbol_from_kallsyms(uint64_t address, char *name, char kind,
 				      uint64_t size, struct drgn_symbol *ret)
 {
-	char kind_lower = tolower(kind);
+	char kind_lower = tolower((unsigned char)kind);
 	ret->name = name;
 	ret->address = address;
 	ret->size = size;
@@ -328,7 +331,7 @@ static void symbol_from_kallsyms(uint64_t address, char *name, char kind,
 		ret->binding = DRGN_SYMBOL_BINDING_UNIQUE;
 	else if (kind_lower == 'v' || kind_lower == 'w')
 		ret->binding = DRGN_SYMBOL_BINDING_WEAK;
-	else if (isupper(kind))
+	else if (isupper((unsigned char)kind))
 		ret->binding = DRGN_SYMBOL_BINDING_GLOBAL;
 	else
 		// If lowercase, the symbol is usually local, but it's
@@ -454,7 +457,7 @@ kallsyms_load_addresses(struct drgn_program *prog, struct kallsyms_reader *kr,
 			if (err)
 				return err;
 			if (bswap)
-				for (int i = 0; i < kr->num_syms; i++)
+				for (size_t i = 0; i < kr->num_syms; i++)
 					addresses[i] = bswap_64(addresses[i]);
 		} else {
 			addr32 = malloc_array(kr->num_syms, sizeof(addr32[0]));
@@ -467,7 +470,7 @@ kallsyms_load_addresses(struct drgn_program *prog, struct kallsyms_reader *kr,
 						false);
 			if (err)
 				return err;
-			for (int i = 0; i < kr->num_syms; i++) {
+			for (size_t i = 0; i < kr->num_syms; i++) {
 				if (bswap)
 					addresses[i] = bswap_32(addr32[i]);
 				else
@@ -507,7 +510,7 @@ kallsyms_load_addresses(struct drgn_program *prog, struct kallsyms_reader *kr,
 		if (err)
 			return err;
 		if (bswap)
-			for (int i = 0; i < kr->num_syms; i++)
+			for (size_t i = 0; i < kr->num_syms; i++)
 				addr32[i] = bswap_32(addr32[i]);
 
 		/*
@@ -516,7 +519,7 @@ kallsyms_load_addresses(struct drgn_program *prog, struct kallsyms_reader *kr,
 		 * have the correct value from vmcoreinfo. Compute it both ways
 		 * and pick the correct interpretation.
 		 */
-		ssize_t stext_idx;
+		size_t stext_idx;
 		err = search_for_string(kr, "_stext", &stext_idx);
 		if (err)
 			return err;
@@ -529,13 +532,13 @@ kallsyms_load_addresses(struct drgn_program *prog, struct kallsyms_reader *kr,
 		/* Place relative */
 		uint64_t prel = loc->kallsyms_offsets + 4 * stext_idx + (int32_t)addr32[stext_idx];
 		if (relbase == loc->_stext) {
-			for (int i = 0; i < kr->num_syms; i++)
+			for (size_t i = 0; i < kr->num_syms; i++)
 				addresses[i] = relative_base + addr32[i];
 		} else if (loc->kallsyms_relative_base && abs_pcpu == loc->_stext) {
-			for (int i = 0; i < kr->num_syms; i++)
+			for (size_t i = 0; i < kr->num_syms; i++)
 				addresses[i] = absolute_percpu(relative_base, (int32_t)addr32[i]);
 		} else if (prel == loc->_stext) {
-			for (int i = 0; i < kr->num_syms; i++)
+			for (size_t i = 0; i < kr->num_syms; i++)
 				addresses[i] = loc->kallsyms_offsets + 4 * i + (int32_t)addr32[i];
 		} else {
 			err = drgn_error_create(
@@ -590,7 +593,7 @@ drgn_load_builtin_kallsyms(struct drgn_program *prog,
 	struct binary_buffer names_bb;
 	binary_buffer_init(&names_bb, kr.names, kr.names_len, false,
 			   kallsyms_binary_buffer_error);
-	for (int i = 0; i < kr.num_syms; i++) {
+	for (size_t i = 0; i < kr.num_syms; i++) {
 		struct drgn_symbol symbol;
 		char kind;
 		uint64_t size = 0;

@@ -1433,6 +1433,12 @@ class TestOperators(MockProgramTestCase):
         self.assertIdentical(void_ptr + 1, void_ptr1)
         self.assertIdentical(1 + void_ptr, void_ptr1)
 
+        void_ptr3 = Object(self.prog, "void *", 0x80000000FFFF0000)
+        self.assertIdentical(void_ptr + self.long(2**63), void_ptr3)
+        self.assertIdentical(void_ptr - self.long(2**63), void_ptr3)
+        self.assertIdentical(void_ptr + self.long(-(2**63)), void_ptr3)
+        self.assertIdentical(void_ptr - self.long(-(2**63)), void_ptr3)
+
     def test_sub(self):
         self._test_arithmetic(operator.sub, 4, 2, 2, floating_point=True)
 
@@ -1469,6 +1475,7 @@ class TestOperators(MockProgramTestCase):
 
         # Integer overflow.
         self.assertIdentical(self.int(0x8000) * self.int(0x10000), self.int(-(2**31)))
+        self.assertIdentical(self.long(-(2**63)) * self.long(-(2**63)), self.long(0))
 
         self.assertIdentical(
             self.unsigned_int(0x8000) * self.int(0x10000), self.unsigned_int(2**31)
@@ -1505,6 +1512,11 @@ class TestOperators(MockProgramTestCase):
             ZeroDivisionError, operator.truediv, self.double(1), self.double(0)
         )
 
+        # INT{,64}_MIN / -1 is undefined behavior and traps on some platforms.
+        # We should wrap.
+        self.assertIdentical(self.long(-(2**63)) / self.long(-1), self.long(-(2**63)))
+        self.assertIdentical(self.int(-(2**31)) / self.int(-1), self.int(-(2**31)))
+
         self._test_pointer_type_errors(operator.truediv)
 
     def test_mod(self):
@@ -1521,6 +1533,11 @@ class TestOperators(MockProgramTestCase):
         self.assertRaises(
             ZeroDivisionError, operator.mod, self.unsigned_int(1), self.unsigned_int(0)
         )
+
+        # INT{,64}_MIN % -1 is undefined behavior and traps on some platforms.
+        # We should handle it.
+        self.assertIdentical(self.long(-(2**63)) % self.long(-1), self.long(0))
+        self.assertIdentical(self.int(-(2**31)) % self.int(-1), self.int(0))
 
         self._test_pointer_type_errors(operator.mod)
         self._test_floating_type_errors(operator.mod)
@@ -3418,6 +3435,16 @@ class TestPrettyPrintObject(MockProgramTestCase):
 	.x = (int)0x0,
 	.y = (int)0xd,
 }""",
+        )
+
+    def test_big_pointer(self):
+        self.assertEqual(
+            Object(
+                self.prog,
+                self.prog.pointer_type(self.prog.void_type(), size=16),
+                0x0123456789ABCDEFFEDCBA9876543210,
+            ).format_(),
+            "(void *)0x123456789abcdeffedcba9876543210",
         )
 
     def test_integer_base_array(self):

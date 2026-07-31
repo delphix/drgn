@@ -101,13 +101,21 @@ static int serialize_compound_value(struct drgn_program *prog, char *buf,
 		return -1;
 	}
 
-	_cleanup_pydecref_ PyObject *items = PyMapping_Items(value_obj);
+	_cleanup_pydecref_ PyObject *items =
+		PyObject_CallMethod(value_obj, "items", NULL);
 	if (!items)
 		return -1;
+	_cleanup_pydecref_ PyObject *it = PyObject_GetIter(items);
+	if (!it)
+		return -1;
 
-	Py_ssize_t num_items = PyList_GET_SIZE(items);
-	for (Py_ssize_t i = 0; i < num_items; i++) {
-		PyObject *item = PyList_GET_ITEM(items, i);
+	for (;;) {
+		_cleanup_pydecref_ PyObject *item = PyIter_Next(it);
+		if (!item) {
+			if (PyErr_Occurred())
+				return -1;
+			break;
+		}
 		if (!PyTuple_Check(item) || PyTuple_GET_SIZE(item) != 2) {
 			PyErr_SetString(PyExc_TypeError, "invalid item");
 			return -1;
@@ -170,34 +178,32 @@ static int serialize_array_value(struct drgn_program *prog, char *buf,
 	}
 
 	uint64_t length = drgn_type_length(type->underlying_type);
-	if (length > PY_SSIZE_T_MAX) {
-		PyErr_NoMemory();
-		return -1;
-	}
 
-	_cleanup_pydecref_ PyObject *seq = PySequence_Fast(value_obj, "");
-	if (!seq) {
+	_cleanup_pydecref_ PyObject *it = PyObject_GetIter(value_obj);
+	if (!it) {
 		if (PyErr_ExceptionMatches(PyExc_TypeError)) {
 			set_error_type_name("'%s' value must be iterable",
 					    drgn_object_type_qualified(type));
 		}
 		return -1;
 	}
-	size_t seq_length = PySequence_Fast_GET_SIZE(seq);
-	if (seq_length > length) {
-		PyErr_SetString(PyExc_ValueError,
-				"too many items in array value");
-		return -1;
-	}
 
-	for (size_t i = 0; i < seq_length; i++) {
+	for (uint64_t i = 0; ; i++) {
+		_cleanup_pydecref_ PyObject *item = PyIter_Next(it);
+		if (!item)
+			break;
+		if (i >= length) {
+			PyErr_SetString(PyExc_ValueError,
+					"too many items in array value");
+			return -1;
+		}
 		if (serialize_py_object(prog, buf, buf_bit_size,
 					bit_offset + i * element_type.bit_size,
-					PySequence_Fast_GET_ITEM(seq, i),
-					&element_type) == -1)
+					item, &element_type) == -1)
 			return -1;
 	}
-
+	if (PyErr_Occurred())
+		return -1;
 	return 0;
 }
 
@@ -262,6 +268,11 @@ static int serialize_py_object(struct drgn_program *prog, char *buf,
 		return 0;
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
+		if (type->bit_size != 32 && type->bit_size != 64) {
+			PyErr_SetString(PyExc_NotImplementedError,
+					"float values which are not 32 or 64 bits are not yet supported");
+			return -1;
+		}
 		if (!PyNumber_Check(value_obj)) {
 			set_error_type_name("'%s' value must be number",
 					    drgn_object_type_qualified(type));
@@ -675,11 +686,14 @@ static PyObject *DrgnObject_value_impl(struct drgn_object *obj)
 		err = drgn_object_read_value(obj, &value_mem, &value);
 		if (err)
 			return set_drgn_error(err);
-		return _PyLong_FromByteArray((void *)value->bufp,
-					     drgn_object_size(obj),
-					     obj->little_endian,
-					     obj->encoding
-					     == DRGN_OBJECT_ENCODING_SIGNED_BIG);
+		PyObject *ret =
+			_PyLong_FromByteArray((void *)value->bufp,
+					      drgn_object_size(obj),
+					      obj->little_endian,
+					      obj->encoding
+					      == DRGN_OBJECT_ENCODING_SIGNED_BIG);
+		drgn_object_deinit_value(obj, value);
+		return ret;
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
 		double fvalue;

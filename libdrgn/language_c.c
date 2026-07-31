@@ -1633,8 +1633,9 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	 * Pointers are special because they can have an asterisk prefix if
 	 * we're dereferencing them.
 	 */
-	if (drgn_type_kind(underlying_type) == DRGN_TYPE_POINTER &&
-	    obj->kind != DRGN_OBJECT_ABSENT) {
+	if (drgn_type_kind(underlying_type) == DRGN_TYPE_POINTER
+	    && obj->kind != DRGN_OBJECT_ABSENT
+	    && obj->encoding == DRGN_OBJECT_ENCODING_UNSIGNED) {
 		return c_format_pointer_object(obj, underlying_type, indent,
 					       one_line_columns,
 					       multi_line_columns, options, sb);
@@ -1670,6 +1671,7 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 					 "cannot format void object");
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
+	case DRGN_TYPE_POINTER:
 		return c_format_int_object(obj, options, sb);
 	case DRGN_TYPE_FLOAT:
 		return c_format_float_object(obj, sb);
@@ -1689,7 +1691,6 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	case DRGN_TYPE_FUNCTION:
 		return c_format_function_object(obj, sb);
 	case DRGN_TYPE_TYPEDEF:
-	case DRGN_TYPE_POINTER:
 	default:
 		UNREACHABLE();
 	}
@@ -1719,7 +1720,7 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 	const char *p = lexer->p;
 	bool cpp = ((struct drgn_c_family_lexer *)lexer)->cpp;
 
-	while (isspace(*p))
+	while (isspace((unsigned char)*p))
 		p++;
 
 	token->value = p;
@@ -1789,10 +1790,10 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 		}
 		fallthrough;
 	default:
-		if (isalpha(*p) || *p == '_') {
+		if (isalpha((unsigned char)*p) || *p == '_') {
 			do {
 				p++;
-			} while (isalnum(*p) || *p == '_');
+			} while (isalnum((unsigned char)*p) || *p == '_');
 			token->kind = identifier_token_kind(token->value,
 							    p - token->value,
 							    cpp);
@@ -1813,7 +1814,7 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 				while ('0' <= *p && *p <= '9')
 					p++;
 			}
-			if (isalpha(*p) || *p == '_') {
+			if (isalpha((unsigned char)*p) || *p == '_') {
 				return drgn_error_create(DRGN_ERROR_SYNTAX,
 							 "invalid number");
 			}

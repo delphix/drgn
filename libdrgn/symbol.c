@@ -59,6 +59,32 @@ drgn_symbol_create(const char *name, uint64_t address, uint64_t size,
 		   enum drgn_symbol_binding binding, enum drgn_symbol_kind kind,
 		   enum drgn_lifetime name_lifetime, struct drgn_symbol **ret)
 {
+	SWITCH_ENUM(binding) {
+	case DRGN_SYMBOL_BINDING_UNKNOWN:
+	case DRGN_SYMBOL_BINDING_LOCAL:
+	case DRGN_SYMBOL_BINDING_GLOBAL:
+	case DRGN_SYMBOL_BINDING_WEAK:
+	case DRGN_SYMBOL_BINDING_UNIQUE:
+		break;
+	default:
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "invalid symbol binding");
+	}
+	SWITCH_ENUM(kind) {
+	case DRGN_SYMBOL_KIND_UNKNOWN:
+	case DRGN_SYMBOL_KIND_OBJECT:
+	case DRGN_SYMBOL_KIND_FUNC:
+	case DRGN_SYMBOL_KIND_SECTION:
+	case DRGN_SYMBOL_KIND_FILE:
+	case DRGN_SYMBOL_KIND_COMMON:
+	case DRGN_SYMBOL_KIND_TLS:
+	case DRGN_SYMBOL_KIND_IFUNC:
+		break;
+	default:
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "invalid symbol kind");
+	}
+
 	struct drgn_symbol *sym = malloc(sizeof(*sym));
 	if (!sym)
 		return &drgn_enomem;
@@ -248,6 +274,8 @@ drgn_symbol_index_init(struct drgn_symbol *symbols, uint32_t count,
 	ret->name_sort = NULL;
 	ret->max_addrs = NULL;
 	drgn_symbol_name_table_init(&ret->htab);
+	if (count == 0)
+		return NULL;
 	ret->name_sort = malloc_array(count, sizeof(ret->name_sort[0]));
 	if (!ret->name_sort)
 		goto enomem;
@@ -391,7 +419,7 @@ drgn_symbol_index_find(const char *name, uint64_t address,
 				break;
 		}
 	} else {
-		for (int i = 0; i < index->num_syms; i++) {
+		for (size_t i = 0; i < index->num_syms; i++) {
 			struct drgn_symbol *s = &index->symbols[i];
 			if (!drgn_symbol_result_builder_add(builder, s))
 				return &drgn_enomem;

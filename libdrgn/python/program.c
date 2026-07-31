@@ -670,7 +670,7 @@ py_symbol_find_fn(const char *name, uint64_t addr,
 
 	_cleanup_pydecref_ PyObject *address_obj = NULL;
 	if (flags & DRGN_FIND_SYMBOL_ADDR) {
-		address_obj = PyLong_FromUnsignedLong(addr);
+		address_obj = PyLong_FromUInt64(addr);
 		if (!address_obj)
 			return drgn_error_from_python();
 	} else {
@@ -1327,11 +1327,10 @@ static PyObject *Program_module(Program *self, PyObject *arg)
 			return NULL;
 		module = drgn_module_find_by_name(&self->prog, name);
 	} else {
-		struct index_arg address = {};
-		if (!index_converter(arg, &address))
+		uint64_t address;
+		if (PyLong_AsUInt64(arg, &address))
 			return NULL;
-		module = drgn_module_find_by_address(&self->prog,
-						     address.uvalue);
+		module = drgn_module_find_by_address(&self->prog, address);
 	}
 	return Module_wrap_find(module);
 }
@@ -1949,11 +1948,10 @@ static PyObject *Program_stack_trace(Program *self, PyObject *args,
 		err = drgn_object_stack_trace(&((DrgnObject *)thread)->obj,
 					      &trace);
 	} else {
-		struct index_arg tid = {};
-
-		if (!index_converter(thread, &tid))
+		uint32_t tid;
+		if (PyLong_AsUInt32(thread, &tid))
 			return NULL;
-		err = drgn_program_stack_trace(&self->prog, tid.uvalue, &trace);
+		err = drgn_program_stack_trace(&self->prog, tid, &trace);
 	}
 	if (err)
 		return set_drgn_error(err);
@@ -1981,14 +1979,20 @@ static PyObject *Program_stack_trace_from_pcs(Program *self, PyObject *args,
 	if (!pypcseq)
 		return NULL;
 
-	size_t size = PySequence_Fast_GET_SIZE(pypcseq);
+	Py_ssize_t size = PySequence_Fast_GET_SIZE(pypcseq);
 	_cleanup_free_ uint64_t *pcs = malloc_array(size, sizeof(uint64_t));
-	for (uint64_t i = 0; i != size; ++i) {
-		struct index_arg pc = {};
-
-		if (!index_converter(PySequence_Fast_GET_ITEM(pypcseq, i), &pc))
+	if (!pcs && size > 0)
+		return PyErr_NoMemory();
+	for (Py_ssize_t i = 0; i < size; i++) {
+		// PyLong_AsUInt64() calls __index__(), which could
+		// theoretically modify the list.
+		if (i >= PySequence_Fast_GET_SIZE(pypcseq)) {
+			size = i;
+			break;
+		}
+		if (PyLong_AsUInt64(PySequence_Fast_GET_ITEM(pypcseq, i),
+				    &pcs[i]))
 			return NULL;
-		pcs[i] = pc.uvalue;
 	}
 
 	err = drgn_program_stack_trace_from_pcs(&self->prog, pcs, size, &trace);
@@ -2012,11 +2016,10 @@ static PyObject *Program_source_location(Program *self, PyObject *arg)
 			return NULL;
 		err = drgn_program_addr2line(&self->prog, address_str, &locs);
 	} else {
-		struct index_arg address = {};
-		if (!index_converter(arg, &address))
+		uint64_t address;
+		if (PyLong_AsUInt64(arg, &address))
 			return NULL;
-		err = drgn_program_source_location(&self->prog, address.uvalue,
-						   &locs);
+		err = drgn_program_source_location(&self->prog, address, &locs);
 	}
 	if (err)
 		return set_drgn_error(err);
@@ -2047,11 +2050,10 @@ static PyObject *Program_symbols(Program *self, PyObject *args)
 		err = drgn_program_find_symbols_by_name(&self->prog, name,
 							&symbols, &count);
 	} else {
-		struct index_arg address = {};
-		if (!index_converter(arg, &address))
+		uint64_t address;
+		if (PyLong_AsUInt64(arg, &address))
 			return NULL;
-		err = drgn_program_find_symbols_by_address(&self->prog,
-							   address.uvalue,
+		err = drgn_program_find_symbols_by_address(&self->prog, address,
 							   &symbols, &count);
 	}
 	if (err)
@@ -2074,12 +2076,11 @@ static PyObject *Program_symbol(Program *self, PyObject *arg)
 			return NULL;
 		err = drgn_program_find_symbol_by_name(&self->prog, name, &sym);
 	} else {
-		struct index_arg address = {};
-
-		if (!index_converter(arg, &address))
+		uint64_t address;
+		if (PyLong_AsUInt64(arg, &address))
 			return NULL;
-		err = drgn_program_find_symbol_by_address(&self->prog,
-							  address.uvalue, &sym);
+		err = drgn_program_find_symbol_by_address(&self->prog, address,
+							  &sym);
 	}
 	if (err)
 		return set_drgn_error(err);

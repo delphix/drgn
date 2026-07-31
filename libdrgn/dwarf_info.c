@@ -4158,17 +4158,21 @@ deref:
 		case DW_OP_and:
 			BINOP(&);
 			break;
-		case DW_OP_div:
+		case DW_OP_div: {
 			CHECK(2);
 			if (ELEM(0) == 0) {
 				return binary_buffer_error(&ctx->bb,
 							   "division by zero in DWARF expression");
 			}
-			ELEM(1) = ((truncate_signed(ELEM(1), address_bits)
-				    / truncate_signed(ELEM(0), address_bits))
-				   & address_mask);
+			int64_t dividend = truncate_signed(ELEM(1), address_bits);
+			int64_t divisor = truncate_signed(ELEM(0), address_bits);
+			if (dividend == INT64_MIN && divisor == -1)
+				ELEM(1) = INT64_MIN & address_mask;
+			else
+				ELEM(1) = (dividend / divisor) & address_mask;
 			uint64_vector_pop(stack);
 			break;
+		}
 		case DW_OP_minus:
 			BINOP_MASK(-);
 			break;
@@ -7683,23 +7687,18 @@ drgn_find_cfi_row_in_dwarf_fde(struct drgn_dwarf_cfi *cfi,
 {
 	struct drgn_error *err;
 	struct drgn_dwarf_cie *cie = &cfi->cies[fde->cie];
-	struct drgn_cfi_row *initial_row =
+	_cleanup_cfi_row_ struct drgn_cfi_row *initial_row =
 		(struct drgn_cfi_row *)file->platform.arch->default_dwarf_cfi_row;
 	err = drgn_eval_dwarf_cfi(file, scn, cie, fde, NULL, unbiased_pc,
 				  cie->initial_instructions,
 				  cie->initial_instructions_size, &initial_row);
 	if (err)
-		goto out;
-	if (!drgn_cfi_row_copy(ret, initial_row)) {
-		err = &drgn_enomem;
-		goto out;
-	}
-	err = drgn_eval_dwarf_cfi(file, scn, cie, fde, initial_row, unbiased_pc,
-				  fde->instructions, fde->instructions_size,
-				  ret);
-out:
-	drgn_cfi_row_destroy(initial_row);
-	return err;
+		return err;
+	if (!drgn_cfi_row_copy(ret, initial_row))
+		return &drgn_enomem;
+	return drgn_eval_dwarf_cfi(file, scn, cie, fde, initial_row,
+				   unbiased_pc, fde->instructions,
+				   fde->instructions_size, ret);
 }
 
 static struct drgn_error *
