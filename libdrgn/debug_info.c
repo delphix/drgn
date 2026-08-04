@@ -1545,14 +1545,19 @@ drgn_module_maybe_use_elf_file(struct drgn_module *module,
 			       module->name, module->build_id_str);
 	}
 	if (elf_start < elf_end) {
-		drgn_log_debug(prog,
-			       "%s: set address range 0x%" PRIx64
-			       "-0x%" PRIx64 " from file", module->name,
-			       elf_start, elf_end);
 		err = drgn_module_set_address_range(module, elf_start, elf_end);
-		// This can only fail if the address range is invalid, which we
-		// just checked for.
-		assert(!err);
+		if (err) {
+			drgn_error_log_debug(prog, err,
+					     "%s: couldn't set address range: ",
+					     module->name);
+			drgn_error_destroy(err);
+			err = NULL;
+		} else {
+			drgn_log_debug(prog,
+				       "%s: set address range 0x%" PRIx64
+				       "-0x%" PRIx64 " from file", module->name,
+				       elf_start, elf_end);
+		}
 	}
 
 	if (use_loaded) {
@@ -5533,7 +5538,7 @@ drgn_load_module_debug_info(struct drgn_module **modules, size_t *num_modulesp)
 		if (drgn_module_wants_file(modules[i])) {
 			modules[num_wanted_modules++] = modules[i];
 		} else if (modules[i]->loaded_file_status == DRGN_MODULE_FILE_DONT_WANT
-			   || modules[i]->loaded_file_status == DRGN_MODULE_FILE_DONT_WANT) {
+			   || modules[i]->debug_file_status == DRGN_MODULE_FILE_DONT_WANT) {
 			drgn_log_debug(prog,
 				       "debugging symbols not wanted for %s",
 				       modules[i]->name);

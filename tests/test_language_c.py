@@ -1260,6 +1260,61 @@ class TestOperators(MockProgramTestCase):
             Object(self.prog, "_Bool", True),
         )
 
+    def test_cast_floating_point_to_integer(self):
+        # Truncation towards zero.
+        for value, expected in ((1.9, 1), (-1.9, -1), (0.5, 0), (-0.5, 0), (-5.0, -5)):
+            with self.subTest(value=value):
+                self.assertIdentical(
+                    cast("int", self.double(value)), self.int(expected)
+                )
+
+        # NaN and saturation.
+        nan = float("nan")
+        inf = float("inf")
+        for type_name, min_, max_ in (
+            ("int", -(2**31), 2**31 - 1),
+            ("unsigned int", 0, 2**32 - 1),
+            ("long", -(2**63), 2**63 - 1),
+            ("unsigned long", 0, 2**64 - 1),
+        ):
+            for value, expected in (
+                (nan, 0),
+                (inf, max_),
+                (-inf, min_),
+                (1e300, max_),
+                (-1e300, min_),
+                # Just out of range.
+                (float(max_ + 1), max_),
+                (float(min_ - 1), min_),
+            ):
+                with self.subTest(type=type_name, value=value):
+                    self.assertIdentical(
+                        cast(type_name, self.double(value)),
+                        Object(self.prog, type_name, expected),
+                    )
+
+        # Saturation is to the range of the destination type.
+        self.assertIdentical(cast("int", self.double(1e10)), self.int(2**31 - 1))
+        self.assertIdentical(cast("int", self.double(-1e10)), self.int(-(2**31)))
+        self.assertIdentical(
+            cast("unsigned int", self.double(5e9)),
+            self.unsigned_int(2**32 - 1),
+        )
+
+        # Values in range are not affected.
+        self.assertIdentical(
+            cast("int", self.double(2147483647.0)), self.int(2**31 - 1)
+        )
+        self.assertIdentical(
+            cast("int", self.double(-2147483648.0)), self.int(-(2**31))
+        )
+        self.assertIdentical(
+            cast("unsigned int", self.double(3e9)), self.unsigned_int(3000000000)
+        )
+        self.assertIdentical(
+            cast("long", self.double(-9223372036854775808.0)), self.long(-(2**63))
+        )
+
     def _test_arithmetic(
         self, op, lhs, rhs, result, integral=True, floating_point=False
     ):
@@ -3218,6 +3273,48 @@ class TestPrettyPrintObject(MockProgramTestCase):
     def test_zero_length_array(self):
         self.assertEqual(str(Object(self.prog, "int []", address=0)), "(int []){}")
         self.assertEqual(str(Object(self.prog, "int [0]", address=0)), "(int [0]){}")
+
+    def test_flexible_array_member(self):
+        self.add_memory_segment((99).to_bytes(4, "little"), virt_addr=0xFFFF0000)
+        obj = Object(
+            self.prog,
+            self.prog.struct_type(
+                "foo",
+                4,
+                (
+                    TypeMember(self.prog.int_type("int", 4, True), "n", 0),
+                    TypeMember(
+                        self.prog.array_type(self.prog.int_type("int", 4, True)),
+                        "a",
+                        32,
+                    ),
+                ),
+            ),
+            address=0xFFFF0000,
+        )
+        self.assertEqual(
+            str(obj),
+            """\
+(struct foo){
+	.n = (int)99,
+	.a = (int []){},
+}""",
+        )
+        self.assertEqual(
+            str(obj.read_()),
+            """\
+(struct foo){
+	.n = (int)99,
+	.a = (int [])<absent>,
+}""",
+        )
+
+        expected = """\
+(struct foo){
+	.n = (int)99,
+}"""
+        self.assertEqual(obj.format_(implicit_members=False), expected)
+        self.assertEqual(obj.read_().format_(implicit_members=False), expected)
 
     def test_array_zeroes(self):
         segment = bytearray(16)
