@@ -192,7 +192,6 @@ void drgn_dwarf_info_init(struct drgn_debug_info *dbinfo)
 	dbinfo->dwarf.global.parent = NULL;
 	drgn_dwarf_base_type_map_init(&dbinfo->dwarf.base_types);
 	drgn_dwarf_specification_map_init(&dbinfo->dwarf.specifications);
-	free(dbinfo->dwarf.index_cu_lookup);
 	drgn_dwarf_index_cu_vector_init(&dbinfo->dwarf.index_cus);
 	drgn_dwarf_type_map_init(&dbinfo->dwarf.types);
 	drgn_dwarf_type_map_init(&dbinfo->dwarf.cant_be_incomplete_array_types);
@@ -208,6 +207,7 @@ void drgn_dwarf_info_deinit(struct drgn_debug_info *dbinfo)
 {
 	drgn_dwarf_type_map_deinit(&dbinfo->dwarf.cant_be_incomplete_array_types);
 	drgn_dwarf_type_map_deinit(&dbinfo->dwarf.types);
+	free(dbinfo->dwarf.index_cu_lookup);
 	vector_for_each(drgn_dwarf_index_cu_vector, cu,
 			&dbinfo->dwarf.index_cus)
 		drgn_dwarf_index_cu_deinit(cu);
@@ -1064,7 +1064,8 @@ read_abbrev_decl(struct drgn_elf_file_section_buffer *buffer,
 		if (insn != 0) {
 			if (insn <= INSN_MAX_SKIP) {
 				if (last_insn + insn <= INSN_MAX_SKIP) {
-					*uint8_vector_last(insns) += insn;
+					last_insn += insn;
+					*uint8_vector_last(insns) = last_insn;
 					continue;
 				} else if (last_insn < INSN_MAX_SKIP) {
 					insn = last_insn + insn - INSN_MAX_SKIP;
@@ -4701,7 +4702,12 @@ drgn_object_from_dwarf_enumerator(struct drgn_debug_info *dbinfo,
 							0);
 		}
 	}
-	UNREACHABLE();
+	// This can happen if the DWARF index and drgn_type_from_dwarf()
+	// disagree. In particular, the DWARF index doesn't check for
+	// DW_AT_declaration on DW_TAG_enumeration_type DIEs, so if such a DIE
+	// has DW_TAG_enumerator children (which is malformed), the DWARF index
+	// will include them but drgn_type_from_dwarf() won't.
+	return &drgn_not_found;
 }
 
 static struct drgn_error *
@@ -6779,9 +6785,11 @@ drgn_debug_info_find_object(const char *name, size_t name_len,
 		if (!die_matches_filename(&die, filename))
 			continue;
 		if (dwarf_tag(&die) == DW_TAG_enumeration_type) {
-			return drgn_object_from_dwarf_enumerator(dbinfo, file,
-								 &die, name,
-								 ret);
+			err = drgn_object_from_dwarf_enumerator(dbinfo, file,
+								&die, name,
+								ret);
+			if (err != &drgn_not_found)
+				return err;
 		} else {
 			return drgn_object_from_dwarf(dbinfo, file, &die, NULL,
 						      NULL, NULL, ret);
@@ -7260,9 +7268,11 @@ static struct drgn_error *drgn_parse_dwarf_cfi(struct drgn_dwarf_cfi *cfi,
 
 	drgn_dwarf_cie_vector_shrink_to_fit(&cies);
 	drgn_dwarf_fde_vector_shrink_to_fit(&fdes);
-	qsort(drgn_dwarf_fde_vector_begin(&fdes),
-	      drgn_dwarf_fde_vector_size(&fdes), sizeof(struct drgn_dwarf_fde),
-	      drgn_dwarf_fde_compar);
+	if (!drgn_dwarf_fde_vector_empty(&fdes)) {
+		qsort(drgn_dwarf_fde_vector_begin(&fdes),
+		      drgn_dwarf_fde_vector_size(&fdes),
+		      sizeof(struct drgn_dwarf_fde), drgn_dwarf_fde_compar);
+	}
 	drgn_dwarf_cie_vector_steal(&cies, &cfi->cies, NULL);
 	drgn_dwarf_fde_vector_steal(&fdes, &cfi->fdes, &cfi->num_fdes);
 	return NULL;

@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <json-c/json.h>
 #include <libelf.h>
+#include <limits.h>
 #include <netdb.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,6 +63,10 @@ static struct drgn_error *qmp_recv_msg(struct drgn_qmp_conn *conn,
 		// Check if we already have a complete line in the buffer.
 		char *newline = buf->len ? memchr(buf->str, '\n', buf->len) : NULL;
 		if (newline) {
+			if (newline - buf->str > INT_MAX) {
+				return drgn_error_create(DRGN_ERROR_BAD_DATA,
+							 "QMP message is too long");
+			}
 			struct json_object *obj =
 				json_tokener_parse_ex(conn->json_tok, buf->str,
 						      newline - buf->str);
@@ -878,16 +883,16 @@ drgn_program_set_qemu_qmp_fd(struct drgn_program *prog, int fd)
 	bool had_platform = prog->has_platform;
 	bool had_vmcoreinfo = prog->vmcoreinfo.raw;
 
+	err = drgn_program_check_initialized(prog);
+	if (err)
+		return err;
+
 	prog->qmp_conn.fd = fd;
 	prog->qmp_conn.json_tok = json_tokener_new();
 	if (!prog->qmp_conn.json_tok) {
 		err = &drgn_enomem;
 		goto err;
 	}
-
-	err = drgn_program_check_initialized(prog);
-	if (err)
-		goto err;
 
 	err = qmp_negotiate(&prog->qmp_conn);
 	if (err)

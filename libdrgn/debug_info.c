@@ -419,6 +419,15 @@ struct drgn_error *drgn_module_find_or_create_extra(struct drgn_program *prog,
 					  ret, new_ret);
 }
 
+static void drgn_split_dwarf_elf_file_destroy(struct drgn_elf_file *file)
+{
+	// The Elf and Dwarf handles in a split DWARF file are borrowed from the
+	// parent Dwarf handle.
+	file->elf = NULL;
+	file->_dwarf = NULL;
+	drgn_elf_file_destroy(file);
+}
+
 static void
 drgn_module_clear_wanted_supplementary_debug_file(struct drgn_module *module)
 {
@@ -442,6 +451,10 @@ static void drgn_module_destroy(struct drgn_module *module)
 	drgn_module_orc_info_deinit(module);
 	drgn_module_dwarf_info_deinit(module);
 	drgn_module_clear_wanted_supplementary_debug_file(module);
+	hash_table_for_each(drgn_elf_file_dwarf_table, it,
+			    &module->split_dwarf_files)
+		drgn_split_dwarf_elf_file_destroy(*it.entry);
+	drgn_elf_file_dwarf_table_deinit(&module->split_dwarf_files);
 	drgn_elf_file_destroy(module->gnu_debugdata_file);
 	drgn_elf_file_destroy(module->supplementary_debug_file);
 	if (module->debug_file != module->loaded_file)
@@ -1545,14 +1558,19 @@ drgn_module_maybe_use_elf_file(struct drgn_module *module,
 			       module->name, module->build_id_str);
 	}
 	if (elf_start < elf_end) {
-		drgn_log_debug(prog,
-			       "%s: set address range 0x%" PRIx64
-			       "-0x%" PRIx64 " from file", module->name,
-			       elf_start, elf_end);
 		err = drgn_module_set_address_range(module, elf_start, elf_end);
-		// This can only fail if the address range is invalid, which we
-		// just checked for.
-		assert(!err);
+		if (err) {
+			drgn_error_log_debug(prog, err,
+					     "%s: couldn't set address range: ",
+					     module->name);
+			drgn_error_destroy(err);
+			err = NULL;
+		} else {
+			drgn_log_debug(prog,
+				       "%s: set address range 0x%" PRIx64
+				       "-0x%" PRIx64 " from file", module->name,
+				       elf_start, elf_end);
+		}
 	}
 
 	if (use_loaded) {
@@ -1984,6 +2002,41 @@ struct drgn_map_files_segment {
 
 DEFINE_VECTOR(drgn_map_files_segment_vector, struct drgn_map_files_segment);
 
+struct drgn_map_files_segments {
+	struct drgn_map_files_segment_vector vector;
+	// Whether the segments are already sorted by start address. The Linux
+	// kernel always returns these entries in order, but we check and sort
+	// afterwards if not just in case.
+	bool sorted;
+};
+
+static void
+drgn_map_files_segments_deinit(struct drgn_map_files_segments *segments)
+{
+	drgn_map_files_segment_vector_deinit(&segments->vector);
+}
+
+#define DRGN_MAP_FILES_SEGMENTS(name)					\
+	_cleanup_(drgn_map_files_segments_deinit)			\
+	struct drgn_map_files_segments name = { VECTOR_INIT, true }
+
+static struct drgn_error *
+drgn_add_map_files_segment(struct drgn_map_files_segments *segments,
+			   uint64_t start, uint64_t end)
+{
+	if (!drgn_map_files_segment_vector_empty(&segments->vector)
+	    && start
+	       < drgn_map_files_segment_vector_last(&segments->vector)->start)
+		segments->sorted = false;
+	struct drgn_map_files_segment *entry =
+		drgn_map_files_segment_vector_append_entry(&segments->vector);
+	if (!entry)
+		return &drgn_enomem;
+	entry->start = start;
+	entry->end = end;
+	return NULL;
+}
+
 static inline int drgn_map_files_segment_compare(const void *_a, const void *_b)
 {
 	const struct drgn_map_files_segment *a = _a;
@@ -1993,17 +2046,14 @@ static inline int drgn_map_files_segment_compare(const void *_a, const void *_b)
 
 static void
 drgn_debug_info_set_map_files_segments(struct drgn_debug_info *dbinfo,
-				       struct drgn_map_files_segment_vector *segments,
-				       bool sorted)
+				       struct drgn_map_files_segments *segments)
 {
 	free(dbinfo->map_files_segments);
-	drgn_map_files_segment_vector_shrink_to_fit(segments);
-	drgn_map_files_segment_vector_steal(segments,
+	drgn_map_files_segment_vector_shrink_to_fit(&segments->vector);
+	drgn_map_files_segment_vector_steal(&segments->vector,
 					    &dbinfo->map_files_segments,
 					    &dbinfo->num_map_files_segments);
-	// The Linux kernel always returns these entries in order, but sort it
-	// just in case.
-	if (!sorted) {
+	if (!segments->sorted) {
 		qsort(dbinfo->map_files_segments,
 		      dbinfo->num_map_files_segments,
 		      sizeof(dbinfo->map_files_segments[0]),
@@ -2073,24 +2123,21 @@ drgn_module_try_proc_files_for_shared_library(struct drgn_module *module,
 		drgn_log_debug(prog, "%s: %m", path);
 		return NULL;
 	}
-	VECTOR(drgn_map_files_segment_vector, segments);
-	bool sorted = true;
+	DRGN_MAP_FILES_SEGMENTS(segments);
 	bool found = false;
 	struct dirent *ent;
 	while ((errno = 0, ent = readdir(dir))) {
-		struct drgn_map_files_segment segment;
-		if (sscanf(ent->d_name, "%" SCNx64 "-%" SCNx64, &segment.start,
-			   &segment.end) != 2)
+		uint64_t segment_start, segment_end;
+		if (sscanf(ent->d_name, "%" SCNx64 "-%" SCNx64, &segment_start,
+			   &segment_end) != 2)
 			continue;
 
-		if (!drgn_map_files_segment_vector_empty(&segments)
-		    && segment.start
-		       < drgn_map_files_segment_vector_last(&segments)->start)
-			sorted = false;
-		if (!drgn_map_files_segment_vector_append(&segments, &segment))
-			return &drgn_enomem;
+		err = drgn_add_map_files_segment(&segments, segment_start,
+						 segment_end);
+		if (err)
+			return err;
 
-		if (segment.start <= address && address < segment.end
+		if (segment_start <= address && address < segment_end
 		    && !found
 		    && strlen(ent->d_name) + 1 < sizeof(path) - dir_len) {
 			found = true;
@@ -2119,8 +2166,7 @@ drgn_module_try_proc_files_for_shared_library(struct drgn_module *module,
 	if (errno)
 		return drgn_error_create_os("readdir", errno, path);
 
-	drgn_debug_info_set_map_files_segments(&prog->dbinfo, &segments,
-					       sorted);
+	drgn_debug_info_set_map_files_segments(&prog->dbinfo, &segments);
 
 	if (!found) {
 		drgn_log_debug(prog,
@@ -3369,12 +3415,15 @@ struct drgn_mapped_file_segments {
 	bool sorted;
 };
 
-#define DRGN_MAPPED_FILE_SEGMENTS_INIT { VECTOR_INIT, true }
-
-static void drgn_mapped_file_segments_abort(struct drgn_mapped_file_segments *segments)
+static void
+drgn_mapped_file_segments_deinit(struct drgn_mapped_file_segments *segments)
 {
 	drgn_mapped_file_segment_vector_deinit(&segments->vector);
 }
+
+#define DRGN_MAPPED_FILE_SEGMENTS(name)					\
+	_cleanup_(drgn_mapped_file_segments_deinit)			\
+	struct drgn_mapped_file_segments name = { VECTOR_INIT, true }
 
 static struct drgn_error *
 drgn_add_mapped_file_segment(struct drgn_mapped_file_segments *segments,
@@ -4473,20 +4522,20 @@ process_add_mapping(struct process_loaded_module_iterator *it,
 		    const char *maps_path, const char *map_files_path,
 		    int map_files_fd, bool *logged_readlink_eperm,
 		    bool *logged_stat_eperm,
-		    struct drgn_map_files_segment_vector *map_files_segments,
+		    struct drgn_map_files_segments *map_files_segments,
 		    struct drgn_mapped_file_segments *segments,
 		    char *line, size_t line_len)
 {
+	struct drgn_error *err;
 	struct drgn_program *prog = it->u.it.prog;
 
-	struct drgn_map_files_segment segment;
-	uint64_t segment_file_offset;
+	uint64_t segment_start, segment_end, segment_file_offset;
 	unsigned int dev_major, dev_minor;
 	uint64_t ino;
 	int map_name_len, path_index;
 	if (sscanf(line,
 		   "%" SCNx64 "-%" SCNx64 "%n %*s %" SCNx64 " %x:%x %" SCNu64 " %n",
-		   &segment.start, &segment.end, &map_name_len,
+		   &segment_start, &segment_end, &map_name_len,
 		   &segment_file_offset, &dev_major, &dev_minor, &ino,
 		   &path_index) != 6) {
 		return drgn_error_format(DRGN_ERROR_BAD_DATA, "couldn't parse %s",
@@ -4496,8 +4545,10 @@ process_add_mapping(struct process_loaded_module_iterator *it,
 	if (ino == 0)
 		return NULL;
 
-	if (!drgn_map_files_segment_vector_append(map_files_segments, &segment))
-		return &drgn_enomem;
+	err = drgn_add_map_files_segment(map_files_segments, segment_start,
+					 segment_end);
+	if (err)
+		return err;
 
 	struct process_mapped_file_key key = {
 		.dev = makedev(dev_major, dev_minor),
@@ -4521,7 +4572,7 @@ process_add_mapping(struct process_loaded_module_iterator *it,
 	if (map_files_fd >= 0) {
 		char map_files_name[34];
 		snprintf(map_files_name, sizeof(map_files_name),
-			 "%" PRIx64 "-%" PRIx64, segment.start, segment.end);
+			 "%" PRIx64 "-%" PRIx64, segment_start, segment_end);
 
 		// The escaped path must be at least as long as the original
 		// path, so use that as the readlink buffer size.
@@ -4630,8 +4681,8 @@ process_add_mapping(struct process_loaded_module_iterator *it,
 		// real_path is owned by the iterator now.
 		real_path = NULL;
 	}
-	return drgn_add_mapped_file_segment(segments, segment.start, segment.end,
-					    segment_file_offset,
+	return drgn_add_mapped_file_segment(segments, segment_start,
+					    segment_end, segment_file_offset,
 					    files_it.entry->file);
 }
 
@@ -4683,17 +4734,15 @@ process_get_mapped_files(struct process_loaded_module_iterator *it)
 	bool logged_readlink_eperm = false, logged_stat_eperm = false;
 	// While we're reading /proc/$pid/maps, we might as well cache the
 	// segments for drgn_module_try_proc_files_for_shared_library().
-	VECTOR(drgn_map_files_segment_vector, map_files_segments);
-	struct drgn_mapped_file_segments segments = DRGN_MAPPED_FILE_SEGMENTS_INIT;
+	DRGN_MAP_FILES_SEGMENTS(map_files_segments);
+	DRGN_MAPPED_FILE_SEGMENTS(segments);
 	for (;;) {
 		errno = 0;
 		ssize_t len;
 		if ((len = getline(&line, &n, maps_file)) == -1) {
 			if (errno) {
-				err = drgn_error_create_os("getline", errno,
-							   maps_path);
-			} else {
-				err = NULL;
+				return drgn_error_create_os("getline", errno,
+							    maps_path);
 			}
 			break;
 		}
@@ -4708,18 +4757,12 @@ process_get_mapped_files(struct process_loaded_module_iterator *it)
 					  &map_files_segments, &segments, line,
 					  len);
 		if (err)
-			break;
+			return err;
 	}
-	if (err) {
-		drgn_mapped_file_segments_abort(&segments);
-	} else {
-		drgn_debug_info_set_map_files_segments(&prog->dbinfo,
-						       &map_files_segments,
-						       segments.sorted);
-		userspace_loaded_module_iterator_set_file_segments(&it->u,
-								   &segments);
-	}
-	return err;
+	drgn_debug_info_set_map_files_segments(&prog->dbinfo,
+					       &map_files_segments);
+	userspace_loaded_module_iterator_set_file_segments(&it->u, &segments);
+	return NULL;
 }
 
 static void
@@ -4844,8 +4887,7 @@ core_get_mapped_files(struct core_loaded_module_iterator *it)
 			return err;
 	}
 
-	struct drgn_mapped_file_segments segments =
-		DRGN_MAPPED_FILE_SEGMENTS_INIT;
+	DRGN_MAPPED_FILE_SEGMENTS(segments);
 	for (uint64_t i = 0; i < count; i++) {
 		struct nt_file_segment64 segment;
 #define visit_nt_file_segment_members(visit_scalar_member, visit_raw_member) do {	\
@@ -4864,7 +4906,7 @@ core_get_mapped_files(struct core_loaded_module_iterator *it)
 		segment.file_offset *= page_size;
 		const char *path = bb.pos;
 		if ((err = binary_buffer_skip_string(&bb)))
-			goto err;
+			return err;
 		drgn_log_debug(prog,
 			       "found 0x%" PRIx64 "-0x%" PRIx64 " 0x%" PRIx64 " %s",
 			       segment.start, segment.end, segment.file_offset,
@@ -4880,29 +4922,22 @@ core_get_mapped_files(struct core_loaded_module_iterator *it)
 			file = *files_it.entry;
 		} else {
 			file = drgn_mapped_file_create(path);
-			if (!file) {
-				err = &drgn_enomem;
-				goto err;
-			}
+			if (!file)
+				return &drgn_enomem;
 			if (core_mapped_files_insert_searched(&it->files, &file,
 							      hp, NULL) < 0) {
 				drgn_mapped_file_destroy(file);
-				err = &drgn_enomem;
-				goto err;
+				return &drgn_enomem;
 			}
 		}
 		err = drgn_add_mapped_file_segment(&segments, segment.start,
 						   segment.end,
 						   segment.file_offset, file);
 		if (err)
-			goto err;
+			return err;
 	}
 	userspace_loaded_module_iterator_set_file_segments(&it->u, &segments);
 	return NULL;
-
-err:
-	drgn_mapped_file_segments_abort(&segments);
-	return err;
 }
 
 static void
@@ -5533,7 +5568,7 @@ drgn_load_module_debug_info(struct drgn_module **modules, size_t *num_modulesp)
 		if (drgn_module_wants_file(modules[i])) {
 			modules[num_wanted_modules++] = modules[i];
 		} else if (modules[i]->loaded_file_status == DRGN_MODULE_FILE_DONT_WANT
-			   || modules[i]->loaded_file_status == DRGN_MODULE_FILE_DONT_WANT) {
+			   || modules[i]->debug_file_status == DRGN_MODULE_FILE_DONT_WANT) {
 			drgn_log_debug(prog,
 				       "debugging symbols not wanted for %s",
 				       modules[i]->name);
@@ -5720,7 +5755,7 @@ drgn_module_create_split_dwarf_file(struct drgn_module *module,
 	int r = drgn_elf_file_dwarf_table_insert(&module->split_dwarf_files,
 						 ret, NULL);
 	if (r < 0) {
-		drgn_elf_file_destroy(*ret);
+		drgn_split_dwarf_elf_file_destroy(*ret);
 		return &drgn_enomem;
 	}
 	assert(r > 0);

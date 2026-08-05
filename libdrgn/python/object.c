@@ -150,8 +150,10 @@ static int serialize_compound_value(struct drgn_program *prog, char *buf,
 		struct drgn_object_type member_type;
 		err = drgn_object_type(member_qualified_type,
 				       member_bit_field_size, &member_type);
-		if (err)
+		if (err) {
+			set_drgn_error(err);
 			return -1;
+		}
 		if (serialize_py_object(prog, buf, buf_bit_size,
 					bit_offset + member_bit_offset,
 					PyTuple_GET_ITEM(item, 1),
@@ -223,7 +225,7 @@ static int serialize_py_object(struct drgn_program *prog, char *buf,
 		return -1;
 	}
 
-	switch (type->encoding) {
+	SWITCH_ENUM(type->encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED:
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		if (!PyNumber_Check(value_obj)) {
@@ -286,15 +288,20 @@ static int serialize_py_object(struct drgn_program *prog, char *buf,
 			double fvalue64;
 			struct {
 #if !HOST_LITTLE_ENDIAN
-				float pad;
+				uint32_t pad;
 #endif
 				float fvalue32;
+#if HOST_LITTLE_ENDIAN
+				uint32_t pad;
+#endif
 			};
 		} tmp;
-		if (type->bit_size == 64)
+		if (type->bit_size == 64) {
 			tmp.fvalue64 = fvalue;
-		else
+		} else {
 			tmp.fvalue32 = fvalue;
+			tmp.pad = 0;
+		}
 		serialize_bits(buf, bit_offset, tmp.uvalue, type->bit_size,
 			       type->little_endian);
 		return 0;
@@ -315,6 +322,12 @@ static int serialize_py_object(struct drgn_program *prog, char *buf,
 			break;
 		}
 		break;
+	case DRGN_OBJECT_ENCODING_NONE:
+	case DRGN_OBJECT_ENCODING_INCOMPLETE_BUFFER:
+	case DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER:
+		set_drgn_error(drgn_error_incomplete_type("cannot create member with %s type",
+							  type->type));
+		return -1;
 	default:
 		break;
 	}
@@ -594,6 +607,9 @@ static PyObject *DrgnObject_compound_value(struct drgn_object *obj,
 					   member_bit_field_size);
 		if (err)
 			return set_drgn_error(err);
+
+		if (!drgn_object_encoding_is_complete(member.encoding))
+			continue;
 
 		_cleanup_pydecref_ PyObject *member_value =
 			DrgnObject_value_impl(&member);

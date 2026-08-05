@@ -306,6 +306,17 @@ drgn_program_check_initialized(struct drgn_program *prog)
 }
 
 static struct drgn_error *
+drgn_program_check_initialized_virtual(struct drgn_program *prog)
+{
+	if (prog->core_fd != -1
+	    || !drgn_memory_reader_empty_virtual(&prog->reader)) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "program memory was already initialized");
+	}
+	return NULL;
+}
+
+static struct drgn_error *
 has_kdump_signature(struct drgn_program *prog, const char *path, bool *ret)
 {
 	char signature[max_iconst(KDUMP_SIG_LEN, FLATTENED_SIG_LEN)];
@@ -744,6 +755,10 @@ drgn_program_set_linux_kernel_custom(struct drgn_program *prog,
 {
 	struct drgn_error *err;
 
+	err = drgn_program_check_initialized_virtual(prog);
+	if (err)
+		return err;
+
 	if (!prog->has_platform) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 			"platform must be set before calling set_linux_kernel_custom()");
@@ -758,7 +773,7 @@ drgn_program_set_linux_kernel_custom(struct drgn_program *prog,
 		err = drgn_program_parse_vmcoreinfo(prog, vmcoreinfo,
 						    vmcoreinfo_size);
 		if (err)
-			return err;
+			goto out_vmcoreinfo;
 	}
 
 	/*
@@ -1105,7 +1120,6 @@ drgn_program_cache_core_dump_threads(struct drgn_program *prog)
 	size_t phnum, i;
 	bool found_prstatus = false;
 	uint32_t first_prstatus_tid;
-	bool found_prpsinfo = false;
 	uint32_t prpsinfo_pid;
 	_cleanup_free_ char *prpsinfo_fname = NULL;
 
@@ -1163,7 +1177,7 @@ drgn_program_cache_core_dump_threads(struct drgn_program *prog)
 			if (strncmp(name, "CORE", nhdr.n_namesz) != 0)
 				continue;
 
-			if (nhdr.n_type == NT_PRPSINFO) {
+			if (nhdr.n_type == NT_PRPSINFO && !prpsinfo_fname) {
 				err = get_prpsinfo_pid(prog,
 						       (char *)data->d_buf + desc_offset,
 						       nhdr.n_descsz,
@@ -1176,7 +1190,6 @@ drgn_program_cache_core_dump_threads(struct drgn_program *prog)
 						       &prpsinfo_fname);
 				if (err)
 					goto err;
-				found_prpsinfo = true;
 			} else if (nhdr.n_type == NT_PRSTATUS) {
 				uint32_t tid;
 				err = drgn_program_cache_prstatus_entry(prog,
@@ -1201,7 +1214,7 @@ drgn_program_cache_core_dump_threads(struct drgn_program *prog)
 out:
 	prog->core_dump_threads_cached = true;
 	if (!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)) {
-		if (found_prpsinfo) {
+		if (prpsinfo_fname) {
 			struct drgn_thread_set_iterator it =
 				drgn_thread_set_search(&prog->thread_set,
 						       &prpsinfo_pid);

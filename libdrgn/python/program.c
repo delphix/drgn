@@ -214,8 +214,10 @@ static int Program_init_logging(Program *prog)
 		return -1;
 
 	PyObject *obj = (PyObject *)prog;
-	if (pyobjectp_set_insert(&programs, &obj, NULL) < 0)
+	if (pyobjectp_set_insert(&programs, &obj, NULL) < 0) {
+		PyErr_NoMemory();
 		return -1;
+	}
 	drgn_program_set_log_callback(&prog->prog, drgnpy_log_fn, NULL);
 	drgn_program_set_log_level(&prog->prog, cached_log_level);
 	drgn_program_set_progress_file(&prog->prog,
@@ -703,12 +705,10 @@ py_symbol_find_fn(const char *name, uint64_t addr,
 		if (!PyObject_TypeCheck(item, &Symbol_type))
 			return drgn_error_create(DRGN_ERROR_TYPE,
 						 "symbol finder results must be of type Symbol");
-		_cleanup_free_ struct drgn_symbol *sym = malloc(sizeof(*sym));
+		_cleanup_symbol_ struct drgn_symbol *sym =
+			drgn_symbol_dup(((Symbol *)item)->sym);
 		if (!sym)
 			return &drgn_enomem;
-		struct drgn_error *err = drgn_symbol_copy(sym, ((Symbol *)item)->sym);
-		if (err)
-			return err;
 
 		if (!drgn_symbol_result_builder_add(builder, sym))
 			return &drgn_enomem;
@@ -832,7 +832,7 @@ static PyObject *Program_set_enabled_##which##_finders(Program *self,		\
 	_cleanup_free_ const char **names =					\
 		malloc_array(count, sizeof(names[0]));				\
 	if (!names)								\
-		return NULL;							\
+		return PyErr_NoMemory();					\
 	for (size_t i = 0; i < count; i++) {					\
 		names[i] = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(names_seq, i));\
 		if (!names[i])							\

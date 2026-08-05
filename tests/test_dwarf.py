@@ -4451,6 +4451,24 @@ class TestTypes(TestCase):
         )
         self.assertEqual(alignof(prog.type("TEST")), 64)
 
+    def test_many_skipped_attribs(self):
+        prog = dwarf_program(
+            (
+                DwarfDie(
+                    DW_TAG.typedef,
+                    [
+                        # Test a mix of large and small attribute sizes.
+                        *([DwarfAttrib(DW_AT.hi_user, DW_FORM.data8, 0)] * 32),
+                        *([DwarfAttrib(DW_AT.hi_user, DW_FORM.data1, 0)] * 64),
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "TEST"),
+                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                    ],
+                ),
+                *labeled_int_die,
+            )
+        )
+        self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
+
 
 class TestObjects(TestCase):
     def test_constant_signed_enum(self):
@@ -4550,6 +4568,31 @@ class TestObjects(TestCase):
                 4096,
             ),
         )
+
+    def test_constant_declaration_enum(self):
+        # enumerator children on a declaration enumeration_type should be
+        # ignored.
+        prog = dwarf_program(
+            (
+                DwarfDie(
+                    DW_TAG.enumeration_type,
+                    (
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "color"),
+                        DwarfAttrib(DW_AT.declaration, DW_FORM.flag_present, True),
+                    ),
+                    (
+                        DwarfDie(
+                            DW_TAG.enumerator,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "RED"),
+                                DwarfAttrib(DW_AT.const_value, DW_FORM.data1, 0),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        self.assertRaises(ObjectNotFoundError, prog.constant, "RED")
 
     def test_function(self):
         prog = dwarf_program(
