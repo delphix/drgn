@@ -550,9 +550,11 @@ static struct drgn_error *
 drgn_check_module_address_range_overlap(struct drgn_module *module,
 					uint64_t start, uint64_t end)
 {
-	for (auto it = drgn_module_address_tree_search_le(&module->prog->dbinfo.modules_by_address,
-							  &start);
-	     it.entry && it.entry->start < end;
+	auto it = drgn_module_address_tree_search_le(&module->prog->dbinfo.modules_by_address,
+						     &start);
+	if (!it.entry)
+		it = drgn_module_address_tree_first(&module->prog->dbinfo.modules_by_address);
+	for (; it.entry && it.entry->start < end;
 	     it = drgn_module_address_tree_next(it)) {
 		if (start < it.entry->end && it.entry->module != module) {
 			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
@@ -1198,9 +1200,10 @@ drgn_module_set_wanted_gnu_debugaltlink(struct drgn_module *module,
 		return err;
 	}
 
-	const char *debugaltlink = data->d_buf;
-	const char *nul = memchr(debugaltlink, 0, data->d_size);
-	if (!nul || nul + 1 == debugaltlink + data->d_size) {
+	const char *debugaltlink = data->d_buf, *nul;
+	if (data->d_size == 0
+	    || !(nul = memchr(debugaltlink, 0, data->d_size))
+	    || nul + 1 == debugaltlink + data->d_size) {
 		drgn_log_debug(prog,
 			       "%s: couldn't parse .gnu_debugaltlink; ignoring debug info",
 			       file->path);

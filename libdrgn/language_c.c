@@ -281,33 +281,23 @@ c_declare_array(struct drgn_qualified_type qualified_type,
 	return c_declare_variable(element_type, &array_name, indent, false, sb);
 }
 
-static struct drgn_error *
-c_declare_function(struct drgn_qualified_type qualified_type,
-		   struct string_callback *name, size_t indent,
-		   struct string_builder *sb)
+static struct drgn_error *c_function_name(struct string_callback *name,
+					  void *arg, struct string_builder *sb)
 {
 	struct drgn_error *err;
-	struct drgn_type_parameter *parameters;
-	size_t num_parameters, i;
-	struct drgn_qualified_type return_type;
+	struct drgn_qualified_type *qualified_type = arg;
 
-	if (!name) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "function must have name");
-	}
-
-	parameters = drgn_type_parameters(qualified_type.type);
-	num_parameters = drgn_type_num_parameters(qualified_type.type);
-
-	return_type = drgn_type_type(qualified_type.type);
-	err = c_declare_variable(return_type, name, indent, false, sb);
+	err = string_callback_call(name, sb);
 	if (err)
 		return err;
 
 	if (!string_builder_appendc(sb, '('))
 		return &drgn_enomem;
 
-	for (i = 0; i < num_parameters; i++) {
+	struct drgn_type_parameter *parameters =
+		drgn_type_parameters(qualified_type->type);
+	size_t num_parameters = drgn_type_num_parameters(qualified_type->type);
+	for (size_t i = 0; i < num_parameters; i++) {
 		const char *parameter_name = parameters[i].name;
 		struct drgn_qualified_type parameter_type;
 		struct string_callback name_cb = {
@@ -329,11 +319,11 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 		if (err)
 			return err;
 	}
-	if (num_parameters && drgn_type_is_variadic(qualified_type.type)) {
+	if (num_parameters && drgn_type_is_variadic(qualified_type->type)) {
 		if (!string_builder_append(sb, ", ..."))
 			return &drgn_enomem;
 	} else if (!num_parameters &&
-		   !drgn_type_is_variadic(qualified_type.type)) {
+		   !drgn_type_is_variadic(qualified_type->type)) {
 		if (!string_builder_append(sb, "void"))
 			return &drgn_enomem;
 	}
@@ -341,6 +331,27 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 	if (!string_builder_appendc(sb, ')'))
 		return &drgn_enomem;
 	return NULL;
+}
+
+static struct drgn_error *
+c_declare_function(struct drgn_qualified_type qualified_type,
+		   struct string_callback *name, size_t indent,
+		   struct string_builder *sb)
+{
+	if (!name) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "function must have name");
+	}
+
+	struct string_callback function_name = {
+		.fn = c_function_name,
+		.str = name,
+		.arg = &qualified_type,
+	};
+	struct drgn_qualified_type return_type =
+		drgn_type_type(qualified_type.type);
+	return c_declare_variable(return_type, &function_name, indent, false,
+				  sb);
 }
 
 static struct drgn_error *
@@ -1797,16 +1808,25 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 							    cpp);
 		} else if ('0' <= *p && *p <= '9') {
 			token->kind = C_TOKEN_NUMBER;
-			if (*p++ == '0' && *p == 'x') {
-				p++;
-				while (('0' <= *p && *p <= '9') ||
-				       ('a' <= *p && *p <= 'f') ||
-				       ('A' <= *p && *p <= 'F')) {
+			if (*p++ == '0') {
+				if (*p == 'x' || *p == 'X') {
 					p++;
-				}
-				if (p - token->value <= 2) {
-					return drgn_error_create(DRGN_ERROR_SYNTAX,
-								 "invalid number");
+					while (('0' <= *p && *p <= '9')
+					       || ('a' <= *p && *p <= 'f')
+					       || ('A' <= *p && *p <= 'F'))
+						p++;
+					if (p - token->value <= 2) {
+						return drgn_error_create(DRGN_ERROR_SYNTAX,
+									 "invalid number");
+					}
+				} else {
+					while ('0' <= *p && *p <= '7')
+						p++;
+					// 8 and 9 aren't valid octal digits.
+					if (*p == '8' || *p == '9') {
+						return drgn_error_create(DRGN_ERROR_SYNTAX,
+									 "invalid number");
+					}
 				}
 			} else {
 				while ('0' <= *p && *p <= '9')
@@ -1836,7 +1856,7 @@ static struct drgn_error *c_token_to_u64(const struct drgn_token *token,
 
 	assert(token->kind == C_TOKEN_NUMBER);
 	if (token->len > 2 && token->value[0] == '0' &&
-	    token->value[1] == 'x') {
+	    (token->value[1] == 'x' || token->value[1] == 'X')) {
 		for (i = 2; i < token->len; i++) {
 			char c = token->value[i];
 			int digit;
@@ -1844,9 +1864,9 @@ static struct drgn_error *c_token_to_u64(const struct drgn_token *token,
 			if ('0' <= c && c <= '9')
 				digit = c - '0';
 			else if ('a' <= c && c <= 'f')
-				digit = c - 'a';
+				digit = c - 'a' + 10;
 			else /* ('A' <= c && c <= 'F') */
-				digit = c - 'A';
+				digit = c - 'A' + 10;
 			if (x > UINT64_MAX / 16)
 				goto overflow;
 			x *= 16;
