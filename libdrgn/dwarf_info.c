@@ -168,8 +168,11 @@ drgn_namespace_dwarf_index_init(struct drgn_namespace_dwarf_index *dindex,
 	dindex->saved_err = NULL;
 }
 
+// Deinitialize one namespace, pushing its children onto a stack threaded
+// through their parent pointers, which are dead once we're tearing down.
 static void
-drgn_namespace_dwarf_index_deinit(struct drgn_namespace_dwarf_index *dindex)
+drgn_namespace_dwarf_index_deinit_one(struct drgn_namespace_dwarf_index *dindex,
+				      struct drgn_namespace_dwarf_index **stack)
 {
 	drgn_error_destroy(dindex->saved_err);
 	array_for_each(tag_map, dindex->map) {
@@ -178,10 +181,26 @@ drgn_namespace_dwarf_index_deinit(struct drgn_namespace_dwarf_index *dindex)
 		drgn_dwarf_index_die_map_deinit(tag_map);
 	}
 	hash_table_for_each(drgn_namespace_table, it, &dindex->children) {
-		drgn_namespace_dwarf_index_deinit(*it.entry);
-		free(*it.entry);
+		(*it.entry)->parent = *stack;
+		*stack = *it.entry;
 	}
 	drgn_namespace_table_deinit(&dindex->children);
+}
+
+static void
+drgn_namespace_dwarf_index_deinit(struct drgn_namespace_dwarf_index *dindex)
+{
+	// Namespaces can be nested arbitrarily deeply, so do this iteratively
+	// instead of recursively. Note that dindex itself is not freed; only
+	// its descendants are.
+	struct drgn_namespace_dwarf_index *stack = NULL;
+	drgn_namespace_dwarf_index_deinit_one(dindex, &stack);
+	while (stack) {
+		struct drgn_namespace_dwarf_index *ns = stack;
+		stack = ns->parent;
+		drgn_namespace_dwarf_index_deinit_one(ns, &stack);
+		free(ns);
+	}
 }
 
 void drgn_dwarf_info_init(struct drgn_debug_info *dbinfo)
@@ -630,7 +649,8 @@ drgn_dwarf_index_read_file(struct drgn_elf_file *file,
 	for (int scn = 0; scn < DRGN_SECTION_INDEX_NUM_DWARF_INDEX; scn++) {
 		if (file->scns[scn]) {
 			Elf_Data *data;
-			err = drgn_elf_file_read_section(file, scn, &data);
+			err = drgn_elf_file_read_cached_section(file, scn,
+								&data);
 			if (err)
 				return err;
 		}
@@ -2138,10 +2158,13 @@ drgn_dwarf_index_update(struct drgn_debug_info *dbinfo)
 
 	struct drgn_error *err = NULL;
 	size_t new_cus_size;
+	int num_threads;
 	#pragma omp parallel num_threads(drgn_num_threads)
 	{
 		struct drgn_error *thread_err = NULL;
 		int thread_num = omp_get_thread_num();
+		#pragma omp master
+		num_threads = omp_get_num_threads();
 
 		// Enumerate CUs in new modules.
 		struct drgn_dwarf_index_cu_vector *cus, *partial_units;
@@ -2185,7 +2208,7 @@ drgn_dwarf_index_update(struct drgn_debug_info *dbinfo)
 					drgn_dwarf_index_cu_vector_size(&dbinfo->dwarf.index_cus);
 				size_t new_partial_units =
 					drgn_dwarf_index_cu_vector_size(&partial_units0);
-				for (int i = 0; i < drgn_num_threads - 1; i++) {
+				for (int i = 0; i < num_threads - 1; i++) {
 					new_cus_size += drgn_dwarf_index_cu_vector_size(&threads[i].cus);
 					new_partial_units += drgn_dwarf_index_cu_vector_size(&threads[i].partial_units);
 				}
@@ -2199,7 +2222,7 @@ drgn_dwarf_index_update(struct drgn_debug_info *dbinfo)
 						drgn_dwarf_index_cus_merge_partial(&dbinfo->dwarf.index_cus,
 										   &partial_units0,
 										   &partial_pos);
-						for (int i = 0; i < drgn_num_threads - 1; i++) {
+						for (int i = 0; i < num_threads - 1; i++) {
 							drgn_dwarf_index_cus_merge(&dbinfo->dwarf.index_cus,
 										   &threads[i].cus,
 										   &threads[i].partial_units,
@@ -2212,7 +2235,7 @@ drgn_dwarf_index_update(struct drgn_debug_info *dbinfo)
 				}
 			}
 			if (err) {
-				for (int i = 0; i < drgn_num_threads - 1; i++) {
+				for (int i = 0; i < num_threads - 1; i++) {
 					drgn_dwarf_index_cu_vector_deinit(&threads[i].partial_units);
 					drgn_dwarf_index_cu_vector_deinit(&threads[i].cus);
 				}
@@ -2327,7 +2350,7 @@ drgn_dwarf_index_update(struct drgn_debug_info *dbinfo)
 		// them).
 		#pragma omp master
 		{
-			for (int i = 0; i < drgn_num_threads - 1; i++) {
+			for (int i = 0; i < num_threads - 1; i++) {
 				err = drgn_dwarf_specification_map_merge(&dbinfo->dwarf.specifications,
 									 &threads[i].specifications,
 									 err);
@@ -2374,14 +2397,14 @@ drgn_dwarf_index_update(struct drgn_debug_info *dbinfo)
 		#pragma omp for schedule(dynamic) nowait
 		for (size_t i = 0; i <= array_size(dbinfo->dwarf.global.map); i++) {
 			if (i < array_size(dbinfo->dwarf.global.map)) {
-				for (int j = 0; j < drgn_num_threads - 1; j++) {
+				for (int j = 0; j < num_threads - 1; j++) {
 					thread_err =
 						drgn_dwarf_index_die_map_merge(&dbinfo->dwarf.global.map[i],
 									       &threads[j].map[i],
 									       thread_err);
 				}
 			} else {
-				for (int j = 0; j < drgn_num_threads - 1; j++) {
+				for (int j = 0; j < num_threads - 1; j++) {
 					thread_err =
 						drgn_dwarf_base_type_map_merge(&dbinfo->dwarf.base_types,
 									       &threads[j].base_types,
@@ -2460,11 +2483,14 @@ static struct drgn_error *index_namespace_impl(struct drgn_namespace_dwarf_index
 	}
 
 	err = NULL;
+	int num_threads;
 	#pragma omp parallel num_threads(drgn_num_threads)
 	{
 		struct drgn_error *thread_err = NULL;
 		struct drgn_dwarf_index_die_map *map;
 		int thread_num = omp_get_thread_num();
+		#pragma omp master
+		num_threads = omp_get_num_threads();
 		if (thread_num == 0) {
 			map = ns->map;
 		} else {
@@ -2500,7 +2526,7 @@ static struct drgn_error *index_namespace_impl(struct drgn_namespace_dwarf_index
 
 		#pragma omp for schedule(dynamic) nowait
 		for (size_t i = 0; i < array_size(ns->map); i++) {
-			for (int j = 0; j < drgn_num_threads - 1; j++) {
+			for (int j = 0; j < num_threads - 1; j++) {
 				thread_err =
 					drgn_dwarf_index_die_map_merge(&ns->map[i],
 								       &maps[j][i],
@@ -3238,7 +3264,9 @@ static struct drgn_error *drgn_dwarf_next_addrx(struct binary_buffer *bb,
 						 "indirect address without .debug_addr section");
 		}
 		Elf_Data *data;
-		err = drgn_elf_file_read_section(file, DRGN_SCN_DEBUG_ADDR, &data);
+		err = drgn_elf_file_read_cached_section(file,
+							DRGN_SCN_DEBUG_ADDR,
+							&data);
 		if (err)
 			return err;
 
@@ -3317,7 +3345,8 @@ static struct drgn_error *drgn_dwarf_read_loclistx(struct drgn_elf_file *file,
 					 "DW_FORM_loclistx without .debug_loclists section");
 	}
 	Elf_Data *data;
-	err = drgn_elf_file_read_section(file, DRGN_SCN_DEBUG_LOCLISTS, &data);
+	err = drgn_elf_file_read_cached_section(file, DRGN_SCN_DEBUG_LOCLISTS,
+						&data);
 	if (err)
 		return err;
 
@@ -3925,8 +3954,10 @@ addr:
 			 * case.
 			 */
 			if (drgn_module_contains_address(ctx->file->module,
-					uvalue + ctx->file->module->debug_file_bias))
-				uvalue += ctx->file->module->debug_file_bias;
+					uvalue + ctx->file->module->debug_file_bias)) {
+				uvalue = (uvalue + ctx->file->module->debug_file_bias)
+					 & address_mask;
+			}
 			PUSH(uvalue);
 			break;
 		case DW_OP_const1u:
@@ -4133,7 +4164,7 @@ deref:
 				drgn_register_state_get_cfa(ctx->regs);
 			if (!cfa.has_value)
 				return &drgn_not_found;
-			PUSH(cfa.value);
+			PUSH_MASK(cfa.value);
 			break;
 		}
 		/* Arithmetic and logical operations. */
@@ -4161,12 +4192,12 @@ deref:
 			break;
 		case DW_OP_div: {
 			CHECK(2);
-			if (ELEM(0) == 0) {
+			int64_t divisor = truncate_signed(ELEM(0), address_bits);
+			if (divisor == 0) {
 				return binary_buffer_error(&ctx->bb,
 							   "division by zero in DWARF expression");
 			}
 			int64_t dividend = truncate_signed(ELEM(1), address_bits);
-			int64_t divisor = truncate_signed(ELEM(0), address_bits);
 			if (dividend == INT64_MIN && divisor == -1)
 				ELEM(1) = INT64_MIN & address_mask;
 			else
@@ -4700,6 +4731,16 @@ drgn_object_from_dwarf_enumerator(struct drgn_debug_info *dbinfo,
 	err = drgn_type_from_dwarf(dbinfo, file, die, &qualified_type);
 	if (err)
 		return err;
+	// The DWARF index doesn't check for DW_AT_declaration on
+	// DW_TAG_enumeration_type DIEs when indexing their DW_TAG_enumerator
+	// children (because that would be malformed). As a result,
+	// drgn_type_from_dwarf() (which honors DW_AT_declaration and follows
+	// DW_AT_specification/DW_AT_signature) may return a type that disagrees
+	// with the DWARF index for such a malformed DIE: an enum type that does
+	// not contain the expected enumerator or a completely different kind of
+	// type.
+	if (drgn_type_kind(qualified_type.type) != DRGN_TYPE_ENUM)
+		return &drgn_not_found;
 	const struct drgn_type_enumerator *enumerators =
 		drgn_type_enumerators(qualified_type.type);
 	size_t num_enumerators = drgn_type_num_enumerators(qualified_type.type);
@@ -4716,11 +4757,6 @@ drgn_object_from_dwarf_enumerator(struct drgn_debug_info *dbinfo,
 							0);
 		}
 	}
-	// This can happen if the DWARF index and drgn_type_from_dwarf()
-	// disagree. In particular, the DWARF index doesn't check for
-	// DW_AT_declaration on DW_TAG_enumeration_type DIEs, so if such a DIE
-	// has DW_TAG_enumerator children (which is malformed), the DWARF index
-	// will include them but drgn_type_from_dwarf() won't.
 	return &drgn_not_found;
 }
 
@@ -5098,8 +5134,9 @@ reg:
 	if (bit_pos < type.bit_size || (bit_offset < 0 && !value_buf)) {
 absent:
 		if (dwarf_tag(die) == DW_TAG_template_value_parameter) {
-			return drgn_error_create(DRGN_ERROR_BAD_DATA,
-						 "DW_AT_template_value_parameter is missing value");
+			err = drgn_error_create(DRGN_ERROR_BAD_DATA,
+						"DW_AT_template_value_parameter is missing value");
+			goto out;
 		}
 		drgn_object_set_absent_internal(ret, &type, absence_reason);
 		err = NULL;

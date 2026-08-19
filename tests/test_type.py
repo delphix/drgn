@@ -582,6 +582,11 @@ class TestType(MockProgramTestCase):
 
         self.assertRaises(TypeError, self.prog.int_type("int", 4, True).member, "foo")
 
+    def test_anonymous_member_cycle(self):
+        type = self.prog.struct_type(None, 8, (TypeMember(lambda: type),))
+        self.assertRaises(RecursionError, type.member, "foo")
+        self.assertRaises(RecursionError, type.has_member, "foo")
+
     def test_offsetof(self):
         self.assertEqual(offsetof(self.line_segment_type, "b"), 8)
         self.assertEqual(offsetof(self.line_segment_type, "a.y"), 4)
@@ -1230,10 +1235,28 @@ class TestTypeMember(MockProgramTestCase):
             def __call__(self2):
                 if self2.first:
                     self2.first = False
-                    return member.object
+                    member.object
                 return Object(self.prog, self.prog.int_type("int", 4, True))
 
         member = TypeMember(Callable())
+        self.assertIdentical(
+            member.object, Object(self.prog, self.prog.int_type("int", 4, True))
+        )
+
+    def test_thunk_reentrant(self):
+        # Test a callable that reenters the object evaluation through the
+        # drgn_lazy_object thunk rather than the callable directly.
+        class Callable:
+            def __init__(self2):
+                self2.first = True
+
+            def __call__(self2):
+                if self2.first:
+                    self2.first = False
+                    member.object
+                return Object(self.prog, self.prog.int_type("int", 4, True))
+
+        member = self.prog.struct_type("foo", 8, [TypeMember(Callable())]).members[0]
         self.assertIdentical(
             member.object, Object(self.prog, self.prog.int_type("int", 4, True))
         )

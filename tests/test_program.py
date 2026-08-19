@@ -974,6 +974,12 @@ class TestTypes(MockProgramTestCase):
             ),
         )
 
+    def test_deeply_nested_declarator(self):
+        depth = 10000
+        self.assertRaises(
+            RecursionError, self.prog.type, "int " + "(" * depth + "*" + ")" * depth
+        )
+
     def test_pointer_to_array(self):
         self.assertIdentical(
             self.prog.type("int (*)[2]"),
@@ -1025,6 +1031,21 @@ class TestTypes(MockProgramTestCase):
                 2,
             ),
         )
+
+    def test_pointer_to_class(self):
+        class_point = self.prog.class_type(
+            "Point",
+            8,
+            (
+                TypeMember(self.prog.int_type("int", 4, True), "x", 0),
+                TypeMember(self.prog.int_type("int", 4, True), "y", 32),
+            ),
+        )
+        class_point_p = self.prog.pointer_type(class_point)
+        self.types.append(class_point)
+        self.prog.language = Language.CPP
+        self.assertIdentical(self.prog.type("class Point *"), class_point_p)
+        self.assertIdentical(self.prog.type("Point *"), class_point_p)
 
 
 class TestObjects(MockProgramTestCase):

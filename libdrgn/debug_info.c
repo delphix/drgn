@@ -1185,10 +1185,10 @@ drgn_module_set_wanted_gnu_debugaltlink(struct drgn_module *module,
 	struct drgn_error *err;
 	struct drgn_program *prog = module->prog;
 
-	// We don't cache .gnu_debugaltlink, and it doesn't need relocation, so
-	// don't use drgn_elf_file_read_section().
 	Elf_Data *data;
-	err = read_elf_section(file->scns[DRGN_SCN_GNU_DEBUGALTLINK], &data);
+	err = drgn_elf_file_read_section(file,
+					 file->scns[DRGN_SCN_GNU_DEBUGALTLINK],
+					 false, &data);
 	if (err) {
 		if (!drgn_error_is_fatal(err)) {
 			drgn_error_log_debug(prog, err,
@@ -1750,6 +1750,13 @@ drgn_module_try_file_internal(struct drgn_module *module, const char *path,
 	// fd and elf are owned by the drgn_elf_file now.
 	fd = -1;
 	elf = NULL;
+
+	if (is_gnu_debugaltlink_file && !drgn_elf_file_has_dwarf(file)) {
+		drgn_log_debug(prog, "%s has no debug info; ignoring", path);
+		drgn_elf_file_destroy(file);
+		return NULL;
+	}
+
 	return drgn_module_maybe_use_elf_file(module, file,
 					      is_gnu_debugaltlink_file);
 }
@@ -2298,10 +2305,10 @@ drgn_module_try_files_by_gnu_debuglink(struct drgn_module *module,
 	struct drgn_elf_file *file = module->loaded_file;
 	if (!file || !file->scns[DRGN_SCN_GNU_DEBUGLINK])
 		return NULL;
-	// We don't cache .gnu_debuglink, and it doesn't need relocation, so
-	// don't use drgn_elf_file_read_section().
 	Elf_Data *data;
-	err = read_elf_section(file->scns[DRGN_SCN_GNU_DEBUGLINK], &data);
+	err = drgn_elf_file_read_section(file,
+					 file->scns[DRGN_SCN_GNU_DEBUGLINK],
+					 false, &data);
 	if (err) {
 		if (!drgn_error_is_fatal(err)) {
 			drgn_error_log_debug(prog, err,
@@ -5754,6 +5761,14 @@ drgn_module_create_split_dwarf_file(struct drgn_module *module,
 				   ret);
 	if (err)
 		return err;
+
+	if (!drgn_elf_file_has_dwarf(*ret)) {
+		drgn_split_dwarf_elf_file_destroy(*ret);
+		return drgn_error_format(DRGN_ERROR_BAD_DATA,
+					 "%s: debug info not found in split DWARF file",
+					 name);
+	}
+
 	(*ret)->_dwarf = dwarf;
 	int r = drgn_elf_file_dwarf_table_insert(&module->split_dwarf_files,
 						 ret, NULL);
