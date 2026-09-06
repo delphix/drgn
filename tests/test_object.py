@@ -15,6 +15,7 @@ from drgn import (
     Qualifiers,
     TypeMember,
     cast,
+    container_of,
     reinterpret,
     sizeof,
 )
@@ -611,6 +612,24 @@ class TestReference(MockProgramTestCase):
             TypeError, "cannot read object with incomplete array type", obj.read_
         )
 
+    def test_compound_flexible_array_member(self):
+        self.add_memory_segment((1).to_bytes(4, "little"), virt_addr=0xFFFF0000)
+        type_ = self.prog.struct_type(
+            "foo",
+            4,
+            (
+                TypeMember(self.prog.int_type("int", 4, True), "n", 0),
+                TypeMember(
+                    self.prog.array_type(self.prog.int_type("int", 4, True)),
+                    "a",
+                    32,
+                ),
+            ),
+        )
+        obj = Object(self.prog, type_, address=0xFFFF0000)
+        self.assertIdentical(obj.read_(), Object(self.prog, type_, {"n": 1}))
+        self.assertEqual(obj.value_(), {"n": 1})
+
     def test_non_scalar_bit_offset(self):
         obj = Object(
             self.prog,
@@ -1204,6 +1223,36 @@ class TestValue(MockProgramTestCase):
                         self.assertEqual(obj.a.value_(), truncate(a, bit_size))
                         self.assertEqual(obj.b.value_(), truncate(b, 128 - bit_size))
 
+    def test_compound_incomplete_member(self):
+        self.assertRaisesRegex(
+            TypeError,
+            "cannot create member with void type",
+            Object,
+            self.prog,
+            self.prog.struct_type("foo", 8, (TypeMember(self.prog.void_type(), "m"),)),
+            value={"m": 0},
+        )
+
+    def test_compound_flexible_array_member(self):
+        obj = Object(
+            self.prog,
+            self.prog.struct_type(
+                "foo",
+                4,
+                (
+                    TypeMember(self.prog.int_type("int", 4, True), "n", 0),
+                    TypeMember(
+                        self.prog.array_type(self.prog.int_type("int", 4, True)),
+                        "a",
+                        32,
+                    ),
+                ),
+            ),
+            value={"n": 1},
+        )
+        self.assertEqual(obj.value_(), {"n": 1})
+        self.assertEqual(repr(obj), "Object(prog, 'struct foo', value={'n': 1})")
+
     def test_pointer(self):
         obj = Object(self.prog, "int *", value=0xFFFF0000)
         self.assertFalse(obj.absent_)
@@ -1296,6 +1345,17 @@ class TestValue(MockProgramTestCase):
                 type,
                 (0).to_bytes(size, "little"),
             )
+
+    def test_member_cycle(self):
+        type = self.prog.struct_type("foo", 8, (TypeMember(lambda: type, "a"),))
+        obj = Object.from_bytes_(self.prog, type, bytes(8))
+        self.assertRaises(RecursionError, obj.value_)
+
+    def test_cyclic_value(self):
+        type = self.prog.struct_type("foo", 8, (TypeMember(lambda: type, "a"),))
+        value = {}
+        value["a"] = value
+        self.assertRaises(RecursionError, Object, self.prog, type, value)
 
 
 class TestAbsent(MockProgramTestCase):
@@ -1852,14 +1912,27 @@ class TestGenericOperators(MockProgramTestCase):
         obj = arr.read_()
         self.assertRaisesRegex(OutOfBoundsError, "out of bounds", obj.__getitem__, -1)
 
-    def test_big_pointer_subscript(self):
+    def test_big_pointer(self):
+        big_pointer_type = self.prog.pointer_type(
+            self.prog.int_type("int", 4, True), size=16
+        )
         obj = Object(
             self.prog,
-            self.prog.pointer_type(self.prog.int_type("int", 4, True), size=16),
+            big_pointer_type,
             0x0123456789ABCDEFFEDCBA9876543210,
         )
         with self.assertRaises(OverflowError):
             obj[0]
+        with self.assertRaises(OverflowError):
+            obj.string_()
+        with self.assertRaises(OverflowError):
+            container_of(
+                obj,
+                self.prog.struct_type(
+                    "foo", 16, (TypeMember(big_pointer_type, "ptr"),)
+                ),
+                "ptr",
+            )
 
     def test_slice(self):
         arr = Object(self.prog, "int [4]", address=0xFFFF0000)
@@ -2349,6 +2422,37 @@ class TestGenericOperators(MockProgramTestCase):
                 address=0xFFFF8004,
                 bit_field_size=5,
             ),
+        )
+
+    def test_incomplete_member(self):
+        self.add_memory_segment((99).to_bytes(4, "little"), virt_addr=0xFFFF0000)
+        obj = Object(
+            self.prog,
+            self.prog.struct_type(
+                "foo",
+                4,
+                (
+                    TypeMember(self.prog.int_type("int", 4, True), "n", 0),
+                    TypeMember(
+                        self.prog.array_type(self.prog.int_type("int", 4, True)),
+                        "a",
+                        32,
+                    ),
+                ),
+            ),
+            address=0xFFFF0000,
+        )
+        self.assertIdentical(
+            obj.a,
+            Object(
+                self.prog,
+                self.prog.array_type(self.prog.int_type("int", 4, True)),
+                address=0xFFFF0004,
+            ),
+        )
+        self.assertIdentical(
+            obj.read_().a,
+            Object(self.prog, self.prog.array_type(self.prog.int_type("int", 4, True))),
         )
 
     def test_member_out_of_bounds(self):

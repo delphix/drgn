@@ -236,6 +236,23 @@ class TestPrettyPrintTypeName(MockProgramTestCase):
             True,
         )
 
+    def test_pointer_to_function_returning_pointer_to_function(self):
+        self.assertTypeName(
+            self.prog.pointer_type(
+                self.prog.function_type(
+                    self.prog.pointer_type(
+                        self.prog.function_type(
+                            self.prog.int_type("int", 4, True), (), False
+                        )
+                    ),
+                    (),
+                    False,
+                )
+            ),
+            "int (*(*)(void))(void)",
+            True,
+        )
+
     def test_pointer_to_function_returning_pointer_to_const(self):
         i = self.prog.int_type("int", 4, True)
         self.assertTypeName(
@@ -337,6 +354,32 @@ class TestPrettyPrintTypeName(MockProgramTestCase):
         self.assertTypeName(
             self.prog.function_type(self.prog.int_type("int", 4, True), (), False),
             "int (void)",
+        )
+
+    def test_function_returning_pointer_to_function(self):
+        self.assertTypeName(
+            self.prog.function_type(
+                self.prog.pointer_type(
+                    self.prog.function_type(
+                        self.prog.int_type("int", 4, True), (), False
+                    )
+                ),
+                (),
+                False,
+            ),
+            "int (*(void))(void)",
+        )
+
+    def test_function_returning_pointer_to_array(self):
+        self.assertTypeName(
+            self.prog.function_type(
+                self.prog.pointer_type(
+                    self.prog.array_type(self.prog.int_type("int", 4, True), 4)
+                ),
+                (),
+                False,
+            ),
+            "int (*(void))[4]",
         )
 
     def test_pointer_to_anonymous_struct(self):
@@ -458,6 +501,18 @@ struct {
                 (TypeParameter(self.prog.int_type("int", 4, True), "j"),),
             ),
             "unsigned int foo(int j)",
+        )
+
+    def test_function_returning_pointer_to_function(self):
+        i = self.prog.int_type("int", 4, True)
+        handler = self.prog.pointer_type(
+            self.prog.function_type(self.prog.void_type(), (TypeParameter(i),), False)
+        )
+        self.assert_variable_declaration(
+            self.prog.function_type(
+                handler, (TypeParameter(i), TypeParameter(handler)), False
+            ),
+            "void (*foo(int, void (*)(int)))(int)",
         )
 
 
@@ -775,6 +830,16 @@ typedef struct {
             self.prog.function_type(self.prog.int_type("int", 4, True), (), False),
             "int (void)",
         )
+
+    def test_anonymous_type_cycle(self):
+        type = self.prog.struct_type(None, 8, (TypeMember(lambda: type, "a"),))
+        self.assertRaises(RecursionError, str, type)
+
+    def test_parameter_cycle(self):
+        type = self.prog.function_type(
+            self.prog.void_type(), (TypeParameter(lambda: type, "p"),)
+        )
+        self.assertRaises(RecursionError, str, type)
 
 
 class TestLiteral(MockProgramTestCase):
@@ -1183,6 +1248,10 @@ class TestCommonRealType(MockProgramTestCase):
         type_ = self.prog.typedef_type("LONG", self.prog.type("long"))
         self.assertCommonRealType(type_, "int", type_)
 
+    def test_typedef_and_bit_field(self):
+        type_ = self.prog.typedef_type("LONG", self.prog.type("long"))
+        self.assertCommonRealType(type_, ("long", 48), type_)
+
 
 class TestOperators(MockProgramTestCase):
     def test_bool_arrays(self):
@@ -1258,6 +1327,61 @@ class TestOperators(MockProgramTestCase):
         self.assertIdentical(
             cast("_Bool", Object(self.prog, "void *", 1)),
             Object(self.prog, "_Bool", True),
+        )
+
+    def test_cast_floating_point_to_integer(self):
+        # Truncation towards zero.
+        for value, expected in ((1.9, 1), (-1.9, -1), (0.5, 0), (-0.5, 0), (-5.0, -5)):
+            with self.subTest(value=value):
+                self.assertIdentical(
+                    cast("int", self.double(value)), self.int(expected)
+                )
+
+        # NaN and saturation.
+        nan = float("nan")
+        inf = float("inf")
+        for type_name, min_, max_ in (
+            ("int", -(2**31), 2**31 - 1),
+            ("unsigned int", 0, 2**32 - 1),
+            ("long", -(2**63), 2**63 - 1),
+            ("unsigned long", 0, 2**64 - 1),
+        ):
+            for value, expected in (
+                (nan, 0),
+                (inf, max_),
+                (-inf, min_),
+                (1e300, max_),
+                (-1e300, min_),
+                # Just out of range.
+                (float(max_ + 1), max_),
+                (float(min_ - 1), min_),
+            ):
+                with self.subTest(type=type_name, value=value):
+                    self.assertIdentical(
+                        cast(type_name, self.double(value)),
+                        Object(self.prog, type_name, expected),
+                    )
+
+        # Saturation is to the range of the destination type.
+        self.assertIdentical(cast("int", self.double(1e10)), self.int(2**31 - 1))
+        self.assertIdentical(cast("int", self.double(-1e10)), self.int(-(2**31)))
+        self.assertIdentical(
+            cast("unsigned int", self.double(5e9)),
+            self.unsigned_int(2**32 - 1),
+        )
+
+        # Values in range are not affected.
+        self.assertIdentical(
+            cast("int", self.double(2147483647.0)), self.int(2**31 - 1)
+        )
+        self.assertIdentical(
+            cast("int", self.double(-2147483648.0)), self.int(-(2**31))
+        )
+        self.assertIdentical(
+            cast("unsigned int", self.double(3e9)), self.unsigned_int(3000000000)
+        )
+        self.assertIdentical(
+            cast("long", self.double(-9223372036854775808.0)), self.long(-(2**63))
         )
 
     def _test_arithmetic(
@@ -2516,6 +2640,20 @@ class TestImplicitConvert(MockProgramTestCase):
             Object(self.prog, type1, 0x8),
         )
 
+    def test_function_pointer_parameter_cycle(self):
+        type1 = self.prog.function_type(
+            self.prog.type("void"), (TypeParameter(lambda: type1),)
+        )
+        type2 = self.prog.function_type(
+            self.prog.type("void"), (TypeParameter(lambda: type2),)
+        )
+        self.assertRaises(
+            RecursionError,
+            implicit_convert,
+            self.prog.pointer_type(type1),
+            Object(self.prog, self.prog.pointer_type(type2), 0x8),
+        )
+
     def test_function_pointers_with_different_is_variadic(self):
         type1 = self.prog.pointer_type(
             self.prog.function_type(self.prog.type("int"), (), is_variadic=False)
@@ -3219,6 +3357,48 @@ class TestPrettyPrintObject(MockProgramTestCase):
         self.assertEqual(str(Object(self.prog, "int []", address=0)), "(int []){}")
         self.assertEqual(str(Object(self.prog, "int [0]", address=0)), "(int [0]){}")
 
+    def test_flexible_array_member(self):
+        self.add_memory_segment((99).to_bytes(4, "little"), virt_addr=0xFFFF0000)
+        obj = Object(
+            self.prog,
+            self.prog.struct_type(
+                "foo",
+                4,
+                (
+                    TypeMember(self.prog.int_type("int", 4, True), "n", 0),
+                    TypeMember(
+                        self.prog.array_type(self.prog.int_type("int", 4, True)),
+                        "a",
+                        32,
+                    ),
+                ),
+            ),
+            address=0xFFFF0000,
+        )
+        self.assertEqual(
+            str(obj),
+            """\
+(struct foo){
+	.n = (int)99,
+	.a = (int []){},
+}""",
+        )
+        self.assertEqual(
+            str(obj.read_()),
+            """\
+(struct foo){
+	.n = (int)99,
+	.a = (int [])<absent>,
+}""",
+        )
+
+        expected = """\
+(struct foo){
+	.n = (int)99,
+}"""
+        self.assertEqual(obj.format_(implicit_members=False), expected)
+        self.assertEqual(obj.read_().format_(implicit_members=False), expected)
+
     def test_array_zeroes(self):
         segment = bytearray(16)
         self.add_memory_segment(segment, virt_addr=0xFFFF0000)
@@ -3457,3 +3637,22 @@ class TestPrettyPrintObject(MockProgramTestCase):
         self.add_memory_segment((13).to_bytes(4, "little"), virt_addr=0xFFFF0000)
         obj = Object(self.prog, "int *", value=0xFFFF0000)
         self.assertEqual(obj.format_(integer_base=8), "*(int *)0xffff0000 = 015")
+
+    def test_member_cycle(self):
+        self.add_memory_segment(bytes(8), virt_addr=0xFFFF0000)
+        type = self.prog.struct_type("foo", 8, (TypeMember(lambda: type, "a"),))
+        obj = Object(self.prog, type, address=0xFFFF0000)
+        self.assertRaises(RecursionError, str, obj)
+        self.assertRaises(RecursionError, obj.format_)
+
+    def test_member_cycle_implicit_members(self):
+        self.add_memory_segment(bytes(8), virt_addr=0xFFFF0000)
+        type = self.prog.struct_type("foo", 8, (TypeMember(lambda: type, "a"),))
+        obj = Object(self.prog, type, address=0xFFFF0000)
+        self.assertRaises(RecursionError, obj.format_, implicit_members=False)
+
+    def test_anonymous_member_cycle(self):
+        self.add_memory_segment(bytes(8), virt_addr=0xFFFF0000)
+        type = self.prog.struct_type("foo", 8, (TypeMember(lambda: type),))
+        obj = Object(self.prog, type, address=0xFFFF0000)
+        self.assertRaises(RecursionError, str, obj)

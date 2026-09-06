@@ -281,33 +281,23 @@ c_declare_array(struct drgn_qualified_type qualified_type,
 	return c_declare_variable(element_type, &array_name, indent, false, sb);
 }
 
-static struct drgn_error *
-c_declare_function(struct drgn_qualified_type qualified_type,
-		   struct string_callback *name, size_t indent,
-		   struct string_builder *sb)
+static struct drgn_error *c_function_name(struct string_callback *name,
+					  void *arg, struct string_builder *sb)
 {
 	struct drgn_error *err;
-	struct drgn_type_parameter *parameters;
-	size_t num_parameters, i;
-	struct drgn_qualified_type return_type;
+	struct drgn_qualified_type *qualified_type = arg;
 
-	if (!name) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "function must have name");
-	}
-
-	parameters = drgn_type_parameters(qualified_type.type);
-	num_parameters = drgn_type_num_parameters(qualified_type.type);
-
-	return_type = drgn_type_type(qualified_type.type);
-	err = c_declare_variable(return_type, name, indent, false, sb);
+	err = string_callback_call(name, sb);
 	if (err)
 		return err;
 
 	if (!string_builder_appendc(sb, '('))
 		return &drgn_enomem;
 
-	for (i = 0; i < num_parameters; i++) {
+	struct drgn_type_parameter *parameters =
+		drgn_type_parameters(qualified_type->type);
+	size_t num_parameters = drgn_type_num_parameters(qualified_type->type);
+	for (size_t i = 0; i < num_parameters; i++) {
 		const char *parameter_name = parameters[i].name;
 		struct drgn_qualified_type parameter_type;
 		struct string_callback name_cb = {
@@ -329,11 +319,11 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 		if (err)
 			return err;
 	}
-	if (num_parameters && drgn_type_is_variadic(qualified_type.type)) {
+	if (num_parameters && drgn_type_is_variadic(qualified_type->type)) {
 		if (!string_builder_append(sb, ", ..."))
 			return &drgn_enomem;
 	} else if (!num_parameters &&
-		   !drgn_type_is_variadic(qualified_type.type)) {
+		   !drgn_type_is_variadic(qualified_type->type)) {
 		if (!string_builder_append(sb, "void"))
 			return &drgn_enomem;
 	}
@@ -344,10 +334,36 @@ c_declare_function(struct drgn_qualified_type qualified_type,
 }
 
 static struct drgn_error *
+c_declare_function(struct drgn_qualified_type qualified_type,
+		   struct string_callback *name, size_t indent,
+		   struct string_builder *sb)
+{
+	if (!name) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "function must have name");
+	}
+
+	struct string_callback function_name = {
+		.fn = c_function_name,
+		.str = name,
+		.arg = &qualified_type,
+	};
+	struct drgn_qualified_type return_type =
+		drgn_type_type(qualified_type.type);
+	return c_declare_variable(return_type, &function_name, indent, false,
+				  sb);
+}
+
+static struct drgn_error *
 c_declare_variable(struct drgn_qualified_type qualified_type,
 		   struct string_callback *name, size_t indent,
 		   bool define_anonymous_type, struct string_builder *sb)
 {
+	// The other c_declare_*() and c_define_*() functions are all mutually
+	// recursive through this one, so this is the only one that needs a
+	// guard.
+	drgn_recursion_guard(1000, "maximum type depth exceeded");
+
 	SWITCH_ENUM(drgn_type_kind(qualified_type.type)) {
 	case DRGN_TYPE_VOID:
 	case DRGN_TYPE_INT:
@@ -931,7 +947,8 @@ c_format_initializer(struct drgn_program *prog, struct initializer_iter *iter,
 				return err;
 			if (__builtin_sub_overflow(remaining_columns,
 						   sb->len - designation_start,
-						   &remaining_columns)) {
+						   &remaining_columns)
+			    || remaining_columns < 2) {
 				err = &drgn_line_wrap;
 				break;
 			}
@@ -1124,8 +1141,7 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 					    DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS)) ==
 			     DRGN_FORMAT_OBJECT_MEMBER_NAMES) {
 				bool zero;
-
-				err = drgn_object_is_zero(ret, &zero);
+				err = drgn_object_is_zero_or_incomplete(ret, &zero);
 				if (err)
 					return err;
 				if (zero)
@@ -1134,6 +1150,12 @@ compound_initializer_iter_next(struct initializer_iter *iter_,
 			break;
 		}
 
+		// This is iterative, so it won't overflow the call stack, but a
+		// type cycle could still loop until memory is exhausted.
+		if (compound_initializer_stack_size(&iter->stack) >= 1000) {
+			return drgn_error_create(DRGN_ERROR_RECURSION,
+						 "maximum anonymous member depth exceeded");
+		}
 		struct compound_initializer_state *new =
 			compound_initializer_stack_append_entry(&iter->stack);
 		if (!new)
@@ -1246,7 +1268,7 @@ c_format_compound_object(const struct drgn_object *obj,
 				goto out;
 
 			bool zero;
-			err = drgn_object_is_zero(&member, &zero);
+			err = drgn_object_is_zero_or_incomplete(&member, &zero);
 			if (err)
 				goto out;
 			if (zero)
@@ -1453,8 +1475,6 @@ array_initializer_iter_next(struct initializer_iter *iter_,
 		container_of(iter_, struct array_initializer_iter, iter);
 
 	for (;;) {
-		bool zero;
-
 		if (iter->i >= iter->length)
 			return &drgn_stop;
 		err = drgn_object_fragment(ret, iter->obj, iter->element_type,
@@ -1469,6 +1489,7 @@ array_initializer_iter_next(struct initializer_iter *iter_,
 		    DRGN_FORMAT_OBJECT_ELEMENT_INDICES)
 			break;
 
+		bool zero;
 		err = drgn_object_is_zero(ret, &zero);
 		if (err)
 			return err;
@@ -1567,8 +1588,6 @@ c_format_array_object(const struct drgn_object *obj,
 	    && iter.length) {
 		DRGN_OBJECT(element, drgn_object_program(obj));
 		do {
-			bool zero;
-
 			err = drgn_object_fragment(&element, obj,
 						   iter.element_type,
 						   (iter.length - 1)
@@ -1577,6 +1596,7 @@ c_format_array_object(const struct drgn_object *obj,
 			if (err)
 				return err;
 
+			bool zero;
 			err = drgn_object_is_zero(&element, &zero);
 			if (err)
 				return err;
@@ -1626,6 +1646,10 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 		     const struct drgn_format_object_options *options,
 		     struct string_builder *sb)
 {
+	// The other c_format_*() functions are all mutually recursive through
+	// this one, so this is the only one that needs a guard.
+	drgn_recursion_guard(1000, "maximum object depth exceeded");
+
 	struct drgn_error *err;
 	struct drgn_type *underlying_type = drgn_underlying_type(obj->type);
 
@@ -1799,16 +1823,25 @@ struct drgn_error *drgn_c_family_lexer_func(struct drgn_lexer *lexer,
 							    cpp);
 		} else if ('0' <= *p && *p <= '9') {
 			token->kind = C_TOKEN_NUMBER;
-			if (*p++ == '0' && *p == 'x') {
-				p++;
-				while (('0' <= *p && *p <= '9') ||
-				       ('a' <= *p && *p <= 'f') ||
-				       ('A' <= *p && *p <= 'F')) {
+			if (*p++ == '0') {
+				if (*p == 'x' || *p == 'X') {
 					p++;
-				}
-				if (p - token->value <= 2) {
-					return drgn_error_create(DRGN_ERROR_SYNTAX,
-								 "invalid number");
+					while (('0' <= *p && *p <= '9')
+					       || ('a' <= *p && *p <= 'f')
+					       || ('A' <= *p && *p <= 'F'))
+						p++;
+					if (p - token->value <= 2) {
+						return drgn_error_create(DRGN_ERROR_SYNTAX,
+									 "invalid number");
+					}
+				} else {
+					while ('0' <= *p && *p <= '7')
+						p++;
+					// 8 and 9 aren't valid octal digits.
+					if (*p == '8' || *p == '9') {
+						return drgn_error_create(DRGN_ERROR_SYNTAX,
+									 "invalid number");
+					}
 				}
 			} else {
 				while ('0' <= *p && *p <= '9')
@@ -1838,7 +1871,7 @@ static struct drgn_error *c_token_to_u64(const struct drgn_token *token,
 
 	assert(token->kind == C_TOKEN_NUMBER);
 	if (token->len > 2 && token->value[0] == '0' &&
-	    token->value[1] == 'x') {
+	    (token->value[1] == 'x' || token->value[1] == 'X')) {
 		for (i = 2; i < token->len; i++) {
 			char c = token->value[i];
 			int digit;
@@ -1846,9 +1879,9 @@ static struct drgn_error *c_token_to_u64(const struct drgn_token *token,
 			if ('0' <= c && c <= '9')
 				digit = c - '0';
 			else if ('a' <= c && c <= 'f')
-				digit = c - 'a';
+				digit = c - 'a' + 10;
 			else /* ('A' <= c && c <= 'F') */
-				digit = c - 'A';
+				digit = c - 'A' + 10;
 			if (x > UINT64_MAX / 16)
 				goto overflow;
 			x *= 16;
@@ -2167,21 +2200,25 @@ static struct drgn_error *cpp_append_to_identifier(
 		return NULL;
 
 	struct drgn_token token;
-
-	do {
+	const char *end = identifier + *len_ret;
+	for (;;) {
 		err = drgn_lexer_pop(lexer, &token);
-	} while (!err && (token.kind == C_TOKEN_IDENTIFIER ||
-			  token.kind == C_TOKEN_COLON));
-
-	if (err)
-		return err;
-	if (token.kind != C_TOKEN_TEMPLATE_ARGUMENTS) {
-		err = drgn_lexer_push(lexer, &token);
 		if (err)
 			return err;
+		if (token.kind != C_TOKEN_IDENTIFIER &&
+		    token.kind != C_TOKEN_COLON &&
+		    token.kind != C_TOKEN_TEMPLATE_ARGUMENTS) {
+			err = drgn_lexer_push(lexer, &token);
+			if (err)
+				return err;
+			break;
+		}
+		end = token.value + token.len;
+		if (token.kind == C_TOKEN_TEMPLATE_ARGUMENTS)
+			break;
 	}
 
-	*len_ret = token.value + token.len - identifier;
+	*len_ret = end - identifier;
 	return NULL;
 }
 
@@ -2533,6 +2570,8 @@ c_parse_abstract_declarator(struct drgn_program *prog,
 			    struct c_declarator **outer,
 			    struct c_declarator **inner)
 {
+	drgn_recursion_guard(1000, "maximum type depth exceeded");
+
 	struct drgn_error *err;
 	struct drgn_token token;
 
@@ -2569,39 +2608,48 @@ c_type_from_declarator(struct drgn_program *prog,
 		       struct c_declarator *declarator,
 		       struct drgn_qualified_type *ret)
 {
-	struct drgn_error *err;
-
-	if (!declarator)
-		return NULL;
-
-	err = c_type_from_declarator(prog, declarator->next, ret);
-	if (err) {
-		free(declarator);
-		return err;
+	// The declarator list is outermost-first, but we need to build the type
+	// innermost-first. Reverse it.
+	struct c_declarator *reversed = NULL;
+	while (declarator) {
+		struct c_declarator *next = declarator->next;
+		declarator->next = reversed;
+		reversed = declarator;
+		declarator = next;
 	}
+	declarator = reversed;
 
-	if (declarator->kind == C_TOKEN_ASTERISK) {
-		uint64_t address_size;
-		err = drgn_program_address_size(prog, &address_size);
+	struct drgn_error *err = NULL;
+	while (declarator) {
+		struct c_declarator *next = declarator->next;
 		if (!err) {
-			err = drgn_pointer_type_create(prog, *ret, address_size,
-						       DRGN_PROGRAM_ENDIAN,
-						       drgn_type_language(ret->type),
-						       &ret->type);
+			if (declarator->kind == C_TOKEN_ASTERISK) {
+				uint64_t address_size;
+				err = drgn_program_address_size(prog,
+								&address_size);
+				if (!err) {
+					err = drgn_pointer_type_create(prog, *ret,
+								       address_size,
+								       DRGN_PROGRAM_ENDIAN,
+								       drgn_type_language(ret->type),
+								       &ret->type);
+				}
+			} else if (declarator->is_complete) {
+				err = drgn_array_type_create(prog, *ret,
+							     declarator->length,
+							     drgn_type_language(ret->type),
+							     &ret->type);
+			} else {
+				err = drgn_incomplete_array_type_create(prog, *ret,
+									drgn_type_language(ret->type),
+									&ret->type);
+			}
+			if (!err)
+				ret->qualifiers = declarator->qualifiers;
 		}
-	} else if (declarator->is_complete) {
-		err = drgn_array_type_create(prog, *ret, declarator->length,
-					     drgn_type_language(ret->type),
-					     &ret->type);
-	} else {
-		err = drgn_incomplete_array_type_create(prog, *ret,
-							drgn_type_language(ret->type),
-							&ret->type);
+		free(declarator);
+		declarator = next;
 	}
-
-	if (!err)
-		ret->qualifiers = declarator->qualifiers;
-	free(declarator);
 	return err;
 }
 
@@ -2920,7 +2968,7 @@ static struct drgn_error *c_integer_promotions(struct drgn_program *prog,
 		type->type = type->underlying_type =
 			drgn_type_type(type->underlying_type).type;
 		if (!type->type) {
-			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 						 "operand cannot have incomplete enum type");
 		}
 		break;
@@ -3109,9 +3157,9 @@ static struct drgn_error *c_common_real_type(struct drgn_program *prog,
 		uint64_t width1, width2;
 
 		width1 = (type1->bit_field_size ? type1->bit_field_size :
-			  8 * drgn_type_size(type1->type));
+			  8 * drgn_type_size(type1->underlying_type));
 		width2 = (type2->bit_field_size ? type2->bit_field_size :
-			  8 * drgn_type_size(type2->type));
+			  8 * drgn_type_size(type2->underlying_type));
 		if (width1 < width2 ||
 		    (width1 == width2 && (!is_signed2 || is_signed1)))
 			goto ret2;
@@ -3247,6 +3295,8 @@ c_types_compatible_impl(struct drgn_qualified_type qualified_type1,
 	// compatible.
 	if (type1 == type2)
 		return NULL;
+
+	drgn_recursion_guard(1000, "maximum type depth exceeded");
 
 	if (drgn_type_kind(type1) != drgn_type_kind(type2)) {
 		// Enum types are compatible with their compatible integer type.

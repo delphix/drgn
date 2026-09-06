@@ -194,7 +194,7 @@ drgn_format_stack_frame(struct drgn_stack_trace *trace, size_t frame, char **ret
 		if (!string_builder_appendf(&str, "%#" PRIx64, pc.value))
 			return &drgn_enomem;
 
-		_cleanup_symbol_ struct drgn_symbol *sym;
+		_cleanup_symbol_ struct drgn_symbol *sym = NULL;
 		err = drgn_program_find_symbol_by_address_internal(trace->prog,
 								   pc.value - !regs->interrupted,
 								   &sym);
@@ -956,6 +956,8 @@ drgn_stack_trace_add_frames(struct drgn_stack_trace **trace,
 {
 	struct drgn_error *err;
 
+	size_t orig_num_frames = (*trace)->num_frames;
+
 	if (!regs->module) {
 		err = drgn_stack_trace_append_frame(trace, trace_capacity, regs,
 						    NULL, 0, 0);
@@ -972,7 +974,6 @@ drgn_stack_trace_add_frames(struct drgn_stack_trace **trace,
 		goto out;
 	pc -= bias;
 
-	size_t orig_num_frames = (*trace)->num_frames;
 	/*
 	 * Walk backwards through scopes, splitting into frames. Stop at index 1
 	 * because 0 must be a unit DIE.
@@ -1084,8 +1085,14 @@ drgn_stack_trace_add_frames(struct drgn_stack_trace **trace,
 out_scopes:
 	free(scopes);
 out:
-	if (err)
+	if (err) {
+		// We may have already appended frames referring to regs, so get
+		// rid of them before destroying it.
+		for (size_t i = orig_num_frames; i < (*trace)->num_frames; i++)
+			free((*trace)->frames[i].scopes);
+		(*trace)->num_frames = orig_num_frames;
 		drgn_register_state_destroy(regs);
+	}
 	return err;
 }
 
@@ -1319,12 +1326,15 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 	if (err)
 		return err;
 
-	/* Limit iterations so we don't get caught in a loop. */
-	for (int i = 0; i < 1024; i++) {
+	for (int i = 0; ; i++) {
 		err = drgn_stack_trace_add_frames(&trace, &trace_capacity,
 						  regs);
 		if (err)
 			return err;
+
+		// Limit iterations so we don't get caught in a loop.
+		if (i == 1023)
+			break;
 
 		err = drgn_unwind_with_cfi(prog, &row, regs, &regs);
 		if (err == &drgn_not_found) {
@@ -1361,6 +1371,16 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_stack_trace_from_pcs(struct drgn_program *prog, const uint64_t *pcs,
 				  size_t pcs_size, struct drgn_stack_trace **ret)
 {
+	if (!prog->has_platform) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "cannot create stack trace without platform");
+	}
+	if (!prog->platform.arch->register_layout) {
+		return drgn_error_format(DRGN_ERROR_NOT_IMPLEMENTED,
+					 "stack traces are not supported on %s architecture",
+					 prog->platform.arch->name);
+	}
+
 	_cleanup_stack_trace_ struct drgn_stack_trace *trace =
 		malloc_flexible_array(struct drgn_stack_trace, frames,
 				      pcs_size);

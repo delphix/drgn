@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "array.h"
+#include "bitmap.h"
 #include "cleanup.h"
 #include "debug_info.h"
 #include "drgn_internal.h"
@@ -19,25 +20,6 @@
 #include "error.h"
 #include "minmax.h"
 #include "util.h"
-
-struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret)
-{
-	GElf_Shdr shdr_mem, *shdr;
-	shdr = gelf_getshdr(scn, &shdr_mem);
-	if (!shdr)
-		return drgn_error_libelf();
-	if (shdr->sh_type == SHT_NOBITS) {
-		return drgn_error_create(DRGN_ERROR_BAD_DATA,
-					 "section has no data");
-	}
-	if ((shdr->sh_flags & SHF_COMPRESSED) && elf_compress(scn, 0, 0) < 0)
-		return drgn_error_libelf();
-	Elf_Data *data = elf_rawdata(scn, NULL);
-	if (!data)
-		return drgn_error_libelf();
-	*ret = data;
-	return NULL;
-}
 
 void truncate_elf_string_data(Elf_Data *data)
 {
@@ -60,6 +42,14 @@ enum drgn_dwarf_file_type {
 	DRGN_DWARF_FILE_PLAIN,
 };
 
+static void drgn_elf_file_create_cleanup(struct drgn_elf_file **filep)
+{
+	if (*filep) {
+		free((*filep)->gnu_compressed_sections);
+		free(*filep);
+	}
+}
+
 struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
 					const char *path, int fd, char *image,
 					Elf *elf, struct drgn_elf_file **ret)
@@ -71,7 +61,8 @@ struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
 	if (!ehdr)
 		return drgn_error_libelf();
 
-	_cleanup_free_ struct drgn_elf_file *file = calloc(1, sizeof(*file));
+	_cleanup_(drgn_elf_file_create_cleanup) struct drgn_elf_file *file =
+		calloc(1, sizeof(*file));
 	if (!file)
 		return &drgn_enomem;
 
@@ -109,7 +100,9 @@ struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
 
 			enum drgn_dwarf_file_type dwarf_section_type;
 			if (strcmp(scnname, ".debug_cu_index") == 0 ||
-			    strcmp(scnname, ".debug_tu_index") == 0) {
+			    strcmp(scnname, ".debug_tu_index") == 0 ||
+			    strcmp(scnname, ".zdebug_cu_index") == 0 ||
+			    strcmp(scnname, ".zdebug_tu_index") == 0) {
 				dwarf_section_type = DRGN_DWARF_FILE_DWO;
 			} else if (strstartswith(scnname, ".debug_") ||
 				   strstartswith(scnname, ".zdebug_")) {
@@ -131,21 +124,37 @@ struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
 			if (!shdr)
 				return drgn_error_libelf();
 
-			if (shdr->sh_type != SHT_PROGBITS)
+			// libdw accepts debug sections with any type other than
+			// SHT_NOBITS.
+			if (shdr->sh_type == SHT_NOBITS)
 				continue;
 
 			const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
 			if (!scnname)
 				return drgn_error_libelf();
 
-			enum drgn_section_index index;
+			enum drgn_section_index index = DRGN_SECTION_INDEX_NUM;
 			if (strstartswith(scnname, ".debug_") ||
 			    strstartswith(scnname, ".zdebug_")) {
 				const char *subname;
-				if (strstartswith(scnname, ".zdebug_"))
+				if (strstartswith(scnname, ".zdebug_")) {
 					subname = scnname + sizeof(".zdebug_") - 1;
-				else
+
+					if (!file->gnu_compressed_sections) {
+						size_t shdrnum;
+						if (elf_getshdrnum(elf,
+								   &shdrnum))
+							return drgn_error_libelf();
+						file->gnu_compressed_sections =
+							drgn_bitmap_create(shdrnum);
+						if (!file->gnu_compressed_sections)
+							return &drgn_enomem;
+					}
+					drgn_bitmap_set_bit(file->gnu_compressed_sections,
+							    elf_ndxscn(scn));
+				} else {
 					subname = scnname + sizeof(".debug_") - 1;
+				}
 				size_t len = strlen(subname);
 				if (len >= 4
 				    && strcmp(subname + len - 4, ".dwo") == 0) {
@@ -163,15 +172,17 @@ struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
 					scnname + sizeof(".gnu.debuglto_.debug_") - 1;
 				index = drgn_debug_section_name_to_index(subname,
 									 strlen(subname));
-			} else if (strcmp(scnname, ".init.text") == 0) {
-				// We consider a file to be vmlinux if it has an
-				// .init.text section and is not relocatable
-				// (which excludes kernel modules).
-				// Keep this in sync with elf_is_vmlinux().
-				file->is_vmlinux = ehdr->e_type != ET_REL;
-				index = DRGN_SECTION_INDEX_NUM;
-			} else {
-				index = drgn_non_debug_section_name_to_index(scnname);
+			} else if (shdr->sh_type == SHT_PROGBITS) {
+				if (strcmp(scnname, ".init.text") == 0) {
+					// We consider a file to be vmlinux if
+					// it has an .init.text section and is
+					// not relocatable (which excludes
+					// kernel modules). Keep this in sync
+					// with elf_is_vmlinux().
+					file->is_vmlinux = ehdr->e_type != ET_REL;
+				} else {
+					index = drgn_non_debug_section_name_to_index(scnname);
+				}
 			}
 			if (index < DRGN_SECTION_INDEX_NUM && !file->scns[index])
 				file->scns[index] = scn;
@@ -222,6 +233,7 @@ void drgn_elf_file_destroy(struct drgn_elf_file *file)
 {
 	if (file) {
 		free(file->sections_with_address);
+		free(file->gnu_compressed_sections);
 		dwarf_end(file->_dwarf);
 		elf_end(file->elf);
 		if (file->fd >= 0)
@@ -429,7 +441,7 @@ apply_elf_rels(const struct drgn_relocating_section *relocating,
 	return NULL;
 }
 
-struct drgn_error *
+static struct drgn_error *
 drgn_elf_file_apply_relocations(struct drgn_elf_file *file)
 {
 	struct drgn_error *err;
@@ -500,9 +512,16 @@ drgn_elf_file_apply_relocations(struct drgn_elf_file *file)
 			}
 
 			Elf_Data *data, *reloc_data, *symtab_data;
-			if ((err = read_elf_section(scn, &data))
-			    || (err = read_elf_section(reloc_scn, &reloc_data))
-			    || (err = read_elf_section(symtab_scn, &symtab_data)))
+			if ((err = drgn_elf_file_read_section(file, scn, false,
+							      &data))
+			    || (err = drgn_elf_file_read_section(file,
+								 reloc_scn,
+								 false,
+								 &reloc_data))
+			    || (err = drgn_elf_file_read_section(file,
+								 symtab_scn,
+								 false,
+								 &symtab_data)))
 				return err;
 
 			struct drgn_relocating_section relocating = {
@@ -530,15 +549,53 @@ drgn_elf_file_apply_relocations(struct drgn_elf_file *file)
 }
 
 struct drgn_error *drgn_elf_file_read_section(struct drgn_elf_file *file,
-					      enum drgn_section_index scn,
+					      Elf_Scn *scn,
+					      bool apply_relocations,
 					      Elf_Data **ret)
 {
 	struct drgn_error *err;
-	if (!file->scn_data[scn]) {
+
+	GElf_Shdr shdr_mem, *shdr = gelf_getshdr(scn, &shdr_mem);
+	if (!shdr)
+		return drgn_error_libelf();
+
+	if (shdr->sh_type == SHT_NOBITS) {
+		return drgn_error_create(DRGN_ERROR_BAD_DATA,
+					 "section has no data");
+	}
+
+	if (apply_relocations) {
 		err = drgn_elf_file_apply_relocations(file);
 		if (err)
 			return err;
-		err = read_elf_section(file->scns[scn], &file->scn_data[scn]);
+	}
+
+	if (file->gnu_compressed_sections
+	    && drgn_bitmap_test_bit(file->gnu_compressed_sections,
+				    elf_ndxscn(scn))) {
+		// Ignore errors since we can't tell whether it has already been
+		// decompressed.
+		elf_compress_gnu(scn, 0, 0);
+	}
+
+	if ((shdr->sh_flags & SHF_COMPRESSED) && elf_compress(scn, 0, 0) < 0)
+		return drgn_error_libelf();
+
+	Elf_Data *data = elf_rawdata(scn, NULL);
+	if (!data)
+		return drgn_error_libelf();
+	*ret = data;
+	return NULL;
+}
+
+struct drgn_error *
+drgn_elf_file_read_cached_section(struct drgn_elf_file *file,
+				  enum drgn_section_index scn, Elf_Data **ret)
+{
+	struct drgn_error *err;
+	if (!file->scn_data[scn]) {
+		err = drgn_elf_file_read_section(file, file->scns[scn], true,
+						 &file->scn_data[scn]);
 		if (err)
 			return err;
 		if (scn == DRGN_SCN_DEBUG_STR)

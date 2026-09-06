@@ -175,6 +175,11 @@ bool drgn_memory_reader_empty(struct drgn_memory_reader *reader)
 		drgn_memory_segment_tree_empty(&reader->physical_segments));
 }
 
+bool drgn_memory_reader_empty_virtual(struct drgn_memory_reader *reader)
+{
+	return drgn_memory_segment_tree_empty(&reader->virtual_segments);
+}
+
 struct drgn_error *
 drgn_memory_reader_add_segment(struct drgn_memory_reader *reader,
 			       uint64_t min_address, uint64_t max_address,
@@ -604,8 +609,10 @@ drgn_memory_search_iterator_refill(struct drgn_memory_search_iterator *it,
 		it->physical ? &it->prog->reader.physical_segments
 			     : &it->prog->reader.virtual_segments;
 
-	if (drgn_memory_search_iterator_remaining_bytes(it) >= needed)
+	if (drgn_memory_search_iterator_remaining_bytes(it) >= needed) {
+		*gap_ret = false;
 		return NULL;
+	}
 
 	err = drgn_blocking_check_signals(blocking_state);
 	if (err)

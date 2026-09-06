@@ -42,14 +42,6 @@ static inline void elf_endp(Elf **elfp)
 }
 
 /**
- * Read the raw data from an ELF section, decompressing it first if it is
- * compressed.
- *
- * This returns an error if the section type is `SHT_NOBITS`.
- */
-struct drgn_error *read_elf_section(Elf_Scn *scn, Elf_Data **ret);
-
-/**
  * Truncate any bytes beyond the last null character in an ELF string table.
  *
  * This sets `data->d_size` so that any string table index less than
@@ -125,6 +117,8 @@ struct drgn_elf_file {
 	 * `.debug_str` section data.
 	 */
 	Elf_Data *alt_debug_str_data;
+	/** Bitmap of GNU-compressed sections, or @c NULL if there are none. */
+	unsigned long *gnu_compressed_sections;
 	/**
 	 * For relocatable files, a bitmap of which sections have their address
 	 * set.
@@ -144,18 +138,28 @@ struct drgn_error *drgn_elf_file_create(struct drgn_module *module,
 
 void drgn_elf_file_destroy(struct drgn_elf_file *file);
 
-/** Apply ELF relocations to the file if needed. */
-struct drgn_error *
-drgn_elf_file_apply_relocations(struct drgn_elf_file *file);
+/**
+ * Read the raw data from an ELF section, decompressing it first if it is
+ * compressed.
+ *
+ * This returns an error if the section type is `SHT_NOBITS`.
+ *
+ * @param[in] apply_relocations Whether to apply ELF relocations to the file
+ * first.
+ */
+struct drgn_error *drgn_elf_file_read_section(struct drgn_elf_file *file,
+					      Elf_Scn *scn,
+					      bool apply_relocations,
+					      Elf_Data **ret);
 
 /**
- * Read an indexed ELF section.
+ * Read a cached ELF section.
  *
  * This applies ELF relocations to the file first if needed.
  */
-struct drgn_error *drgn_elf_file_read_section(struct drgn_elf_file *file,
-					      enum drgn_section_index scn,
-					      Elf_Data **ret);
+struct drgn_error *
+drgn_elf_file_read_cached_section(struct drgn_elf_file *file,
+				  enum drgn_section_index scn, Elf_Data **ret);
 
 struct drgn_error *drgn_elf_file_get_dwarf(struct drgn_elf_file *file,
 					   Dwarf **ret);
@@ -232,7 +236,7 @@ drgn_elf_file_section_buffer_init(struct drgn_elf_file_section_buffer *buffer,
 }
 
 /**
- * Initialize a @ref binary_buffer for an indexed ELF section that has already
+ * Initialize a @ref binary_buffer for a cached ELF section that has already
  * been read.
  */
 static inline void
@@ -245,8 +249,8 @@ drgn_elf_file_section_buffer_init_index(struct drgn_elf_file_section_buffer *buf
 }
 
 /**
- * Read an indexed ELF section (applying ELF relocations if needed) and
- * initialize a @ref binary_buffer for it.
+ * Read a cached ELF section (applying ELF relocations if needed) and initialize
+ * a @ref binary_buffer for it.
  */
 static inline struct drgn_error *
 drgn_elf_file_section_buffer_read(struct drgn_elf_file_section_buffer *buffer,
@@ -254,7 +258,8 @@ drgn_elf_file_section_buffer_read(struct drgn_elf_file_section_buffer *buffer,
 				  enum drgn_section_index scn)
 {
 	Elf_Data *data;
-	struct drgn_error *err = drgn_elf_file_read_section(file, scn, &data);
+	struct drgn_error *err =
+		drgn_elf_file_read_cached_section(file, scn, &data);
 	if (err)
 		return err;
 	drgn_elf_file_section_buffer_init(buffer, file, file->scns[scn], data);
