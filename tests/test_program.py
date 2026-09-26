@@ -919,6 +919,18 @@ class TestTypes(MockProgramTestCase):
             self.prog.type("int [0x20]"),
             self.prog.array_type(self.prog.int_type("int", 4, True), 32),
         )
+        self.assertIdentical(
+            self.prog.type("int [0xa]"),
+            self.prog.array_type(self.prog.int_type("int", 4, True), 10),
+        )
+        self.assertIdentical(
+            self.prog.type("int [0Xff]"),
+            self.prog.array_type(self.prog.int_type("int", 4, True), 255),
+        )
+        self.assertIdentical(
+            self.prog.type("int [0xAB]"),
+            self.prog.array_type(self.prog.int_type("int", 4, True), 171),
+        )
 
     def test_array_octal(self):
         self.assertIdentical(
@@ -960,6 +972,12 @@ class TestTypes(MockProgramTestCase):
                 ),
                 2,
             ),
+        )
+
+    def test_deeply_nested_declarator(self):
+        depth = 10000
+        self.assertRaises(
+            RecursionError, self.prog.type, "int " + "(" * depth + "*" + ")" * depth
         )
 
     def test_pointer_to_array(self):
@@ -1013,6 +1031,21 @@ class TestTypes(MockProgramTestCase):
                 2,
             ),
         )
+
+    def test_pointer_to_class(self):
+        class_point = self.prog.class_type(
+            "Point",
+            8,
+            (
+                TypeMember(self.prog.int_type("int", 4, True), "x", 0),
+                TypeMember(self.prog.int_type("int", 4, True), "y", 32),
+            ),
+        )
+        class_point_p = self.prog.pointer_type(class_point)
+        self.types.append(class_point)
+        self.prog.language = Language.CPP
+        self.assertIdentical(self.prog.type("class Point *"), class_point_p)
+        self.assertIdentical(self.prog.type("Point *"), class_point_p)
 
 
 class TestObjects(MockProgramTestCase):
@@ -1221,13 +1254,6 @@ class TestSetLinuxKernelCustom(TestCase):
         prog.set_linux_kernel_custom(make_vmcoreinfo(), False)
         self.assertFalse(prog.flags & ProgramFlags.IS_LIVE)
 
-    def test_idempotent(self):
-        prog = Program(MOCK_PLATFORM)
-        prog.set_linux_kernel_custom(make_vmcoreinfo(), False)
-        self.assertTrue(prog.flags & ProgramFlags.IS_LINUX_KERNEL)
-        prog.set_linux_kernel_custom(make_vmcoreinfo(), False)
-        self.assertTrue(prog.flags & ProgramFlags.IS_LINUX_KERNEL)
-
     def test_with_vmcoreinfo_in_constructor(self):
         vmcoreinfo1 = make_vmcoreinfo(osrelease="5.0.0-first")
         vmcoreinfo2 = make_vmcoreinfo(osrelease="6.0.0-second")
@@ -1247,6 +1273,18 @@ class TestSetLinuxKernelCustom(TestCase):
         prog.set_linux_kernel_custom(make_vmcoreinfo(), False)
         self.assertTrue(prog.flags & ProgramFlags.IS_LINUX_KERNEL)
         self.assertEqual(prog.read(0x1000, len(data), physical=True), data)
+
+    def test_with_virtual_memory_segment(self):
+        prog = Program(MOCK_PLATFORM)
+        data = b"test data"
+        prog.add_memory_segment(
+            0xFFFF0000,
+            len(data),
+            lambda addr, count, off, phys: data[off : off + count],
+        )
+        self.assertRaises(
+            ValueError, prog.set_linux_kernel_custom, make_vmcoreinfo(), False
+        )
 
 
 def dummy_symbol_finder(prog, name, address, one):
