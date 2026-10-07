@@ -181,10 +181,8 @@ static DrgnObject *StackFrame_subscript(StackFrame *self, PyObject *key)
 static int StackFrame_contains(StackFrame *self, PyObject *key)
 {
 	struct drgn_error *err;
-	if (!PyUnicode_Check(key)) {
-		PyErr_SetObject(PyExc_KeyError, key);
-		return -1;
-	}
+	if (!PyUnicode_Check(key))
+		return 0;
 	const char *name = PyUnicode_AsUTF8(key);
 	if (!name)
 		return -1;
@@ -199,6 +197,14 @@ static int StackFrame_contains(StackFrame *self, PyObject *key)
 		set_drgn_error(err);
 		return -1;
 	}
+}
+
+static PyObject *StackFrame_contains_method(StackFrame *self, PyObject *key)
+{
+	int r = StackFrame_contains(self, key);
+	if (r < 0)
+		return NULL;
+	Py_RETURN_BOOL(r);
 }
 
 static PyObject *StackFrame_source_name(StackFrame *self)
@@ -363,7 +369,7 @@ static PyObject *StackFrame_get_sp(StackFrame *self, void *arg)
 static PyMethodDef StackFrame_methods[] = {
 	{"__getitem__", (PyCFunction)StackFrame_subscript,
 	 METH_O | METH_COEXIST, drgn_StackFrame___getitem___DOC},
-	{"__contains__", (PyCFunction)StackFrame_contains,
+	{"__contains__", (PyCFunction)StackFrame_contains_method,
 	 METH_O | METH_COEXIST, drgn_StackFrame___contains___DOC},
 	{"locals", (PyCFunction)StackFrame_locals,
 	 METH_NOARGS, drgn_StackFrame_locals_DOC},

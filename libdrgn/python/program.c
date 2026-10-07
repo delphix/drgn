@@ -2195,10 +2195,8 @@ static int Program_contains(Program *self, PyObject *key)
 {
 	struct drgn_error *err;
 
-	if (!PyUnicode_Check(key)) {
-		PyErr_SetObject(PyExc_KeyError, key);
+	if (!PyUnicode_Check(key))
 		return 0;
-	}
 
 	const char *name = PyUnicode_AsUTF8(key);
 	if (!name)
@@ -2216,6 +2214,14 @@ static int Program_contains(Program *self, PyObject *key)
 		}
 	}
 	return 1;
+}
+
+static PyObject *Program_contains_method(Program *self, PyObject *key)
+{
+	int r = Program_contains(self, key);
+	if (r < 0)
+		return NULL;
+	Py_RETURN_BOOL(r);
 }
 
 static PyObject *Program_get_flags(Program *self, void *arg)
@@ -2331,8 +2337,8 @@ static PyMethodDef Program_methods[] = {
 	 drgn_Program_find_standard_debug_info_DOC},
 	{"__getitem__", (PyCFunction)Program_subscript, METH_O | METH_COEXIST,
 	 drgn_Program___getitem___DOC},
-	{"__contains__", (PyCFunction)Program_contains, METH_O | METH_COEXIST,
-	 drgn_Program___contains___DOC},
+	{"__contains__", (PyCFunction)Program_contains_method,
+	 METH_O | METH_COEXIST, drgn_Program___contains___DOC},
 	{"read", (PyCFunction)Program_read, METH_VARARGS | METH_KEYWORDS,
 	 drgn_Program_read_DOC},
 	{"read_c_string", (PyCFunction)Program_read_c_string,
