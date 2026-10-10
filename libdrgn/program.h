@@ -169,6 +169,7 @@ struct drgn_program {
 				uint64_t at_phdr;
 				uint64_t at_phnum;
 				uint64_t at_sysinfo_ehdr;
+				uint64_t at_pagesz;
 			} auxv;
 			bool auxv_cached;
 		};
@@ -232,6 +233,10 @@ struct drgn_program {
 				 * Whether 5-level paging was enabled on x86-64.
 				 */
 				bool pgtable_l5_enabled;
+				/** Whether `RADIX_MMU` was in the VMCOREINFO. */
+				bool have_ppc64_radix_mmu;
+				/** Whether the PPC64 mmu is configured to Radix mode */
+				bool ppc64_radix_mmu;
 				/** Whether LPAE was enabled on Arm. */
 				bool arm_lpae;
 				/** Whether `CRASHTIME` was in the VMCOREINFO. */

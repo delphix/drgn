@@ -1532,9 +1532,12 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 				.key = state->modules[i]->name,
 				.value = VECTOR_INIT,
 			};
-			if (drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
-							     &entry, NULL) < 0)
+			int r = drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
+								 &entry, NULL);
+			if (r < 0)
 				return &drgn_enomem;
+			if (r == 0)
+				state->kmod_walk.duplicate_names = true;
 		}
 	}
 
@@ -1545,11 +1548,14 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 	for (;;) {
 		if (i >= char_p_vector_size(&it.entry->value)) {
 			// No matches remaining for this module. Clear the old
-			// matches and find another one.
-			vector_for_each(char_p_vector, path, &it.entry->value)
-				free(*path);
-			char_p_vector_clear(&it.entry->value);
-			i = 0;
+			// matches if we can, then find another one.
+			if (!state->kmod_walk.duplicate_names) {
+				vector_for_each(char_p_vector, path,
+						&it.entry->value)
+					free(*path);
+				char_p_vector_clear(&it.entry->value);
+				i = 0;
+			}
 
 			err = drgn_kmod_walk(module->prog, options,
 					     &state->kmod_walk, it.entry);
@@ -1566,10 +1572,12 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 		if (!drgn_module_wants_file(module))
 			break;
 	}
-	// We won't need any more matches for this module.
-	drgn_kmod_walk_module_map_entry_deinit(it.entry);
-	drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
-						  it);
+	if (!state->kmod_walk.duplicate_names) {
+		// We won't need any more matches for this module.
+		drgn_kmod_walk_module_map_entry_deinit(it.entry);
+		drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
+							  it);
+	}
 	return NULL;
 }
 
@@ -2079,6 +2087,7 @@ kernel_module_set_section_addresses_live(struct drgn_module *module)
 		_cleanup_fclose_ FILE *file = fdopen(fd, "r");
 		if (!file)
 			return drgn_error_create_os("fdopen", errno, NULL);
+		fd = -1; // Owned by file now.
 		uint64_t address;
 		if (fscanf(file, "%" SCNx64, &address) != 1) {
 			return drgn_error_format(DRGN_ERROR_BAD_DATA,
@@ -2235,9 +2244,9 @@ kernel_module_set_section_addresses(struct drgn_module *module,
 			// Before that, the section address is in struct
 			// module_sect_attr::address.
 			err = drgn_object_member(&tmp, &attr, "address");
-			if (err)
-				return err;
 		}
+		if (err)
+			return err;
 		uint64_t address;
 		err = drgn_object_read_unsigned(&tmp, &address);
 		if (err)
