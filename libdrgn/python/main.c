@@ -1,16 +1,18 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 // SPDX-License-Identifier: LGPL-2.1-or-later
 
+#include "drgnpy.h"
+
 #include <elfutils/libdwfl.h>
 #ifdef WITH_PCRE2
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
 #endif
 
-#include "drgnpy.h"
 #include "../debug_info.h"
 #include "../error.h"
 #include "../path.h"
+#include "../stack_trace.h"
 
 /* Basically PyModule_AddType(), which is only available since Python 3.9. */
 static int add_type(PyObject *module, PyTypeObject *type)
@@ -39,14 +41,19 @@ PyObject *UnsupportedOperation;
 
 static _Thread_local Program *default_prog;
 
-static PyObject *get_default_prog(PyObject *self, PyObject *_)
+static inline Program *get_default_prog_impl(void)
 {
 	if (!default_prog) {
 		PyErr_SetString(NoDefaultProgramError, "no default program");
 		return NULL;
 	}
 	Py_INCREF(default_prog);
-	return (PyObject *)default_prog;
+	return default_prog;
+}
+
+static PyObject *get_default_prog(PyObject *self, PyObject *Py_UNUSED(ignored))
+{
+	return (PyObject *)get_default_prog_impl();
 }
 
 static PyObject *set_default_prog(PyObject *self, PyObject *arg)
@@ -106,25 +113,22 @@ static PyObject *sizeof_(PyObject *self, PyObject *arg)
 	} else if (PyObject_TypeCheck(arg, &DrgnObject_type)) {
 		err = drgn_object_sizeof(&((DrgnObject *)arg)->obj, &size);
 	} else if (PyUnicode_Check(arg)) {
-		if (!default_prog) {
-			PyErr_SetString(NoDefaultProgramError,
-					"no default program");
+		_cleanup_pydecref_ Program *prog = get_default_prog_impl();
+		if (!prog)
 			return NULL;
-		}
 
 		const char *name = PyUnicode_AsUTF8(arg);
 		if (!name)
 			return NULL;
 
 		struct drgn_qualified_type qualified_type;
-		err = drgn_program_find_type(&default_prog->prog, name, NULL,
+		err = drgn_program_find_type(&prog->prog, name, NULL,
 					     &qualified_type);
 		if (!err) {
 			err = drgn_type_sizeof(qualified_type.type, &size);
 		} else if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
-			DRGN_OBJECT(obj, &default_prog->prog);
-			err = drgn_program_find_object(&default_prog->prog,
-						       name, NULL,
+			DRGN_OBJECT(obj, &prog->prog);
+			err = drgn_program_find_object(&prog->prog, name, NULL,
 						       DRGN_FIND_OBJECT_ANY,
 						       &obj);
 			if (!err)
@@ -140,37 +144,40 @@ static PyObject *sizeof_(PyObject *self, PyObject *arg)
 	return PyLong_FromUInt64(size);
 }
 
-static bool
+static Program *
 default_prog_find_type(PyObject *arg, struct drgn_qualified_type *ret)
 {
 	struct drgn_error *err;
 
-	if (!default_prog) {
-		PyErr_SetString(NoDefaultProgramError, "no default program");
-		return false;
-	}
+	_cleanup_pydecref_ Program *prog = get_default_prog_impl();
+	if (!prog)
+		return NULL;
 
 	const char *name = PyUnicode_AsUTF8(arg);
 	if (!name)
-		return false;
+		return NULL;
 
-	err = drgn_program_find_type(&default_prog->prog, name, NULL, ret);
+	err = drgn_program_find_type(&prog->prog, name, NULL, ret);
 	if (err) {
 		set_drgn_error(err);
-		return false;
+		return NULL;
 	}
-	return true;
+	// Need to hold a reference to the default program so that the type
+	// stays alive.
+	return_ptr(prog);
 }
 
 static PyObject *alignof_(PyObject *self, PyObject *arg)
 {
 	struct drgn_error *err;
+	_cleanup_pydecref_ Program *prog = NULL;
 	struct drgn_qualified_type qualified_type;
 	if (PyObject_TypeCheck(arg, &DrgnType_type)) {
 		qualified_type.type = ((DrgnType *)arg)->type;
 		qualified_type.qualifiers = ((DrgnType *)arg)->qualifiers;
 	} else if (PyUnicode_Check(arg)) {
-		if (!default_prog_find_type(arg, &qualified_type))
+		prog = default_prog_find_type(arg, &qualified_type);
+		if (!prog)
 			return NULL;
 	} else {
 		return PyErr_Format(PyExc_TypeError,
@@ -195,12 +202,14 @@ static PyObject *offsetof_(PyObject *self, PyObject *args, PyObject *kwds)
 					 &arg, &member))
 		return NULL;
 
+	_cleanup_pydecref_ Program *prog = NULL;
 	struct drgn_type *type;
 	if (PyObject_TypeCheck(arg, &DrgnType_type)) {
 		type = ((DrgnType *)arg)->type;
 	} else if (PyUnicode_Check(arg)) {
 		struct drgn_qualified_type qualified_type;
-		if (!default_prog_find_type(arg, &qualified_type))
+		prog = default_prog_find_type(arg, &qualified_type);
+		if (!prog)
 			return NULL;
 		type = qualified_type.type;
 	} else {
@@ -214,6 +223,28 @@ static PyObject *offsetof_(PyObject *self, PyObject *args, PyObject *kwds)
 	if (err)
 		return set_drgn_error(err);
 	return PyLong_FromUInt64(offset);
+}
+
+static PyObject *drgnpy_parse_addr2line(PyObject *self, PyObject *arg)
+{
+	struct drgn_error *err;
+	if (!PyUnicode_Check(arg)) {
+		PyErr_SetString(PyExc_TypeError, "argument must be str");
+		return NULL;
+	}
+	const char *s = PyUnicode_AsUTF8(arg);
+	if (!s)
+		return NULL;
+
+	const char *sym_name;
+	size_t sym_name_len;
+	unsigned long long offset;
+	err = drgn_parse_addr2line(s, &sym_name, &sym_name_len, &offset);
+	if (err)
+		return set_drgn_error(err);
+
+	return Py_BuildValue("s#K", sym_name ? sym_name : "",
+			     (Py_ssize_t)sym_name_len, offset);
 }
 
 static PyMethodDef drgn_methods[] = {
@@ -243,6 +274,7 @@ static PyMethodDef drgn_methods[] = {
 	 METH_NOARGS, drgn_program_from_kernel_DOC},
 	{"program_from_pid", (PyCFunction)program_from_pid,
 	 METH_VARARGS | METH_KEYWORDS, drgn_program_from_pid_DOC},
+	{"_parse_addr2line", drgnpy_parse_addr2line, METH_O},
 	{"_linux_helper_direct_mapping_offset",
 	 (PyCFunction)drgnpy_linux_helper_direct_mapping_offset, METH_O},
 	{"_linux_helper_read_vm", (PyCFunction)drgnpy_linux_helper_read_vm,

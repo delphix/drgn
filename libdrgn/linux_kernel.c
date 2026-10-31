@@ -380,7 +380,6 @@ linux_kernel_get_vmcoreinfo(struct drgn_program *prog, struct drgn_object *ret)
 static struct drgn_error *
 linux_kernel_get_vmemmap_address(struct drgn_program *prog, uint64_t *ret)
 {
-	static const uint64_t SECTION_HAS_MEM_MAP = 0x2;
 	static const uint64_t SECTION_MAP_MASK = ~((UINT64_C(1) << 6) - 1);
 	struct drgn_error *err;
 
@@ -395,6 +394,30 @@ linux_kernel_get_vmemmap_address(struct drgn_program *prog, uint64_t *ret)
 			// !CONFIG_SPARSEMEM_VMEMMAP
 			err = &drgn_not_found;
 		}
+		return err;
+	}
+
+	// Since Linux kernel commit ed7802dd48f7 ("mm: memory_hotplug: enumerate
+	// all supported section flags") (in v6.0), the section flags are an
+	// anonymous enum. Before that, they were macros. SECTION_HAS_MEM_MAP
+	// didn't change until Linux kernel commit da7acb8982ed ("mm/sparse:
+	// remove SECTION_MARKED_PRESENT") (in v7.4).
+	uint64_t SECTION_HAS_MEM_MAP;
+	err = drgn_program_find_object(prog, "SECTION_HAS_MEM_MAP_BIT", NULL,
+				       DRGN_FIND_OBJECT_CONSTANT, &section);
+	if (!err) {
+		union drgn_value bit;
+		err = drgn_object_read_integer(&section, &bit);
+		if (err)
+			return err;
+		if (bit.uvalue >= 64) {
+			return drgn_error_create(DRGN_ERROR_BAD_DATA,
+						 "invalid SECTION_HAS_MEM_MAP_BIT");
+		}
+		SECTION_HAS_MEM_MAP = UINT64_C(1) << bit.uvalue;
+	} else if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
+		SECTION_HAS_MEM_MAP = 0x2;
+	} else {
 		return err;
 	}
 
@@ -552,7 +575,7 @@ linux_kernel_get_sections_per_root_impl(struct drgn_program *prog, uint64_t *ret
 			       &sizeof_mem_section);
 	if (err)
 		return err;
-	if (!is_power_of_two(sizeof_mem_section)
+	if (sizeof_mem_section == 0
 	    || sizeof_mem_section > prog->vmcoreinfo.page_size) {
 		return drgn_error_create(DRGN_ERROR_BAD_DATA,
 					 "struct mem_section has invalid size");
@@ -625,7 +648,8 @@ linux_kernel_get_max_physmem_bits_impl(struct drgn_program *prog, int64_t *ret)
 		//                       + SECTION_SIZE_BITS
 		//
 		// (NR_SECTION_ROOTS and SECTIONS_PER_ROOT are always powers of
-		// two.)
+		// two before Linux kernel commit 48070b721a60 ("mm/sparse:
+		// relax struct mem_section size constraints") (in v7.4).)
 		//
 		// => MAX_PHYSMEM_BITS = log2(NR_SECTION_ROOTS)
 		//                       + log2(SECTIONS_PER_ROOT)
@@ -1532,9 +1556,12 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 				.key = state->modules[i]->name,
 				.value = VECTOR_INIT,
 			};
-			if (drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
-							     &entry, NULL) < 0)
+			int r = drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
+								 &entry, NULL);
+			if (r < 0)
 				return &drgn_enomem;
+			if (r == 0)
+				state->kmod_walk.duplicate_names = true;
 		}
 	}
 
@@ -1545,11 +1572,14 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 	for (;;) {
 		if (i >= char_p_vector_size(&it.entry->value)) {
 			// No matches remaining for this module. Clear the old
-			// matches and find another one.
-			vector_for_each(char_p_vector, path, &it.entry->value)
-				free(*path);
-			char_p_vector_clear(&it.entry->value);
-			i = 0;
+			// matches if we can, then find another one.
+			if (!state->kmod_walk.duplicate_names) {
+				vector_for_each(char_p_vector, path,
+						&it.entry->value)
+					free(*path);
+				char_p_vector_clear(&it.entry->value);
+				i = 0;
+			}
 
 			err = drgn_kmod_walk(module->prog, options,
 					     &state->kmod_walk, it.entry);
@@ -1566,10 +1596,12 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 		if (!drgn_module_wants_file(module))
 			break;
 	}
-	// We won't need any more matches for this module.
-	drgn_kmod_walk_module_map_entry_deinit(it.entry);
-	drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
-						  it);
+	if (!state->kmod_walk.duplicate_names) {
+		// We won't need any more matches for this module.
+		drgn_kmod_walk_module_map_entry_deinit(it.entry);
+		drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
+							  it);
+	}
 	return NULL;
 }
 
@@ -2079,6 +2111,7 @@ kernel_module_set_section_addresses_live(struct drgn_module *module)
 		_cleanup_fclose_ FILE *file = fdopen(fd, "r");
 		if (!file)
 			return drgn_error_create_os("fdopen", errno, NULL);
+		fd = -1; // Owned by file now.
 		uint64_t address;
 		if (fscanf(file, "%" SCNx64, &address) != 1) {
 			return drgn_error_format(DRGN_ERROR_BAD_DATA,
@@ -2235,9 +2268,9 @@ kernel_module_set_section_addresses(struct drgn_module *module,
 			// Before that, the section address is in struct
 			// module_sect_attr::address.
 			err = drgn_object_member(&tmp, &attr, "address");
-			if (err)
-				return err;
 		}
+		if (err)
+			return err;
 		uint64_t address;
 		err = drgn_object_read_unsigned(&tmp, &address);
 		if (err)
