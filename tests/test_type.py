@@ -1,6 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+import weakref
+
 from drgn import (
     Architecture,
     Language,
@@ -580,6 +582,11 @@ class TestType(MockProgramTestCase):
 
         self.assertRaises(TypeError, self.prog.int_type("int", 4, True).member, "foo")
 
+    def test_anonymous_member_cycle(self):
+        type = self.prog.struct_type(None, 8, (TypeMember(lambda: type),))
+        self.assertRaises(RecursionError, type.member, "foo")
+        self.assertRaises(RecursionError, type.has_member, "foo")
+
     def test_offsetof(self):
         self.assertEqual(offsetof(self.line_segment_type, "b"), 8)
         self.assertEqual(offsetof(self.line_segment_type, "a.y"), 4)
@@ -626,6 +633,21 @@ class TestType(MockProgramTestCase):
             self.prog.array_type(self.prog.int_type("int", 4, True), 10),
             "[1]",
         )
+
+        array_type = self.prog.struct_type(
+            "array",
+            1024,
+            (
+                TypeMember(
+                    self.prog.array_type(self.prog.int_type("int", 4, True), 256),
+                    "a",
+                    0,
+                ),
+            ),
+        )
+        self.assertEqual(offsetof(array_type, "a[10]"), 40)
+        self.assertEqual(offsetof(array_type, "a[0x10]"), 64)
+        self.assertEqual(offsetof(array_type, "a[0xff]"), 1020)
 
     def test_enum(self):
         t = self.prog.enum_type(
@@ -1203,6 +1225,59 @@ class TestTypeMember(MockProgramTestCase):
 
         m = TypeMember(lambda: None)
         self.assertRaises(TypeError, getattr, m, "type")
+
+    def test_callable_reentrant(self):
+        # Test a callable that reenters the object evaluation.
+        class Callable:
+            def __init__(self2):
+                self2.first = True
+
+            def __call__(self2):
+                if self2.first:
+                    self2.first = False
+                    member.object
+                return Object(self.prog, self.prog.int_type("int", 4, True))
+
+        member = TypeMember(Callable())
+        self.assertIdentical(
+            member.object, Object(self.prog, self.prog.int_type("int", 4, True))
+        )
+
+    def test_thunk_reentrant(self):
+        # Test a callable that reenters the object evaluation through the
+        # drgn_lazy_object thunk rather than the callable directly.
+        class Callable:
+            def __init__(self2):
+                self2.first = True
+
+            def __call__(self2):
+                if self2.first:
+                    self2.first = False
+                    member.object
+                return Object(self.prog, self.prog.int_type("int", 4, True))
+
+        member = self.prog.struct_type("foo", 8, [TypeMember(Callable())]).members[0]
+        self.assertIdentical(
+            member.object, Object(self.prog, self.prog.int_type("int", 4, True))
+        )
+
+    def test_callable_reentrant_finalizer(self):
+        # Test a callable that reenters the object evaluation while it is being
+        # finalized.
+        class Callable:
+            def __call__(self2):
+                return Object(self.prog, self.prog.int_type("int", 4, True))
+
+        obj = Callable()
+        member = TypeMember(obj)
+        # The weakref callback reenters the object evaluation when the callable
+        # is finalized.
+        ref = weakref.ref(obj, lambda _: member.object)  # noqa: F841
+        del obj
+
+        self.assertIdentical(
+            member.object, Object(self.prog, self.prog.int_type("int", 4, True))
+        )
 
     def test_repr(self):
         m = TypeMember(self.prog.void_type, name="foo")

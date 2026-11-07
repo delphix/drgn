@@ -1083,6 +1083,10 @@ phys_addr_t drgn_test_pa;
 unsigned long drgn_test_pfn;
 struct page *drgn_test_page;
 struct page *drgn_test_compound_page;
+#ifdef page_folio
+struct folio *drgn_test_folio;
+struct folio *drgn_test_compound_folio;
+#endif
 void *drgn_test_vmalloc_va;
 phys_addr_t drgn_test_vmalloc_pa;
 unsigned long drgn_test_vmalloc_pfn;
@@ -1095,10 +1099,14 @@ struct mem_section *drgn_test_mem_section;
 struct page *drgn_test_section_mem_map;
 struct page *drgn_test_section_decoded_mem_map;
 
+#ifdef SECTION_MARKED_PRESENT
 unsigned long drgn_test_SECTION_MARKED_PRESENT = SECTION_MARKED_PRESENT;
 struct mem_section *drgn_test_present_section = &(struct mem_section){
 	.section_mem_map = SECTION_MARKED_PRESENT,
 };
+#else
+#define present_section_nr(nr) (early_section_nr(nr) || valid_section_nr(nr))
+#endif
 
 unsigned long drgn_test_SECTION_HAS_MEM_MAP = SECTION_HAS_MEM_MAP;
 struct mem_section *drgn_test_valid_section = &(struct mem_section){
@@ -1179,6 +1187,10 @@ static int drgn_test_mm_init(void)
 	drgn_test_compound_page = alloc_pages(GFP_KERNEL | __GFP_COMP, 1);
 	if (!drgn_test_compound_page)
 		return -ENOMEM;
+#ifdef page_folio
+	drgn_test_folio = page_folio(drgn_test_page);
+	drgn_test_compound_folio = page_folio(drgn_test_compound_page);
+#endif
 	drgn_test_va = page_address(drgn_test_page);
 	// Fill the page with a PRNG sequence.
 	fill = drgn_test_prng32_seed("PAGE");

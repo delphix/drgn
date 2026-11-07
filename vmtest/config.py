@@ -15,6 +15,8 @@ from util import KernelVersion, out_of_date
 # Kernel versions that we run tests on and therefore support. Keep this in sync
 # with docs/support_matrix.rst.
 SUPPORTED_KERNEL_VERSIONS = (
+    "7.4",
+    "7.3",
     "7.2",
     "7.1",
     "7.0",
@@ -55,6 +57,7 @@ SUPPORTED_KERNEL_VERSIONS = (
 )
 
 KERNEL_ORG_COMPILER_VERSION = "12.5.0"
+PAHOLE_VERSION = "1.32"
 
 
 BASE_KCONFIG = """
@@ -536,9 +539,10 @@ class Compiler(NamedTuple):
     target: Architecture
     bin: Path
     prefix: str
+    pahole_bin: Path
 
     def env(self) -> Dict[str, str]:
-        path = str(self.bin.resolve())
+        path = str(self.bin.resolve()) + ":" + str(self.pahole_bin.resolve())
         try:
             path += ":" + os.environ["PATH"]
         except KeyError:
@@ -557,17 +561,29 @@ def compiler_url(host_name: str, target_name: str) -> str:
     return f"https://github.com/osandov/drgn/releases/download/vmtest-compilers/{compiler_name(host_name, target_name)}.tar.xz"
 
 
+def pahole_name(host_name: str) -> str:
+    return f"{host_name}-pahole-{PAHOLE_VERSION}"
+
+
+def pahole_url(host_name: str) -> str:
+    return f"https://github.com/osandov/drgn/releases/download/vmtest-compilers/{pahole_name(host_name)}.tar.xz"
+
+
 def kconfig_localversion(arch: Architecture, flavor: KernelFlavor, version: str) -> str:
     vmtest_kernel_version = [
         # Increment the major version to rebuild every
         # architecture/flavor/version combination.
-        42,
+        43,
         # The minor version makes the default flavor the "latest" version.
         1 if flavor.name == "default" else 0,
     ]
     patch_level = 0
     # If only specific architecture/flavor/version combinations need to be
     # rebuilt, conditionally increment the patch level here.
+    if arch.name == "s390x" and (
+        KernelVersion("5.10") <= KernelVersion(version) < KernelVersion("7.1")
+    ):
+        patch_level = 1
     if patch_level:
         vmtest_kernel_version.append(patch_level)
 

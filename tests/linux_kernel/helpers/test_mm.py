@@ -19,9 +19,13 @@ from drgn.helpers.linux.device import dev_name
 from drgn.helpers.linux.mm import (
     PFN_PHYS,
     PHYS_PFN,
+    PageAnon,
+    PageBuddy,
     PageCompound,
     PageHead,
+    PageKsm,
     PageSwapBacked,
+    PageSwapCache,
     PageTail,
     PageWriteback,
     access_process_vm,
@@ -43,6 +47,7 @@ from drgn.helpers.linux.mm import (
     for_each_vma,
     for_each_vmap_area,
     memory_block_size_bytes,
+    page_folio,
     page_index,
     page_size,
     page_to_pfn,
@@ -72,6 +77,7 @@ from tests.linux_kernel import (
     iter_maps,
     meminfo_field_in_pages,
     mlock,
+    mprotect,
     prctl_set_vma_anon_name,
     prng32,
     skip_if_highmem,
@@ -175,6 +181,54 @@ class TestMm(MmTestCase):
         self.assertEqual(
             page_size(self.prog["drgn_test_compound_page"]), 2 * self.prog["PAGE_SIZE"]
         )
+
+    @skip_unless_have_test_kmod
+    def test_page_folio(self):
+        try:
+            drgn_test_folio = self.prog["drgn_test_folio"]
+            drgn_test_compound_folio = self.prog["drgn_test_compound_folio"]
+        except LookupError:
+            self.skipTest("struct folio not available")
+        self.assertEqual(
+            page_folio(self.prog["drgn_test_page"]).value_(),
+            drgn_test_folio.value_(),
+        )
+        self.assertEqual(
+            page_folio(self.prog["drgn_test_compound_page"]).value_(),
+            drgn_test_compound_folio.value_(),
+        )
+        self.assertEqual(
+            page_folio(self.prog["drgn_test_compound_page"] + 1).value_(),
+            drgn_test_compound_folio.value_(),
+        )
+
+    @skip_unless_have_full_mm_support
+    @skip_if_highmem
+    def test_PageAnon(self):
+        with mmap.mmap(
+            -1, mmap.PAGESIZE, mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        ) as anon_map:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(anon_map))
+            mlock(address, mmap.PAGESIZE)
+            task = find_task(self.prog, os.getpid())
+            self.assertTrue(PageAnon(follow_page(task.mm, address)))
+        with self.map_pages() as (_, _, pfns):
+            self.assertFalse(PageAnon(pfn_to_page(self.prog, pfns[0])))
+
+    @skip_unless_have_test_kmod
+    def test_PageBuddy(self):
+        self.assertFalse(PageBuddy(self.prog["drgn_test_page"]))
+
+    @skip_unless_have_test_kmod
+    def test_PageKsm(self):
+        self.assertFalse(PageKsm(self.prog["drgn_test_page"]))
+
+    @skip_unless_have_full_mm_support
+    def test_PageSwapCache(self):
+        with self.map_pages() as (_, _, pfns):
+            page = pfn_to_page(self.prog, pfns[0])
+            self.assertTrue(PageSwapBacked(page))
+            self.assertFalse(PageSwapCache(page))
 
     @skip_unless_have_full_mm_support
     def test_decode_page_flags(self):
@@ -372,6 +426,21 @@ class TestMm(MmTestCase):
         self.assertEqual(access_remote_vm(task.mm, address, len(data)), data)
         self.assertRaises(FaultError, access_process_vm, task, 0, 8)
 
+    @unittest.skipUnless(NORMALIZED_MACHINE_NAME == "x86_64", "machine is not x86_64")
+    @skip_unless_have_full_mm_support
+    def test_access_process_vm_prot_none(self):
+        task = find_task(self.prog, os.getpid())
+        data = bytes(range(256)) * (mmap.PAGESIZE // 256)
+        with mmap.mmap(
+            -1, mmap.PAGESIZE, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        ) as map:
+            map[:] = data
+            address = ctypes.addressof(ctypes.c_char.from_buffer(map))
+            mlock(address, mmap.PAGESIZE)
+            mprotect(address, mmap.PAGESIZE, 0)  # PROT_NONE
+            self.assertEqual(access_process_vm(task, address, len(data)), data)
+            self.assertEqual(access_remote_vm(task.mm, address, len(data)), data)
+
     @skip_unless_have_full_mm_support
     @skip_if_highmem
     def test_access_process_vm_big(self):
@@ -394,11 +463,11 @@ class TestMm(MmTestCase):
 
     @skip_unless_have_full_mm_support
     def test_access_remote_vm_init_mm(self):
-        data = self.prog["UTS_RELEASE"].string_()
+        data = b"Linux version " + self.prog["UTS_RELEASE"].string_()
         self.assertEqual(
             access_remote_vm(
                 self.prog["init_mm"].address_of_(),
-                self.prog["init_uts_ns"].name.release + 0,
+                self.prog["linux_banner"].address_,
                 len(data),
             ),
             data,
