@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
 import traceback
 from typing import (
@@ -18,6 +19,7 @@ from typing import (
     Callable,
     Deque,
     Dict,
+    Iterator,
     List,
     Optional,
     Protocol,
@@ -26,6 +28,7 @@ from typing import (
     Tuple,
     Union,
 )
+import urllib.error
 
 from util import KernelVersion, nproc
 from vmtest.chroot import chroot_sh_cmd
@@ -50,6 +53,23 @@ if TYPE_CHECKING:
     else:
         from typing import ParamSpec  # novermin
     _P = ParamSpec("_P")
+
+
+_IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS") == "true"
+
+
+@contextlib.contextmanager
+def _github_workflow_group(title: str) -> Iterator[None]:
+    if not _IN_GITHUB_ACTIONS:
+        yield
+        return
+    sys.stdout.flush()
+    print("::group::" + title, file=sys.stderr, flush=True)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        print("::endgroup::", file=sys.stderr, flush=True)
 
 
 class _TestFunction(Protocol):
@@ -127,6 +147,7 @@ class _TestRunner:
 
         self._downloader = Downloader(directory)
         self._download_queue: Deque[Union[Compiler, Kernel]] = deque()
+        self._downloads_paused = False
 
         self._test_queue: Deque[Tuple[str, str, _TestFunction]] = deque()
         self._tests_running: Dict[Tuple[str, str], float] = {}
@@ -180,8 +201,11 @@ class _TestRunner:
                     update_progress |= callback()
                 if update_progress:
                     self._print_progress()
-        except Exception:
+        except Exception as e:
             traceback.print_exc()
+            if isinstance(e, urllib.error.HTTPError) and e.code == 403:
+                print("Headers:", e.headers, file=sys.stderr)
+                print("Body:", e.read().decode(), file=sys.stderr)
             return False
         finally:
             for future in self._futures:
@@ -302,6 +326,9 @@ class _TestRunner:
         with contextlib.ExitStack() as exit_stack:
             if self._foreground:
                 outfile = None
+                exit_stack.enter_context(
+                    _github_workflow_group(f"Build drgn for {arch.name}")
+                )
             else:
                 outfile = exit_stack.enter_context(
                     (self._directory / "log" / f"{arch.name}-build.log").open("w")
@@ -339,7 +366,12 @@ class _TestRunner:
 
     def _submit_next_download(self) -> bool:
         if self._download_queue:
-            self._submit(self._download, self._download_queue[0])
+            # GitHub Actions has limited disk space, so don't download too far
+            # ahead of the tests. The limit is arbitrary but works well enough.
+            if _IN_GITHUB_ACTIONS and len(self._test_queue) >= 5:
+                self._downloads_paused = True
+            else:
+                self._submit(self._download, self._download_queue[0])
         return not self._foreground
 
     def _download(self, download: Union[Compiler, Kernel]) -> Callable[[], bool]:
@@ -352,9 +384,9 @@ class _TestRunner:
     def _download_done(self, download: Union[Compiler, Kernel]) -> bool:
         popped = self._download_queue.popleft()
         assert popped is download
-        self._submit_next_download()
         if isinstance(download, Kernel):
             self._queue_kernel_test(download)
+        self._submit_next_download()
         return not self._foreground
 
     def _queue_local_test(self, arch: Architecture) -> None:
@@ -382,6 +414,9 @@ class _TestRunner:
             self._tests_running[(category_name, test_name)] = time.monotonic()
             logger.info("%s %s test started", category_name, test_name)
             self._submit(self._test_wrapper, category_name, test_name, fn)
+        if self._downloads_paused:
+            self._downloads_paused = False
+            self._submit_next_download()
 
     def _test_wrapper(
         self, category_name: str, test_name: str, fn: _TestFunction
@@ -389,6 +424,9 @@ class _TestRunner:
         with contextlib.ExitStack() as exit_stack:
             if self._foreground:
                 outfile = None
+                exit_stack.enter_context(
+                    _github_workflow_group(f"Test {category_name} {test_name}")
+                )
             else:
                 outfile = exit_stack.enter_context(
                     (self._directory / "log" / f"{category_name}-{test_name}.log").open(
@@ -420,7 +458,18 @@ class _TestRunner:
         pytest_args = "--ignore=tests/linux_kernel"
         if self._pytest_local_args is not None:
             pytest_args += " " + self._pytest_local_args
+        success = True
         if rootfs == Path("/"):
+            # make check rebuilds.
+            if not self._skip_build:
+                # Keep this in sync with setup.py.
+                build_temp = "build/temp" + sysconfig.get_config_var("EXT_SUFFIX")[:-3]
+                if subprocess.call(
+                    ["make", "-C", build_temp, f"-j{nproc() + 1}", "check"],
+                    stdout=outfile,
+                    stderr=outfile,
+                ):
+                    success = False
             args = [
                 sys.executable,
                 "-m",
@@ -448,7 +497,7 @@ mount --bind . "$1/mnt"
                 "sh",
                 str(rootfs),
             ]
-        return subprocess.call(args, stdout=outfile, stderr=outfile) == 0
+        return subprocess.call(args, stdout=outfile, stderr=outfile) == 0 and success
 
     def _test_kernel(self, kernel: Kernel, *, outfile: Optional[TextIO] = None) -> bool:
         rootfs = self._rootfs(kernel.arch)
@@ -512,6 +561,11 @@ fi
         ) as e:
             print(e, file=sys.stderr if outfile is None else outfile)
             return False
+        finally:
+            # We won't use the kernel again, so free up disk space.
+            if _IN_GITHUB_ACTIONS:
+                logger.info("deleting kernel %s", kernel.release)
+                shutil.rmtree(kernel.path)
 
 
 if __name__ == "__main__":
