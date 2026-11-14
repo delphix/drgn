@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-from drgn import Object, Program
+from drgn import Architecture, Object, Platform, PlatformFlags, Program
 from tests import TestCase
 from tests.resources import get_resource
 
@@ -32,6 +32,15 @@ class TestLinuxUserspaceCoreDump(TestCase):
         self.assertIsNone(self.trace[7].function_name)
         self.assertIsNone(self.trace[8].function_name)
 
+    def test_stack_frame_contains(self):
+        self.assertIn("cm", self.trace[0])
+        self.assertNotIn("foo", self.trace[0])
+        self.assertNotIn(1, self.trace[0])
+        # Make sure that calling the method directly also works.
+        self.assertIs(self.trace[0].__contains__("cm"), True)
+        self.assertIs(self.trace[0].__contains__("foo"), False)
+        self.assertIs(self.trace[0].__contains__(1), False)
+
     def test_stack_trace_type_error(self):
         self.assertRaises(
             TypeError,
@@ -52,4 +61,21 @@ class TestLinuxUserspaceCoreDump(TestCase):
             TypeError,
             self.prog.stack_trace,
             Object(self.prog, self.prog.pointer_type(self.prog.struct_type(None)), 0),
+        )
+
+
+class TestStackTraceFromPcs(TestCase):
+    def test_no_platform(self):
+        self.assertRaises(ValueError, Program().stack_trace_from_pcs, [0xDEADBEEF])
+
+    def test_unknown_platform(self):
+        self.assertRaises(
+            NotImplementedError,
+            Program(
+                Platform(
+                    Architecture.UNKNOWN,
+                    PlatformFlags.IS_64_BIT | PlatformFlags.IS_LITTLE_ENDIAN,
+                )
+            ).stack_trace_from_pcs,
+            [0xDEADBEEF],
         )
