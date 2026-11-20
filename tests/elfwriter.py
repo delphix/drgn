@@ -17,12 +17,13 @@ class ElfSection:
         name: Optional[str] = None,
         sh_type: Optional[SHT] = None,
         p_type: Optional[PT] = None,
+        p_offset: Optional[int] = None,
         vaddr: int = 0,
         paddr: int = 0,
         memsz: Optional[int] = None,
         p_align: int = 0,
-        sh_link: int = 0,
-        sh_info: int = 0,
+        sh_link: Union[int, str] = 0,
+        sh_info: Union[int, str] = 0,
         sh_entsize: int = 0,
         sh_flags: SHF = SHF(0),
     ):
@@ -31,6 +32,7 @@ class ElfSection:
         self.sh_type = sh_type
         self.sh_flags = sh_flags
         self.p_type = p_type
+        self.p_offset = p_offset
         self.vaddr = vaddr
         self.paddr = paddr
         self.memsz = memsz
@@ -117,7 +119,7 @@ def _create_symtab(
             name=symtab_name,
             sh_type=SHT.DYNSYM if dynamic else SHT.SYMTAB,
             data=symtab_data,
-            sh_link=sum((1 for section in sections if section.name is not None), 2),
+            sh_link=strtab_name,
             sh_info=sh_info,
             sh_entsize=symbol_struct.size,
         )
@@ -211,20 +213,34 @@ def create_elf_file(
             )
         )
 
+    shstrtab = bytearray(1)
+    shstrtab_offsets = {"": 0}
+
+    def add_to_shstrtab(name):
+        if name not in shstrtab_offsets:
+            shstrtab_offsets[name] = len(shstrtab)
+            shstrtab.extend(name.encode())
+            shstrtab.append(0)
+
     shnum = 0
     phnum = 0
-    shstrtab = bytearray(1)
+    section_indices = {}
     for section in sections:
         if section.name is not None:
-            shstrtab.extend(section.name.encode())
-            shstrtab.append(0)
+            add_to_shstrtab(section.name)
             shnum += 1
+            section_indices.setdefault(section.name, shnum)
         if section.p_type is not None:
             phnum += 1
     if shnum > 0:
         shnum += 2  # One for the SHT_NULL section, one for .shstrtab.
-        shstrtab.extend(b".shstrtab\0")
+        add_to_shstrtab(".shstrtab")
         sections.append(ElfSection(name=".shstrtab", sh_type=SHT.STRTAB, data=shstrtab))
+
+    def section_index(index_or_name):
+        if isinstance(index_or_name, str):
+            return section_indices[index_or_name]
+        return index_or_name
 
     shdr_offset = ehdr_struct.size
     phdr_offset = shdr_offset + shdr_struct.size * shnum
@@ -267,7 +283,14 @@ def create_elf_file(
     shdr_offset += shdr_struct.size
     for section in sections:
         ch_addralign = 1 if section.p_type is None else bits // 8
-        memsz = len(section.data) if section.memsz is None else section.memsz
+        if section.p_align:
+            padding = section.vaddr % section.p_align - len(buf) % section.p_align
+            buf.extend(bytes(padding))
+        data_offset = len(buf)
+        p_offset = data_offset if section.p_offset is None else section.p_offset
+        assert p_offset <= data_offset
+        p_filesz = data_offset + len(section.data) - p_offset
+        memsz = p_filesz if section.memsz is None else section.memsz
         if section.sh_flags & SHF.COMPRESSED:
             sh_addralign = bits // 8
             compressed_data = zlib.compress(section.data)
@@ -275,21 +298,18 @@ def create_elf_file(
         else:
             sh_addralign = ch_addralign
             sh_size = memsz
-        if section.p_align:
-            padding = section.vaddr % section.p_align - len(buf) % section.p_align
-            buf.extend(bytes(padding))
         if section.name is not None:
             shdr_struct.pack_into(
                 buf,
                 shdr_offset,
-                shstrtab.index(section.name.encode()),  # sh_name
+                shstrtab_offsets[section.name],  # sh_name
                 section.sh_type,  # sh_type
                 section.sh_flags,  # sh_flags
                 section.vaddr,  # sh_addr
                 len(buf),  # sh_offset
                 sh_size,  # sh_size
-                section.sh_link,  # sh_link
-                section.sh_info,  # sh_info
+                section_index(section.sh_link),  # sh_link
+                section_index(section.sh_info),  # sh_info
                 sh_addralign,  # sh_addralign
                 section.sh_entsize,  # sh_entsize
             )
@@ -302,10 +322,10 @@ def create_elf_file(
                     phdr_offset,
                     section.p_type,  # p_type
                     flags,  # p_flags
-                    len(buf),  # p_offset
+                    p_offset,  # p_offset
                     section.vaddr,  # p_vaddr
                     section.paddr,  # p_paddr
-                    len(section.data),  # p_filesz
+                    p_filesz,  # p_filesz
                     memsz,  # p_memsz
                     section.p_align,  # p_align
                 )
@@ -314,10 +334,10 @@ def create_elf_file(
                     buf,
                     phdr_offset,
                     section.p_type,  # p_type
-                    len(buf),  # p_offset
+                    p_offset,  # p_offset
                     section.vaddr,  # p_vaddr
                     section.paddr,  # p_paddr
-                    len(section.data),  # p_filesz
+                    p_filesz,  # p_filesz
                     memsz,  # p_memsz
                     flags,  # p_flags
                     section.p_align,  # p_align

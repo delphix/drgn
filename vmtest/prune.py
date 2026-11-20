@@ -11,12 +11,24 @@ from pathlib import Path
 import re
 import shutil
 import sys
-from typing import Any, Awaitable, Callable, Dict, Iterable, List, Tuple, TypeVar
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Container,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 import aiohttp
 
 from util import KernelVersion
-from vmtest.download import VMTEST_GITHUB_RELEASE
+from vmtest.config import ARCHITECTURES, KERNEL_FLAVORS
+from vmtest.download import github_release_cache, vmtest_github_release
 from vmtest.githubapi import AioGitHubApi
 
 logger = logging.getLogger(__name__)
@@ -49,6 +61,8 @@ async def _prune(
     kernels: Iterable[Tuple[str, str, _AssetT]],
     kmods: Iterable[Tuple[str, str, _AssetT]] = (),
     keep: int,
+    flavors: Optional[Container[str]],
+    yes: bool,
     asset_name: Callable[[_AssetT], str],
     delete_asset: Callable[[_AssetT], Awaitable[None]],
 ) -> int:
@@ -75,12 +89,16 @@ async def _prune(
 
     kernels_to_keep = {(release, arch) for release, arch, _ in unrecognized_kernels}
     kernels_to_delete: List[Tuple[str, str, _AssetT]] = []
-    for (_, _, arch), kernel_group in grouped_kernels.items():
+    for (_, flavor, arch), kernel_group in grouped_kernels.items():
         kernel_group.sort(key=lambda x: KernelVersion(x[0]), reverse=True)
-        for release, _ in kernel_group[:keep]:
+        if flavors is None or flavor in flavors:
+            group_keep = keep
+        else:
+            group_keep = len(kernel_group)
+        for release, _ in kernel_group[:group_keep]:
             kernels_to_keep.add((release, arch))
         kernels_to_delete.extend(
-            (release, arch, asset) for release, asset in kernel_group[keep:]
+            (release, arch, asset) for release, asset in kernel_group[group_keep:]
         )
     kernels_to_delete.sort(key=_kernel_asset_sort_key)
 
@@ -107,7 +125,7 @@ async def _prune(
     if not kernels_to_delete and not kmods_to_delete:
         return 0
 
-    if not _prompt_yes_no("Continue?", default=False):
+    if not yes and not _prompt_yes_no("Continue?", default=False):
         return 1
 
     to_delete = kernels_to_delete + kmods_to_delete
@@ -154,22 +172,54 @@ async def main() -> None:
     parser.add_argument(
         "-k", "--keep", type=int, default=1, help="number of latest kernels to keep"
     )
+    parser.add_argument(
+        "-a",
+        "--architecture",
+        dest="architectures",
+        choices=sorted(ARCHITECTURES),
+        action="append",
+        default=argparse.SUPPRESS,
+        help="only prune given architecture; may be given multiple times (default: all)",
+    )
+    parser.add_argument(
+        "-f",
+        "--flavor",
+        dest="flavors",
+        choices=list(KERNEL_FLAVORS),
+        action="append",
+        default=argparse.SUPPRESS,
+        help="only prune given flavor; may be given multiple times (default: all)",
+    )
+    parser.add_argument(
+        "-y", "--yes", action="store_true", help="don't ask for confirmation"
+    )
     args = parser.parse_args()
 
     if args.keep <= 0:
         sys.exit("keep must be >= 1")
 
+    architectures = [
+        arch
+        for arch in ARCHITECTURES.values()
+        if arch.name in getattr(args, "architectures", ARCHITECTURES)
+    ]
+    flavors = getattr(args, "flavors", None)
+
     if args.local:
         status = await _prune(
             kernels=(
-                (kernel.name[len("kernel-") :], kernel.parent.name, kernel)
-                for kernel in args.directory.glob("*/kernel-*")
+                (kernel.name[len("kernel-") :], arch.name, kernel)
+                for arch in architectures
+                for kernel in (args.directory / arch.name).glob("kernel-*")
             ),
             kmods=(
-                (kmod.name[len("drgn_test-") : -len(".ko")], kmod.parent.name, kmod)
-                for kmod in args.directory.glob("*/drgn_test-*.ko")
+                (kmod.name[len("drgn_test-") : -len(".ko")], arch.name, kmod)
+                for arch in architectures
+                for kmod in (args.directory / arch.name).glob("drgn_test-*.ko")
             ),
             keep=args.keep,
+            flavors=flavors,
+            yes=args.yes,
             asset_name=str,
             delete_asset=_delete_local_asset,
         )
@@ -180,19 +230,24 @@ async def main() -> None:
         async with aiohttp.ClientSession(trust_env=True) as session:
             gh = AioGitHubApi(session, GITHUB_TOKEN)
 
-            github_release = await gh.get_release_by_tag(
-                *VMTEST_GITHUB_RELEASE, cache=args.directory / "github_release.json"
-            )
-
             kernels = []
-            for asset in github_release["assets"]:
-                match = re.fullmatch(
-                    r"kernel-(?P<release>.*)\.(?P<arch>[^.]+)\.tar\.zst", asset["name"]
+            for arch in architectures:
+                cache = github_release_cache(args.directory, arch)
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                github_release = await gh.get_release_by_tag(
+                    *vmtest_github_release(arch), cache=cache
                 )
-                if match:
-                    kernels.append((match.group("release"), match.group("arch"), asset))
-                elif asset["name"].startswith("kernel-"):
-                    logger.warning("ignoring unrecognized kernel: %s", asset["name"])
+                for asset in github_release["assets"]:
+                    match = re.fullmatch(
+                        rf"kernel-(?P<release>.*)\.{re.escape(arch.name)}\.tar\.zst",
+                        asset["name"],
+                    )
+                    if match:
+                        kernels.append((match.group("release"), arch.name, asset))
+                    elif asset["name"].startswith("kernel-"):
+                        logger.warning(
+                            "ignoring unrecognized kernel: %s", asset["name"]
+                        )
 
             async def _delete_remote_asset(asset: Dict[str, Any]) -> None:
                 await gh.delete(asset["url"])
@@ -200,6 +255,8 @@ async def main() -> None:
             status = await _prune(
                 kernels=kernels,
                 keep=args.keep,
+                flavors=flavors,
+                yes=args.yes,
                 asset_name=operator.itemgetter("name"),
                 delete_asset=_delete_remote_asset,
             )
