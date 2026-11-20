@@ -92,6 +92,12 @@ umount -n -l /mnt
 # Enable cgroup controllers.
 echo +cpu > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null || true
 
+# Don't use transparent hugepages automatically. Collapsing can race with MM
+# tests.
+if [ -e /sys/kernel/mm/transparent_hugepage/enabled ]; then
+	echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+fi
+
 # Load kernel modules.
 mkdir -p "/lib/modules/$RELEASE"
 mount --bind {kernel_dir} "/lib/modules/$RELEASE"
@@ -244,6 +250,7 @@ def run_in_vm(
     test_kmod: TestKmodMode = TestKmodMode.NONE,
     interactive: bool = False,
     outfile: Optional[TextIO] = None,
+    timeout: Optional[float] = None,
 ) -> int:
     if root_dir is None:
         if kernel.arch is HOST_ARCHITECTURE:
@@ -304,7 +311,7 @@ def run_in_vm(
     # multidevs was added in QEMU 4.2.0.
     if qemu_version >= (4, 2):
         virtfs_options += ",multidevs=remap"
-    _9pfs_mount_options = f"trans=virtio,cache=loose,msize={1024 * 1024}"
+    _9pfs_mount_options = f"trans=virtio,cache=loose,msize={256 * 1024}"
 
     with contextlib.ExitStack() as exit_stack:
         temp_path = Path(
@@ -438,12 +445,15 @@ def run_in_vm(
                 raise LostVMError(
                     f"QEMU did not connect within {server_sock.gettimeout()} seconds"
                 )
+            sock.settimeout(timeout)
             status_buf = bytearray()
             while True:
                 try:
                     buf = sock.recv(4)
                 except ConnectionResetError:
                     buf = b""
+                except socket.timeout:
+                    raise LostVMError(f"VM timed out after {timeout} seconds")
                 if not buf:
                     break
                 status_buf.extend(buf)
