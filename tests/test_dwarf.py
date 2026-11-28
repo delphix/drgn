@@ -8,7 +8,7 @@ import os.path
 import re
 import tempfile
 
-from _drgn_util.elf import PT, SHF, SHT, STB, STT
+from _drgn_util.elf import ET, PT, SHF, SHT, STB, STT
 import drgn
 from drgn import (
     AbsenceReason,
@@ -691,6 +691,19 @@ class TestTypes(TestCase):
             )
         )
         self.assertIdentical(prog.type("TEST").type, prog.struct_type(None, 0, ()))
+
+    def test_struct_large_byte_size(self):
+        prog = dwarf_program(
+            wrap_test_type_dies(
+                DwarfDie(
+                    DW_TAG.structure_type,
+                    (DwarfAttrib(DW_AT.byte_size, DW_FORM.data8, 0x100000004),),
+                )
+            )
+        )
+        self.assertIdentical(
+            prog.type("TEST").type, prog.struct_type(None, 0x100000004, ())
+        )
 
     def test_struct_incomplete(self):
         prog = dwarf_program(
@@ -4451,6 +4464,24 @@ class TestTypes(TestCase):
         )
         self.assertEqual(alignof(prog.type("TEST")), 64)
 
+    def test_many_skipped_attribs(self):
+        prog = dwarf_program(
+            (
+                DwarfDie(
+                    DW_TAG.typedef,
+                    [
+                        # Test a mix of large and small attribute sizes.
+                        *([DwarfAttrib(DW_AT.hi_user, DW_FORM.data8, 0)] * 32),
+                        *([DwarfAttrib(DW_AT.hi_user, DW_FORM.data1, 0)] * 64),
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "TEST"),
+                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                    ],
+                ),
+                *labeled_int_die,
+            )
+        )
+        self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
+
 
 class TestObjects(TestCase):
     def test_constant_signed_enum(self):
@@ -4550,6 +4581,67 @@ class TestObjects(TestCase):
                 4096,
             ),
         )
+
+    def test_constant_declaration_enum(self):
+        # enumerator children on a declaration enumeration_type should be
+        # ignored.
+        prog = dwarf_program(
+            (
+                DwarfDie(
+                    DW_TAG.enumeration_type,
+                    (
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "color"),
+                        DwarfAttrib(DW_AT.declaration, DW_FORM.flag_present, True),
+                    ),
+                    (
+                        DwarfDie(
+                            DW_TAG.enumerator,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "RED"),
+                                DwarfAttrib(DW_AT.const_value, DW_FORM.data1, 0),
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        )
+        self.assertRaises(ObjectNotFoundError, prog.constant, "RED")
+
+    def test_constant_enum_specification_not_enum(self):
+        # A declaration DW_TAG_enumeration_type whose definition (via
+        # DW_AT_specification) is something other than an enumerated type.
+        prog = dwarf_program(
+            (
+                *labeled_int_die,
+                DwarfLabel("declaration"),
+                DwarfDie(
+                    DW_TAG.enumeration_type,
+                    (
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "color"),
+                        DwarfAttrib(DW_AT.type, DW_FORM.ref4, "int_die"),
+                        DwarfAttrib(DW_AT.declaration, DW_FORM.flag_present, True),
+                    ),
+                    (
+                        DwarfDie(
+                            DW_TAG.enumerator,
+                            (
+                                DwarfAttrib(DW_AT.name, DW_FORM.string, "RED"),
+                                DwarfAttrib(DW_AT.const_value, DW_FORM.data1, 0),
+                            ),
+                        ),
+                    ),
+                ),
+                DwarfDie(
+                    DW_TAG.structure_type,
+                    (
+                        DwarfAttrib(DW_AT.name, DW_FORM.string, "color"),
+                        DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 4),
+                        DwarfAttrib(DW_AT.specification, DW_FORM.ref4, "declaration"),
+                    ),
+                ),
+            )
+        )
+        self.assertRaises(ObjectNotFoundError, prog.constant, "RED")
 
     def test_function(self):
         prog = dwarf_program(
@@ -7141,12 +7233,47 @@ class TestProgram(TestCase):
 
 
 class TestCompressedDebugSections(TestCase):
+    # int_die using DW_FORM_strp instead of DW_FORM_string to exercise
+    # .{z,}debug_str.
+    int_die = DwarfDie(
+        DW_TAG.base_type,
+        (
+            DwarfAttrib(DW_AT.byte_size, DW_FORM.data1, 4),
+            DwarfAttrib(DW_AT.encoding, DW_FORM.data1, DW_ATE.signed),
+            DwarfAttrib(DW_AT.name, DW_FORM.strp, "int"),
+        ),
+    )
+
     def test_zlib_gnu(self):
-        prog = dwarf_program(wrap_test_type_dies(int_die), compress="zlib-gnu")
+        prog = dwarf_program(wrap_test_type_dies(self.int_die), compress="zlib-gnu")
         self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
 
     def test_zlib_gabi(self):
-        prog = dwarf_program(wrap_test_type_dies(int_die), compress="zlib-gabi")
+        prog = dwarf_program(wrap_test_type_dies(self.int_die), compress="zlib-gabi")
+        self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
+
+    def test_zlib_gabi_relocatable(self):
+        prog = dwarf_program(
+            wrap_test_type_dies(self.int_die),
+            compress="zlib-gabi",
+            elf_type=ET.REL,
+            sections=(
+                ElfSection(
+                    name=".symtab",
+                    sh_type=SHT.SYMTAB,
+                    data=bytes(24),
+                    sh_entsize=24,
+                ),
+                ElfSection(
+                    name=".rela.debug_info",
+                    sh_type=SHT.RELA,
+                    data=bytes(24),  # R_X86_64_NONE
+                    sh_link=".symtab",
+                    sh_info=".debug_info",
+                    sh_entsize=24,
+                ),
+            ),
+        )
         self.assertIdentical(prog.type("TEST").type, prog.int_type("int", 4, True))
 
 
@@ -8921,6 +9048,106 @@ class TestSourceLocation(TestCase):
         self.assertEqual(locs[0].name(), "callee")
         self.assertEqual(tuple(locs[1]), ("/usr/src/main.c", 2, 2))
         self.assertEqual(locs[1].name(), "caller")
+
+    def test_function_in_namespace(self):
+        prog = self.dwarf_lnp_program(
+            dies=(
+                *labeled_int_die,
+                DwarfDie(
+                    DW_TAG.namespace,
+                    (DwarfAttrib(DW_AT.name, DW_FORM.string, "moho"),),
+                    (
+                        DwarfDie(
+                            DW_TAG.namespace,
+                            (DwarfAttrib(DW_AT.name, DW_FORM.string, "eve"),),
+                            (
+                                DwarfDie(
+                                    DW_TAG.subprogram,
+                                    (
+                                        DwarfAttrib(
+                                            DW_AT.name, DW_FORM.string, "caller"
+                                        ),
+                                        DwarfAttrib(DW_AT.low_pc, DW_FORM.addr, 0x100),
+                                        DwarfAttrib(DW_AT.high_pc, DW_FORM.addr, 0x108),
+                                    ),
+                                    (
+                                        DwarfDie(
+                                            DW_TAG.variable,
+                                            (
+                                                DwarfAttrib(
+                                                    DW_AT.name, DW_FORM.string, "x"
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.type, DW_FORM.ref4, "int_die"
+                                                ),
+                                            ),
+                                        ),
+                                        DwarfDie(
+                                            DW_TAG.inlined_subroutine,
+                                            (
+                                                DwarfAttrib(
+                                                    DW_AT.abstract_origin,
+                                                    DW_FORM.ref4,
+                                                    "callee_die",
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.low_pc, DW_FORM.addr, 0x104
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.high_pc, DW_FORM.addr, 0x108
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.call_file,
+                                                    DW_FORM.udata,
+                                                    "main.c",
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.call_line, DW_FORM.udata, 2
+                                                ),
+                                                DwarfAttrib(
+                                                    DW_AT.call_column, DW_FORM.udata, 2
+                                                ),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                                DwarfLabel("callee_die"),
+                                DwarfDie(
+                                    DW_TAG.subprogram,
+                                    (
+                                        DwarfAttrib(
+                                            DW_AT.name, DW_FORM.string, "callee"
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            lnp=create_dwarf_lnp(
+                (
+                    (0x100, "main.c", 1, 1),
+                    (0x104, "main.c", 6, 4),
+                    (0x108, "main.c", 10, 1),
+                    (0x10C, None, None, None),
+                ),
+                comp_dir="/usr/src",
+                file_name="main.c",
+            ),
+            low_pc=0x100,
+            high_pc=0x10C,
+        )
+        locs = prog.source_location(0x104)
+        self.assertEqual(len(locs), 2)
+        self.assertEqual(tuple(locs[0]), ("/usr/src/main.c", 6, 4))
+        self.assertEqual(locs[0].name(), "callee")
+        self.assertEqual(tuple(locs[1]), ("/usr/src/main.c", 2, 2))
+        self.assertEqual(locs[1].name(), "caller")
+
+        trace = prog.stack_trace_from_pcs([0x105])
+        self.assertEqual([frame.function_name for frame in trace], ["callee", "caller"])
+        self.assertEqual(trace[1].locals(), ["x"])
 
     def test_assembly(self):
         prog = self.dwarf_lnp_program(

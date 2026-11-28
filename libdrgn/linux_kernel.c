@@ -380,7 +380,6 @@ linux_kernel_get_vmcoreinfo(struct drgn_program *prog, struct drgn_object *ret)
 static struct drgn_error *
 linux_kernel_get_vmemmap_address(struct drgn_program *prog, uint64_t *ret)
 {
-	static const uint64_t SECTION_HAS_MEM_MAP = 0x2;
 	static const uint64_t SECTION_MAP_MASK = ~((UINT64_C(1) << 6) - 1);
 	struct drgn_error *err;
 
@@ -395,6 +394,30 @@ linux_kernel_get_vmemmap_address(struct drgn_program *prog, uint64_t *ret)
 			// !CONFIG_SPARSEMEM_VMEMMAP
 			err = &drgn_not_found;
 		}
+		return err;
+	}
+
+	// Since Linux kernel commit ed7802dd48f7 ("mm: memory_hotplug: enumerate
+	// all supported section flags") (in v6.0), the section flags are an
+	// anonymous enum. Before that, they were macros. SECTION_HAS_MEM_MAP
+	// didn't change until Linux kernel commit da7acb8982ed ("mm/sparse:
+	// remove SECTION_MARKED_PRESENT") (in v7.4).
+	uint64_t SECTION_HAS_MEM_MAP;
+	err = drgn_program_find_object(prog, "SECTION_HAS_MEM_MAP_BIT", NULL,
+				       DRGN_FIND_OBJECT_CONSTANT, &section);
+	if (!err) {
+		union drgn_value bit;
+		err = drgn_object_read_integer(&section, &bit);
+		if (err)
+			return err;
+		if (bit.uvalue >= 64) {
+			return drgn_error_create(DRGN_ERROR_BAD_DATA,
+						 "invalid SECTION_HAS_MEM_MAP_BIT");
+		}
+		SECTION_HAS_MEM_MAP = UINT64_C(1) << bit.uvalue;
+	} else if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
+		SECTION_HAS_MEM_MAP = 0x2;
+	} else {
 		return err;
 	}
 
@@ -552,7 +575,7 @@ linux_kernel_get_sections_per_root_impl(struct drgn_program *prog, uint64_t *ret
 			       &sizeof_mem_section);
 	if (err)
 		return err;
-	if (!is_power_of_two(sizeof_mem_section)
+	if (sizeof_mem_section == 0
 	    || sizeof_mem_section > prog->vmcoreinfo.page_size) {
 		return drgn_error_create(DRGN_ERROR_BAD_DATA,
 					 "struct mem_section has invalid size");
@@ -625,7 +648,8 @@ linux_kernel_get_max_physmem_bits_impl(struct drgn_program *prog, int64_t *ret)
 		//                       + SECTION_SIZE_BITS
 		//
 		// (NR_SECTION_ROOTS and SECTIONS_PER_ROOT are always powers of
-		// two.)
+		// two before Linux kernel commit 48070b721a60 ("mm/sparse:
+		// relax struct mem_section size constraints") (in v7.4).)
 		//
 		// => MAX_PHYSMEM_BITS = log2(NR_SECTION_ROOTS)
 		//                       + log2(SECTIONS_PER_ROOT)
@@ -1532,9 +1556,12 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 				.key = state->modules[i]->name,
 				.value = VECTOR_INIT,
 			};
-			if (drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
-							     &entry, NULL) < 0)
+			int r = drgn_kmod_walk_module_map_insert(&state->kmod_walk.modules,
+								 &entry, NULL);
+			if (r < 0)
 				return &drgn_enomem;
+			if (r == 0)
+				state->kmod_walk.duplicate_names = true;
 		}
 	}
 
@@ -1545,11 +1572,14 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 	for (;;) {
 		if (i >= char_p_vector_size(&it.entry->value)) {
 			// No matches remaining for this module. Clear the old
-			// matches and find another one.
-			vector_for_each(char_p_vector, path, &it.entry->value)
-				free(*path);
-			char_p_vector_clear(&it.entry->value);
-			i = 0;
+			// matches if we can, then find another one.
+			if (!state->kmod_walk.duplicate_names) {
+				vector_for_each(char_p_vector, path,
+						&it.entry->value)
+					free(*path);
+				char_p_vector_clear(&it.entry->value);
+				i = 0;
+			}
 
 			err = drgn_kmod_walk(module->prog, options,
 					     &state->kmod_walk, it.entry);
@@ -1566,10 +1596,12 @@ drgn_module_try_linux_kmod_files(struct drgn_module *module,
 		if (!drgn_module_wants_file(module))
 			break;
 	}
-	// We won't need any more matches for this module.
-	drgn_kmod_walk_module_map_entry_deinit(it.entry);
-	drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
-						  it);
+	if (!state->kmod_walk.duplicate_names) {
+		// We won't need any more matches for this module.
+		drgn_kmod_walk_module_map_entry_deinit(it.entry);
+		drgn_kmod_walk_module_map_delete_iterator(&state->kmod_walk.modules,
+							  it);
+	}
 	return NULL;
 }
 
@@ -2079,6 +2111,7 @@ kernel_module_set_section_addresses_live(struct drgn_module *module)
 		_cleanup_fclose_ FILE *file = fdopen(fd, "r");
 		if (!file)
 			return drgn_error_create_os("fdopen", errno, NULL);
+		fd = -1; // Owned by file now.
 		uint64_t address;
 		if (fscanf(file, "%" SCNx64, &address) != 1) {
 			return drgn_error_format(DRGN_ERROR_BAD_DATA,
@@ -2235,9 +2268,9 @@ kernel_module_set_section_addresses(struct drgn_module *module,
 			// Before that, the section address is in struct
 			// module_sect_attr::address.
 			err = drgn_object_member(&tmp, &attr, "address");
-			if (err)
-				return err;
 		}
+		if (err)
+			return err;
 		uint64_t address;
 		err = drgn_object_read_unsigned(&tmp, &address);
 		if (err)
@@ -2585,180 +2618,5 @@ linux_kernel_loaded_module_iterator_create(struct drgn_program *prog,
 	it->module_list_iterations_remaining = MAX_MODULE_LIST_ITERATIONS;
 	drgn_object_init(&it->node, prog);
 	*ret = &it->it;
-	return NULL;
-}
-
-static struct drgn_error *
-linux_cpu_present_mask(struct drgn_program *prog, uint64_t **bitmap_ret,
-		       size_t *size_ret)
-{
-	// This C implementation is not exposed as a drgn helper because it doesn't
-	// really provide any benefit over the Python implementation. We would need
-	// to wrap this in another Python function in order to provide the existing
-	// "default program" behavior that cpu_present_mask() already provides.
-	// Rather than add the extra boilerplate and complexity, have this copy for
-	// internal use.
-	struct drgn_error *err;
-
-	DRGN_OBJECT(tmp, prog);
-	err = drgn_program_find_object(prog, "__cpu_present_mask", NULL,
-				       DRGN_FIND_OBJECT_VARIABLE, &tmp);
-	if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP)) {
-		err = drgn_program_find_object(prog, "cpu_present_mask", NULL,
-							DRGN_FIND_OBJECT_VARIABLE, &tmp);
-		if (err)
-			return err;
-		err = drgn_object_dereference(&tmp, &tmp);
-	}
-	if (err)
-		return err;
-
-	err = drgn_object_member(&tmp, &tmp, "bits");
-	if (err)
-		return err;
-
-	uint64_t bitmap_addr = tmp.address;
-	DRGN_OBJECT(nr_cpu_ids_obj, prog);
-	uint64_t nr_cpu_ids;
-	err = drgn_program_find_object(prog, "nr_cpu_ids", NULL,
-				       DRGN_FIND_OBJECT_VARIABLE, &nr_cpu_ids_obj);
-	if (err) {
-		if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP))
-			nr_cpu_ids = 1;
-		else
-			return err;
-	} else {
-		err = drgn_object_read_unsigned(&nr_cpu_ids_obj, &nr_cpu_ids);
-		if (err)
-			return err;
-	}
-	// A bogus value could overflow a size_t in our size calculations.
-	if (nr_cpu_ids > SIZE_MAX - 63)
-		return &drgn_enomem;
-
-	bool is_64_bit;
-	err = drgn_program_is_64_bit(prog, &is_64_bit);
-	if (err)
-		return err;
-
-	bool bswap;
-	err = drgn_program_bswap(prog, &bswap);
-	if (err)
-		return err;
-
-	size_t size = (nr_cpu_ids + 63) / 64;
-	_cleanup_free_ uint64_t *bitmap = calloc(size, sizeof(*bitmap));
-	if (!bitmap)
-		return &drgn_enomem;
-
-	if (is_64_bit) {
-		err = drgn_program_read_memory(prog, bitmap, bitmap_addr, size * 8, false);
-		if (err)
-			return err;
-
-		if (bswap)
-			for (size_t i = 0; i < size; i++)
-				bitmap[i] = bswap_64(bitmap[i]);
-	} else {
-		size_t nr_words = (nr_cpu_ids + 31) / 32;
-		_cleanup_free_ uint32_t *orig = malloc_array(nr_words, sizeof(*orig));
-		if (!orig)
-			return &drgn_enomem;
-
-		err = drgn_program_read_memory(prog, orig, bitmap_addr, nr_words * 4, false);
-		if (err)
-			return err;
-
-		for (size_t i = 0; i < nr_words; i++) {
-			uint32_t value = bswap ? bswap_32(orig[i]) : orig[i];
-			if (i & 1)
-				bitmap[i >> 1] |= (uint64_t) value << 32;
-			else
-				bitmap[i >> 1] |= value;
-		}
-	}
-
-	*bitmap_ret = no_cleanup_ptr(bitmap);
-	*size_ret = nr_cpu_ids;
-	return NULL;
-}
-
-DEFINE_VECTOR(uint64_vector, uint64_t);
-
-struct drgn_error *
-drgn_program_is_irq_regs(struct drgn_program *prog, uint64_t addr,
-                         bool *ret)
-{
-	if (!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) ||
-	    (prog->flags & DRGN_PROGRAM_IS_LIVE)) {
-		*ret = false;
-		return NULL;
-	}
-
-	if (!prog->irq_regs_cached) {
-		struct drgn_error *err;
-		DRGN_OBJECT(irq_regs_obj, prog);
-
-		err = drgn_program_find_object(prog, "__irq_regs", NULL,
-					       DRGN_FIND_OBJECT_VARIABLE, &irq_regs_obj);
-		if (err)
-			return err;
-
-		err = drgn_object_address_of(&irq_regs_obj, &irq_regs_obj);
-		if (err)
-			return err;
-
-		_cleanup_free_ uint64_t *cpumask = NULL;
-		size_t nr_cpus;
-		err = linux_cpu_present_mask(prog, &cpumask, &nr_cpus);
-		if (err)
-			return err;
-
-		DRGN_OBJECT(percpu_regs, prog);
-		VECTOR(uint64_vector, addresses);
-		uint64_t regs_ptr;
-		for (size_t word_index = 0, num_words = (nr_cpus + 63) / 64;
-		     word_index < num_words; word_index++) {
-			uint64_t word = cpumask[word_index];
-			unsigned int i;
-			for_each_bit(i, word) {
-				size_t cpu = word_index * 64 + i;
-				err = linux_helper_per_cpu_ptr(&percpu_regs, &irq_regs_obj, cpu);
-				if (err)
-					return err;
-				err = drgn_object_dereference(&percpu_regs, &percpu_regs);
-				if (err)
-					return err;
-				err = drgn_object_read_unsigned(&percpu_regs, &regs_ptr);
-				if (err)
-					return err;
-				if (!regs_ptr)
-					continue;
-				drgn_log_debug(prog, "irq_regs: cpu %zu: %"PRIx64, cpu, regs_ptr);
-				if (!uint64_vector_append(&addresses, &regs_ptr))
-					return &drgn_enomem;
-			}
-		}
-		drgn_log_debug(prog, "irq_regs: loaded %zu per-cpu __irq_regs",
-			       uint64_vector_size(&addresses));
-
-		// A signal value so we don't need to store length in the
-		// program. The array won't need random access, so this is a
-		// reasonable tradeoff.
-		regs_ptr = 0;
-		if (!uint64_vector_append(&addresses, &regs_ptr))
-			return &drgn_enomem;
-
-		uint64_vector_shrink_to_fit(&addresses);
-		uint64_vector_steal(&addresses, &prog->irq_regs_cached, NULL);
-	}
-
-	for (size_t i = 0; prog->irq_regs_cached[i]; i++) {
-		if (prog->irq_regs_cached[i] == addr) {
-			*ret = true;
-			return NULL;
-		}
-	}
-	*ret = false;
 	return NULL;
 }

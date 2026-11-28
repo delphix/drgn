@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sys
 from typing import (
+    Any,
     AsyncIterator,
     Dict,
     List,
@@ -34,7 +35,12 @@ from vmtest.config import (
     KernelFlavor,
     kconfig_localversion,
 )
-from vmtest.download import VMTEST_GITHUB_RELEASE, Downloader, available_kernel_releases
+from vmtest.download import (
+    Downloader,
+    available_kernel_releases,
+    github_release_cache,
+    vmtest_github_release,
+)
 from vmtest.githubapi import AioGitHubApi
 from vmtest.kbuild import KBuild, apply_patches
 
@@ -122,7 +128,9 @@ async def build_kernels(
     ],
     compilers: Mapping[str, Compiler],
     keep_builds: bool,
-) -> AsyncIterator[Path]:
+    keep_going: bool,
+    failed_builds: List[str],
+) -> AsyncIterator[Tuple[Architecture, Path]]:
     build_dir.mkdir(parents=True, exist_ok=True)
     for rev, arches in kernel_revs:
         logger.info("checking out %s in %s", rev, kernel_dir)
@@ -148,8 +156,17 @@ async def build_kernels(
                         env=env,
                         build_log_file=build_log_file,
                     )
-                    await kbuild.build()
-                    yield await kbuild.package("tar.zst", build_dir)
+                    try:
+                        await kbuild.build()
+                        kernel_package = await kbuild.package("tar.zst", build_dir)
+                    except Exception:
+                        if not keep_going:
+                            raise
+                        failed_build = f"{rev} {arch.name} {flavor.name}"
+                        logger.exception("building %s failed", failed_build)
+                        failed_builds.append(failed_build)
+                    else:
+                        yield arch, kernel_package
                     if not keep_builds:
                         logger.info("deleting %s", flavor_rev_build_dir)
                         # Shell out instead of using, e.g., shutil.rmtree(), to
@@ -264,6 +281,11 @@ async def main() -> None:
         default=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="continue with remaining kernels if a build fails, then exit with an error",
+    )
+    parser.add_argument(
         "--download-directory",
         metavar="DIR",
         type=Path,
@@ -296,22 +318,41 @@ async def main() -> None:
             sys.exit("GITHUB_TOKEN environment variable is not set")
         gh = AioGitHubApi(session, GITHUB_TOKEN)
 
-        args.download_directory.mkdir(parents=True, exist_ok=True)
-        github_release_coro = gh.get_release_by_tag(
-            *VMTEST_GITHUB_RELEASE,
-            cache=args.download_directory / "github_release.json",
+        async def get_github_release(arch: Architecture) -> Any:
+            cache = github_release_cache(args.download_directory, arch)
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                return await gh.get_release_by_tag(
+                    *vmtest_github_release(arch), cache=cache
+                )
+            except aiohttp.ClientResponseError as e:
+                if e.status != 404:
+                    raise
+                return None
+
+        github_releases_coro = asyncio.gather(
+            *[get_github_release(arch) for arch in args.architectures]
         )
         if args.latest_kernels:
-            github_release, latest_kernel_tags = await asyncio.gather(
-                github_release_coro, get_latest_kernel_tags()
+            github_releases, latest_kernel_tags = await asyncio.gather(
+                github_releases_coro, get_latest_kernel_tags()
             )
         else:
-            github_release = await github_release_coro
+            github_releases = await github_releases_coro
 
-        kernel_releases = available_kernel_releases(github_release)
+        kernel_releases = {}
+        upload_urls = {}
+        for arch, github_release in zip(args.architectures, github_releases):
+            if github_release is None:
+                sys.exit(
+                    f"GitHub release {vmtest_github_release(arch)[2]} does not exist"
+                )
+            kernel_releases[arch.name] = available_kernel_releases(github_release, arch)
+            upload_urls[arch.name] = github_release["upload_url"]
+
         logger.info("available kernel releases:")
         for arch in args.architectures:
-            arch_kernel_releases = kernel_releases.get(arch.name, {})
+            arch_kernel_releases = kernel_releases[arch.name]
             logger.info(
                 "  %s: %s",
                 arch.name,
@@ -336,7 +377,7 @@ async def main() -> None:
                     if not arch.kernel_version_supported(version):
                         continue
 
-                    arch_kernel_releases = kernel_releases.get(arch.name, {})
+                    arch_kernel_releases = kernel_releases[arch.name]
                     tag_arch_flavors_to_build = [
                         flavor
                         for flavor in args.flavors
@@ -386,17 +427,20 @@ async def main() -> None:
                     args.kernel_directory, [tag for tag, _ in to_build]
                 )
 
-                async for kernel_package in build_kernels(
+                failed_builds: List[str] = []
+                async for arch, kernel_package in build_kernels(
                     args.kernel_directory,
                     args.build_directory,
                     to_build,
                     compilers,
                     args.keep_builds,
+                    args.keep_going,
+                    failed_builds,
                 ):
                     if args.upload:
                         await upload_queue.put(
                             AssetUploadWork(
-                                upload_url=github_release["upload_url"],
+                                upload_url=upload_urls[arch.name],
                                 path=kernel_package,
                                 name=kernel_package.name,
                                 content_type="application/zstd",
@@ -405,11 +449,16 @@ async def main() -> None:
                     else:
                         logger.info("would upload %s", kernel_package)
 
+                errors = []
+                if failed_builds:
+                    errors.append(f"some builds failed: {', '.join(failed_builds)}")
                 if args.upload:
                     await upload_queue.put(None)
                     await upload_queue.join()
                     if not await uploader:
-                        sys.exit("some uploads failed")
+                        errors.append("some uploads failed")
+                if errors:
+                    sys.exit("\n".join(errors))
         else:
             logger.info("nothing to build")
 
